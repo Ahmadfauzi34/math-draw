@@ -14,12 +14,19 @@ cargo build --release
 - `math-draw run <spec.json>` — Validate and execute a `v1` flat spec or `burn-math.recursive-spec.v2` spec on `Device::flex()`.
 - `math-draw validate <spec.json> [--explain]` — Static validation (52-constructor catalog, argument bounds, shape inference, dtype flow, dataflow & ports) with optional `--explain` trace.
 - `math-draw verify <base.json> <cand.json> [--cases <cases.json>] [--fuzz [N]] [--seed S] [--lo A] [--hi B] [--abs-tol T] [--rel-tol T]` — Equivalence checking across explicit or domain-aware fuzzed inputs.
+- `math-draw trace-hash <spec.json> [other.json] [--max-bytes N] [--isolate]` — Per-step SHA-256 tensor fingerprinting, divergence step localization, and optional prefix subspec isolation.
+- `math-draw rollout scan <spec.json> [--steps N] [--state-port <slot|name>] [--inputs-seq <seq.json>]` — Stateful autoregressive/recurrent rollout tracking `delta_linf` and per-tick state hashes.
+- `math-draw rollout fixpoint <spec.json> [--tol 1e-6] [--max-steps 100] [--state-port <slot|name>]` — Fixed-point iteration until `||s_{t+1} - s_t||_∞ <= tol` with Lipschitz contraction estimates.
+- `math-draw rollout unroll <spec.json> [--steps N] [--state-port <slot|name>] [--out <out.json>]` — Materialize an N-step weight-tied unrolled `v1` spec.
+- `math-draw rollout bisect <base.json> <cand.json> [--steps N] [--state-port <slot|name>] [--inputs-seq <seq.json>] [--abs-tol 1e-5]` — Pinpoint both the first divergent rollout tick and the exact divergent intra-tick step.
+- `math-draw profile <spec.json> [--iters 30] [--warmup 5]` — Benchmark latency (`min`/`median`/`p95`/`mean`/`max` ms), step count, parameter count, and output hash using a compiled `PreparedGraph`.
+- `math-draw compare <base.json> <cand.json> [--iters 30] [--warmup 5]` — Benchmark and equivalence-check a baseline vs candidate spec.
 - `math-draw find-op [--list | <constructor>]` — Inspect supported constructors and parameter schemas.
 - `math-draw rewrite list` / `math-draw rewrite apply <rule|all> <spec.json> [--out <out.json>]` — Pure graph rewrites (`linear-branch-fusion`, `linear-chain-fusion`, `relu-idempotent`, `transpose-involution`, `dead-step-elimination`, `add-commute`).
 - `math-draw recurse expand <spec.v2.json> [--out <out.v1.json>]` — Compile recursive `v2` graph specs (subgraphs, `repeat` with `tie_weights`/`weights_per_depth`, `residual`, `parallel_concat`, `$ref`, built-in macros) into canonical flat `v1`.
 - `math-draw recurse search <spec.json> [--out <best.json>] [--max-depth 3] [--cases <cases.json>]` — Recursive tree rewrite search verified against the baseline.
-- `math-draw recurse solve-gd <spec.json> [--targets <targets.json>] [--steps 20] [--lr 0.1] [--layer <idx|all>] [--out <out.json>]` — Burn `Device::flex().autodiff()` gradient descent with reflective backtracking.
-- `math-draw recurse fit <spec.json> --targets <targets.json> [--gens 40] [--pop 16] [--sigma 0.2] [--lr 0.2] [--seed 42] [--out <out.json>]` — Gradient-free Evolutionary Strategy optimizer across active weighted layers.
+- `math-draw recurse solve-gd <spec.json> [--targets <targets.json>] [--steps 20] [--lr 0.1] [--layer <idx|all>] [--precondition] [--out <out.json>]` — Burn `Device::flex().autodiff()` gradient descent with backtracking and optional second-order diagonal Hessian preconditioning.
+- `math-draw recurse fit <spec.json> --targets <targets.json> [--gens 40] [--pop 16] [--sigma 0.2] [--lr 0.2] [--seed 42] [--sensitivity-guided] [--freeze-threshold 1e-6] [--out <out.json>]` — Gradient-free Evolutionary Strategy optimizer with optional sensitivity-guided layer freezing.
 - `math-draw smoke` — Run the built-in end-to-end smoke suite.
 
 ## Quick Examples
@@ -29,5 +36,8 @@ cargo run -- smoke
 cargo run -- run examples/linear-relu.json
 cargo run -- run examples/recursive-gated-residual.v2.json
 cargo run -- validate examples/linear-relu.json --explain
-cargo run -- recurse solve-gd examples/linear-relu.json --targets examples/targets-linear.json --steps 20 --lr 0.05
+cargo run -- trace-hash examples/linear-relu.json
+cargo run -- rollout fixpoint examples/recursive-gated-residual.v2.json --tol 1e-5
+cargo run -- profile examples/linear-relu.json --iters 20
+cargo run -- recurse solve-gd examples/linear-relu.json --targets examples/targets-linear.json --steps 20 --lr 0.05 --precondition
 ```

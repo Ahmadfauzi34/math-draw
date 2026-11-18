@@ -257,8 +257,60 @@ fn rewrites_and_recurse_preserve_semantics() {
     }"#;
     let ml = load_spec_str(ml_raw, Path::new(".")).unwrap().spec;
     let tf: TargetsFile = serde_json::from_str(r#"{"cases":[{"inputs":{"0":[1.0,2.0]},"expected":[2.5]}]}"#).unwrap();
-    let gd = solve_gd_autodiff(&ml, Some(&tf), None, 20, 0.05).unwrap();
+    let gd = solve_gd_autodiff(&ml, Some(&tf), None, 20, 0.05, false).unwrap();
     assert!(gd.final_loss < gd.start_loss);
-    let es = fit_es(&ml, &tf, 15, 12, 0.2, 0.2, 7).unwrap();
+    let es = fit_es(&ml, &tf, 15, 12, 0.2, 0.2, 7, false, 1e-6).unwrap();
     assert!(es.final_loss < es.start_loss);
+}
+
+#[test]
+fn batch1_trace_rollout_profile_and_preconditioned() {
+    use math_draw::profile::{compare_specs_perf, profile_spec};
+    use math_draw::rollout::{rollout_fixpoint, rollout_scan, rollout_unroll};
+    use math_draw::trace::{compare_trace_hashes, trace_hash_spec};
+
+    // 1. trace-hash budget skipping check
+    let raw = r#"{"inputs":{"0":[1.0,-2.0]},"layers":[{"args":[0,2,2,false],"constructor":"linear"},{"args":[1],"constructor":"relu"}],"numSlots":3,"outputSlot":2,"ports":[{"shape":[1,2,1,1],"slot":0}],"steps":[{"kind":"unary","layer":0,"slots":[0,1]},{"kind":"unary","layer":1,"slots":[1,2]}],"weights":{"0":[1,0,0,1]}}"#;
+    let spec = load_spec_str(raw, Path::new(".")).unwrap().spec;
+    let rep_skip = trace_hash_spec(&spec, 4).unwrap();
+    assert_eq!(rep_skip.skipped_steps, 2);
+    let rep_full = trace_hash_spec(&spec, 1024).unwrap();
+    assert_eq!(rep_full.captured_steps, 2);
+
+    let cmp_eq = compare_trace_hashes(&spec, &spec, 1024, true).unwrap();
+    assert!(cmp_eq.hash_chain_equal);
+    assert!(cmp_eq.first_divergent_step.is_none());
+
+    // 2. rollout with non-converging / shape mismatch fails closed cleanly
+    let bad_rollout = rollout_fixpoint(&spec, None, 1e-6, 1, None);
+    // [1, -2] -> relu -> [1, 0], delta = 2.0 > 1e-6 so converged == false
+    assert!(!bad_rollout.unwrap().converged);
+
+    // 3. scan + unroll agreement on step inputs
+    let r2 = r#"{
+      "numSlots": 3,
+      "layers": [{ "constructor": "linear", "args": [0, 2, 2, false] }, { "constructor": "add", "args": [1] }],
+      "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 2] }, { "kind": "binary", "layer": 1, "slots": [2, 1, 2] }],
+      "outputSlot": 2,
+      "ports": [{ "slot": 0, "role": "state", "shape": [1, 2, 1, 1] }, { "slot": 1, "role": "context", "shape": [1, 2, 1, 1] }],
+      "weights": { "0": [0.5, 0.0, 0.0, 0.5] },
+      "inputs": { "0": [0.0, 0.0], "1": [1.0, 2.0] }
+    }"#;
+    let rs = load_spec_str(r2, Path::new(".")).unwrap().spec;
+    let sc = rollout_scan(&rs, None, 3, Some("state"), None).unwrap();
+    let ur = rollout_unroll(&rs, None, 3, Some("state")).unwrap();
+    let ur_out = run_spec(&ur.unrolled_spec).unwrap();
+    assert_eq!(sc.final_state_sha256, ur_out.trace_sha256);
+
+    // 4. profile & compare
+    let p = profile_spec(&spec, 2, 5).unwrap();
+    assert_eq!(p.steps_count, 2);
+    let cp = compare_specs_perf(&spec, &spec, 2, 5).unwrap();
+    assert!(cp.outputs_match);
+
+    // 5. preconditioned GD on ill-conditioned weighted linear
+    let tf: TargetsFile = serde_json::from_str(r#"{"cases":[{"inputs":{"0":[1.0,-2.0]},"expected":[2.0,-4.0]}]}"#).unwrap();
+    let gd_pre = solve_gd_autodiff(&spec, Some(&tf), Some(0), 20, 0.1, true).unwrap();
+    assert!(gd_pre.preconditioned);
+    assert!(gd_pre.final_loss < gd_pre.start_loss);
 }

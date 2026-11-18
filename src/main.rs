@@ -4,10 +4,15 @@ use std::process::ExitCode;
 
 use math_draw::catalog::{CATALOG, find_constructor};
 use math_draw::engine::run_spec;
+use math_draw::profile::{compare_specs_perf, profile_spec};
 use math_draw::recurse::{fit_es, search_graph_tree, solve_gd_autodiff};
 use math_draw::rewrite::{REWRITE_RULES, apply_rewrite, apply_rewrites_recursive};
+use math_draw::rollout::{
+    parse_inputs_sequence, rollout_bisect, rollout_fixpoint, rollout_scan, rollout_unroll,
+};
 use math_draw::smoke::run_smoke_suite;
 use math_draw::spec::{load_spec_file, sha256_json};
+use math_draw::trace::{DEFAULT_MAX_TENSOR_BYTES, compare_trace_hashes, trace_hash_spec};
 use math_draw::validate::validate_spec;
 use math_draw::verify::{
     EvalCase, FuzzConfig, TargetsFile, default_cases_from_spec, generate_fuzz_cases, verify_specs,
@@ -21,13 +26,20 @@ USAGE:
   math-draw run <spec.json>
   math-draw validate <spec.json> [--explain]
   math-draw verify <base.json> <candidate.json> [--cases <cases.json>] [--fuzz [N]] [--seed S] [--lo A] [--hi B] [--abs-tol T] [--rel-tol T]
+  math-draw trace-hash <spec.json> [other.json] [--max-bytes N] [--isolate]
+  math-draw rollout scan <spec.json> [--steps N] [--state-port <slot|name>] [--inputs-seq <seq.json>]
+  math-draw rollout fixpoint <spec.json> [--tol 1e-6] [--max-steps 100] [--state-port <slot|name>]
+  math-draw rollout unroll <spec.json> [--steps N] [--state-port <slot|name>] [--out <out.json>]
+  math-draw rollout bisect <base.json> <cand.json> [--steps N] [--state-port <slot|name>] [--inputs-seq <seq.json>] [--abs-tol 1e-5]
+  math-draw profile <spec.json> [--iters 30] [--warmup 5]
+  math-draw compare <base.json> <cand.json> [--iters 30] [--warmup 5]
   math-draw find-op [--list | <constructor>]
   math-draw rewrite list
   math-draw rewrite apply <rule|all> <spec.json> [--out <out.json>]
   math-draw recurse expand <spec.v2.json> [--out <out.v1.json>]
   math-draw recurse search <spec.json> [--out <best.json>] [--max-depth 3] [--cases <cases.json>] [--abs-tol 1e-5] [--rel-tol 1e-5]
-  math-draw recurse solve-gd <spec.json> [--targets <targets.json>] [--steps 20] [--lr 0.1] [--layer <idx|all>] [--out <out.json>]
-  math-draw recurse fit <spec.json> --targets <targets.json> [--gens 40] [--pop 16] [--sigma 0.2] [--lr 0.2] [--seed 42] [--out <out.json>]
+  math-draw recurse solve-gd <spec.json> [--targets <targets.json>] [--steps 20] [--lr 0.1] [--layer <idx|all>] [--precondition] [--out <out.json>]
+  math-draw recurse fit <spec.json> --targets <targets.json> [--gens 40] [--pop 16] [--sigma 0.2] [--lr 0.2] [--seed 42] [--sensitivity-guided] [--freeze-threshold 1e-6] [--out <out.json>]
   math-draw smoke"#
     );
 }
@@ -201,6 +213,208 @@ fn main() -> ExitCode {
             let rep = verify_specs(&base, &cand, &cases, abs_tol, rel_tol);
             print_json_exit(&rep, rep.equivalent)
         }
+        "trace-hash" => {
+            let valued = ["--max-bytes"];
+            let pos = positional_args(rest, &valued);
+            let Some(first) = pos.first() else {
+                return err_exit("usage: math-draw trace-hash <spec.json> [other.json] [--max-bytes N] [--isolate]");
+            };
+            let max_bytes = flag_val(rest, "--max-bytes")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_MAX_TENSOR_BYTES);
+            let isolate = has_flag(rest, "--isolate");
+            let left = match load_spec_file(Path::new(first)) {
+                Ok(l) => l.spec,
+                Err(e) => return err_exit(&e),
+            };
+            if let Some(second) = pos.get(1) {
+                let right = match load_spec_file(Path::new(second)) {
+                    Ok(l) => l.spec,
+                    Err(e) => return err_exit(&e),
+                };
+                match compare_trace_hashes(&left, &right, max_bytes, isolate) {
+                    Ok(rep) => print_json_exit(&rep, rep.ok),
+                    Err(e) => err_exit(&e),
+                }
+            } else {
+                match trace_hash_spec(&left, max_bytes) {
+                    Ok(rep) => print_json_exit(&rep, rep.ok),
+                    Err(e) => err_exit(&e),
+                }
+            }
+        }
+        "rollout" => {
+            let Some(sub) = rest.first().map(|s| s.as_str()) else {
+                return err_exit("usage: math-draw rollout <scan|fixpoint|unroll|bisect> ...");
+            };
+            let sub_rest = &rest[1..];
+            match sub {
+                "scan" => {
+                    let valued = ["--steps", "--state-port", "--inputs-seq"];
+                    let pos = positional_args(sub_rest, &valued);
+                    let Some(file) = pos.first() else {
+                        return err_exit("usage: math-draw rollout scan <spec.json> [--steps N] [--state-port <slot|name>] [--inputs-seq <seq.json>]");
+                    };
+                    let loaded = match load_spec_file(Path::new(file)) {
+                        Ok(l) => l,
+                        Err(e) => return err_exit(&e),
+                    };
+                    let steps = flag_val(sub_rest, "--steps")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(8usize);
+                    let state_port = flag_val(sub_rest, "--state-port");
+                    let seq = if let Some(sp) = flag_val(sub_rest, "--inputs-seq") {
+                        let raw = match std::fs::read_to_string(sp) {
+                            Ok(r) => r,
+                            Err(e) => return err_exit(&format!("cannot read inputs-seq '{sp}': {e}")),
+                        };
+                        match parse_inputs_sequence(&raw, loaded.expansion.as_ref()) {
+                            Ok(s) => Some(s),
+                            Err(e) => return err_exit(&e),
+                        }
+                    } else {
+                        None
+                    };
+                    match rollout_scan(&loaded.spec, loaded.expansion.as_ref(), steps, state_port, seq.as_deref()) {
+                        Ok(rep) => print_json_exit(&rep, rep.ok),
+                        Err(e) => err_exit(&e),
+                    }
+                }
+                "fixpoint" => {
+                    let valued = ["--tol", "--max-steps", "--state-port"];
+                    let pos = positional_args(sub_rest, &valued);
+                    let Some(file) = pos.first() else {
+                        return err_exit("usage: math-draw rollout fixpoint <spec.json> [--tol 1e-6] [--max-steps 100] [--state-port <slot|name>]");
+                    };
+                    let loaded = match load_spec_file(Path::new(file)) {
+                        Ok(l) => l,
+                        Err(e) => return err_exit(&e),
+                    };
+                    let tol = flag_val(sub_rest, "--tol")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(1e-6f64);
+                    let max_steps = flag_val(sub_rest, "--max-steps")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(100usize);
+                    let state_port = flag_val(sub_rest, "--state-port");
+                    match rollout_fixpoint(&loaded.spec, loaded.expansion.as_ref(), tol, max_steps, state_port) {
+                        Ok(rep) => print_json_exit(&rep, rep.converged),
+                        Err(e) => err_exit(&e),
+                    }
+                }
+                "unroll" => {
+                    let valued = ["--steps", "--state-port", "--out"];
+                    let pos = positional_args(sub_rest, &valued);
+                    let Some(file) = pos.first() else {
+                        return err_exit("usage: math-draw rollout unroll <spec.json> [--steps N] [--state-port <slot|name>] [--out <out.json>]");
+                    };
+                    let loaded = match load_spec_file(Path::new(file)) {
+                        Ok(l) => l,
+                        Err(e) => return err_exit(&e),
+                    };
+                    let steps = flag_val(sub_rest, "--steps")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(4usize);
+                    let state_port = flag_val(sub_rest, "--state-port");
+                    match rollout_unroll(&loaded.spec, loaded.expansion.as_ref(), steps, state_port) {
+                        Ok(rep) => {
+                            if let Some(op) = flag_val(sub_rest, "--out")
+                                && let Err(e) = write_pretty_json(op, &rep.unrolled_spec)
+                            {
+                                return err_exit(&e);
+                            }
+                            print_json_exit(&rep, rep.ok)
+                        }
+                        Err(e) => err_exit(&e),
+                    }
+                }
+                "bisect" => {
+                    let valued = ["--steps", "--state-port", "--inputs-seq", "--abs-tol"];
+                    let pos = positional_args(sub_rest, &valued);
+                    if pos.len() < 2 {
+                        return err_exit("usage: math-draw rollout bisect <base.json> <cand.json> [--steps N] [--state-port <slot|name>] [--abs-tol 1e-5]");
+                    }
+                    let base = match load_spec_file(Path::new(&pos[0])) {
+                        Ok(l) => l,
+                        Err(e) => return err_exit(&e),
+                    };
+                    let cand = match load_spec_file(Path::new(&pos[1])) {
+                        Ok(l) => l,
+                        Err(e) => return err_exit(&e),
+                    };
+                    let steps = flag_val(sub_rest, "--steps")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(8usize);
+                    let state_port = flag_val(sub_rest, "--state-port");
+                    let abs_tol = flag_val(sub_rest, "--abs-tol")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(1e-5f64);
+                    let seq = if let Some(sp) = flag_val(sub_rest, "--inputs-seq") {
+                        let raw = match std::fs::read_to_string(sp) {
+                            Ok(r) => r,
+                            Err(e) => return err_exit(&format!("cannot read inputs-seq '{sp}': {e}")),
+                        };
+                        match parse_inputs_sequence(&raw, base.expansion.as_ref()) {
+                            Ok(s) => Some(s),
+                            Err(e) => return err_exit(&e),
+                        }
+                    } else {
+                        None
+                    };
+                    match rollout_bisect(
+                        &base.spec,
+                        &cand.spec,
+                        base.expansion.as_ref(),
+                        steps,
+                        state_port,
+                        seq.as_deref(),
+                        abs_tol,
+                    ) {
+                        Ok(rep) => print_json_exit(&rep, rep.ok),
+                        Err(e) => err_exit(&e),
+                    }
+                }
+                _ => err_exit(&format!("unknown rollout subcommand '{sub}' (use: scan | fixpoint | unroll | bisect)")),
+            }
+        }
+        "profile" => {
+            let valued = ["--iters", "--warmup"];
+            let pos = positional_args(rest, &valued);
+            let Some(file) = pos.first() else {
+                return err_exit("usage: math-draw profile <spec.json> [--iters 30] [--warmup 5]");
+            };
+            let loaded = match load_spec_file(Path::new(file)) {
+                Ok(l) => l,
+                Err(e) => return err_exit(&e),
+            };
+            let iters = flag_val(rest, "--iters").and_then(|s| s.parse().ok()).unwrap_or(30usize);
+            let warmup = flag_val(rest, "--warmup").and_then(|s| s.parse().ok()).unwrap_or(5usize);
+            match profile_spec(&loaded.spec, warmup, iters) {
+                Ok(rep) => print_json_exit(&rep, rep.ok),
+                Err(e) => err_exit(&e),
+            }
+        }
+        "compare" => {
+            let valued = ["--iters", "--warmup"];
+            let pos = positional_args(rest, &valued);
+            if pos.len() < 2 {
+                return err_exit("usage: math-draw compare <base.json> <cand.json> [--iters 30] [--warmup 5]");
+            }
+            let base = match load_spec_file(Path::new(&pos[0])) {
+                Ok(l) => l.spec,
+                Err(e) => return err_exit(&e),
+            };
+            let cand = match load_spec_file(Path::new(&pos[1])) {
+                Ok(l) => l.spec,
+                Err(e) => return err_exit(&e),
+            };
+            let iters = flag_val(rest, "--iters").and_then(|s| s.parse().ok()).unwrap_or(30usize);
+            let warmup = flag_val(rest, "--warmup").and_then(|s| s.parse().ok()).unwrap_or(5usize);
+            match compare_specs_perf(&base, &cand, warmup, iters) {
+                Ok(rep) => print_json_exit(&rep, rep.ok),
+                Err(e) => err_exit(&e),
+            }
+        }
         "find-op" => {
             if has_flag(rest, "--list") || rest.is_empty() {
                 let list: Vec<_> = CATALOG
@@ -360,7 +574,7 @@ fn main() -> ExitCode {
                     let valued = ["--targets", "--steps", "--lr", "--layer", "--out"];
                     let pos = positional_args(sub_rest, &valued);
                     let Some(file) = pos.first() else {
-                        return err_exit("usage: math-draw recurse solve-gd <spec.json> [--targets <targets.json>] [--steps 20] [--lr 0.1] [--layer <idx|all>] [--out <out.json>]");
+                        return err_exit("usage: math-draw recurse solve-gd <spec.json> [--targets <targets.json>] [--steps 20] [--lr 0.1] [--layer <idx|all>] [--precondition] [--out <out.json>]");
                     };
                     let loaded = match load_spec_file(Path::new(file)) {
                         Ok(l) => l,
@@ -389,7 +603,8 @@ fn main() -> ExitCode {
                             Err(_) => return err_exit(&format!("invalid --layer value '{s}'")),
                         },
                     };
-                    match solve_gd_autodiff(&loaded.spec, targets.as_ref(), layer_filter, steps, lr) {
+                    let precondition = has_flag(sub_rest, "--precondition");
+                    match solve_gd_autodiff(&loaded.spec, targets.as_ref(), layer_filter, steps, lr, precondition) {
                         Ok(res) => {
                             if let Some(op) = flag_val(sub_rest, "--out")
                                 && let Err(e) = write_pretty_json(op, &res.optimized_spec)
@@ -402,10 +617,10 @@ fn main() -> ExitCode {
                     }
                 }
                 "fit" => {
-                    let valued = ["--targets", "--gens", "--pop", "--sigma", "--lr", "--seed", "--out"];
+                    let valued = ["--targets", "--gens", "--pop", "--sigma", "--lr", "--seed", "--freeze-threshold", "--out"];
                     let pos = positional_args(sub_rest, &valued);
                     let Some(file) = pos.first() else {
-                        return err_exit("usage: math-draw recurse fit <spec.json> --targets <targets.json> [--gens 40] [--pop 16] [--sigma 0.2] [--lr 0.2] [--seed 42] [--out <out.json>]");
+                        return err_exit("usage: math-draw recurse fit <spec.json> --targets <targets.json> [--gens 40] [--pop 16] [--sigma 0.2] [--lr 0.2] [--seed 42] [--sensitivity-guided] [--freeze-threshold 1e-6] [--out <out.json>]");
                     };
                     let Some(tf_path) = flag_val(sub_rest, "--targets")
                         .or_else(|| pos.get(1).map(|s| s.as_str()))
@@ -435,7 +650,21 @@ fn main() -> ExitCode {
                     let seed = flag_val(sub_rest, "--seed")
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(42u64);
-                    match fit_es(&loaded.spec, &targets, gens, pop, sigma, lr, seed) {
+                    let sensitivity_guided = has_flag(sub_rest, "--sensitivity-guided");
+                    let freeze_threshold = flag_val(sub_rest, "--freeze-threshold")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(1e-6f64);
+                    match fit_es(
+                        &loaded.spec,
+                        &targets,
+                        gens,
+                        pop,
+                        sigma,
+                        lr,
+                        seed,
+                        sensitivity_guided,
+                        freeze_threshold,
+                    ) {
                         Ok(res) => {
                             if let Some(op) = flag_val(sub_rest, "--out")
                                 && let Err(e) = write_pretty_json(op, &res.optimized_spec)

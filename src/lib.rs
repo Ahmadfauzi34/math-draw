@@ -1,9 +1,12 @@
 pub mod catalog;
 pub mod composer;
 pub mod engine;
+pub mod profile;
 pub mod recurse;
 pub mod rewrite;
+pub mod rollout;
 pub mod smoke;
 pub mod spec;
+pub mod trace;
 pub mod validate;
 pub mod verify;

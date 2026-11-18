@@ -4,8 +4,11 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::engine::{eval_spec_with_inputs, run_spec};
+use crate::profile::{compare_specs_perf, profile_spec};
 use crate::recurse::{fit_es, search_graph_tree, solve_gd_autodiff};
+use crate::rollout::{rollout_bisect, rollout_fixpoint, rollout_scan, rollout_unroll};
 use crate::spec::{load_spec_str, SpecV1};
+use crate::trace::{DEFAULT_MAX_TENSOR_BYTES, compare_trace_hashes};
 use crate::validate::validate_spec;
 use crate::verify::{FuzzConfig, TargetsFile, generate_fuzz_cases, verify_specs};
 
@@ -212,7 +215,7 @@ pub fn run_smoke_suite() -> SmokeReport {
         let targets: TargetsFile = serde_json::from_str(
             r#"{"cases":[{"inputs":{"0":[1.0,2.0]},"expected":[5.0]}]}"#,
         ).map_err(|e| e.to_string())?;
-        let res = solve_gd_autodiff(&base, Some(&targets), Some(0), 25, 0.1)?;
+        let res = solve_gd_autodiff(&base, Some(&targets), Some(0), 25, 0.1, false)?;
         if !(res.final_loss < 1e-3 && res.final_loss < res.start_loss) {
             return Err(format!("loss did not converge: {} -> {}", res.start_loss, res.final_loss));
         }
@@ -234,7 +237,7 @@ pub fn run_smoke_suite() -> SmokeReport {
         let targets: TargetsFile = serde_json::from_str(
             r#"{"cases":[{"inputs":{"0":[1.0,2.0]},"expected":[5.0]}]}"#,
         ).map_err(|e| e.to_string())?;
-        let res = fit_es(&base, &targets, 25, 16, 0.2, 0.2, 42)?;
+        let res = fit_es(&base, &targets, 25, 16, 0.2, 0.2, 42, false, 1e-6)?;
         if !(res.final_loss < res.start_loss) {
             return Err(format!("ES loss did not improve: {} -> {}", res.start_loss, res.final_loss));
         }
@@ -287,6 +290,181 @@ pub fn run_smoke_suite() -> SmokeReport {
         let r_b1 = eval_spec_with_inputs(&b1_spec, None)?;
         approx_eq_slice(&r_b2.values[2..4], &r_b1.values, 1e-5)?;
         Ok(format!("int_out={:?} batch_isolated_ok", r_int.outputs.values))
+    }));
+
+    // 11. trace-hash step divergence localization + prefix isolate
+    checks.push(run_check("trace_hash_divergence_isolate", || {
+        let base_raw = r#"{
+          "numSlots": 4,
+          "layers": [
+            { "constructor": "linear", "args": [0, 2, 2, false] },
+            { "constructor": "relu", "args": [1] },
+            { "constructor": "linear", "args": [2, 2, 2, false] }
+          ],
+          "steps": [
+            { "kind": "unary", "layer": 0, "slots": [0, 1] },
+            { "kind": "unary", "layer": 1, "slots": [1, 2] },
+            { "kind": "unary", "layer": 2, "slots": [2, 3] }
+          ],
+          "outputSlot": 3,
+          "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+          "weights": { "0": [1, 0, 0, 1], "2": [1, 0, 0, 1] },
+          "inputs": { "0": [2.0, 3.0] }
+        }"#;
+        let mut_raw = r#"{
+          "numSlots": 4,
+          "layers": [
+            { "constructor": "linear", "args": [0, 2, 2, false] },
+            { "constructor": "relu", "args": [1] },
+            { "constructor": "linear", "args": [2, 2, 2, false] }
+          ],
+          "steps": [
+            { "kind": "unary", "layer": 0, "slots": [0, 1] },
+            { "kind": "unary", "layer": 1, "slots": [1, 2] },
+            { "kind": "unary", "layer": 2, "slots": [2, 3] }
+          ],
+          "outputSlot": 3,
+          "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+          "weights": { "0": [1, 0, 0, 1], "2": [2, 0, 0, 1] },
+          "inputs": { "0": [2.0, 3.0] }
+        }"#;
+        let base = load_spec_str(base_raw, Path::new("."))?.spec;
+        let mutated = load_spec_str(mut_raw, Path::new("."))?.spec;
+        let cmp = compare_trace_hashes(&base, &mutated, DEFAULT_MAX_TENSOR_BYTES, true)?;
+        if cmp.first_divergent_step != Some(2) || cmp.left_prefix_subspec.is_none() {
+            return Err(format!("expected divergence at step 2 with isolate subspec, got {:?}", cmp.first_divergent_step));
+        }
+        Ok(format!("first_divergent_step=2 reason={}", cmp.divergent_step_detail.unwrap().reason))
+    }));
+
+    // 12. rollout fixpoint contraction + unroll parity
+    checks.push(run_check("rollout_fixpoint_and_unroll", || {
+        let raw = r#"{
+          "schema": "burn-math.recursive-spec.v2",
+          "ports": {
+            "state": { "slot": 0, "role": "state", "shape": [1, 2, 1, 1] },
+            "bias_ctx": { "slot": 1, "role": "context", "shape": [1, 2, 1, 1] }
+          },
+          "subgraphs": {
+            "contract_step": {
+              "in": ["s", "b"],
+              "out": "s_next",
+              "steps": [
+                { "op": "linear", "args": [2, 2, false], "weights": [0.5, 0.0, 0.0, 0.5], "in": ["s"], "out": "scaled" },
+                { "op": "add", "in": ["scaled", "b"], "out": "s_next" }
+              ]
+            }
+          },
+          "steps": [
+            { "op": "repeat", "subgraph": "contract_step", "depth": 1, "tie_weights": true, "in": ["state", "bias_ctx"], "out": "final_state" }
+          ],
+          "output": "final_state",
+          "inputs": { "state": [0.0, 0.0], "bias_ctx": [1.0, 2.0] }
+        }"#;
+        let loaded = load_spec_str(raw, Path::new("."))?;
+        let scan = rollout_scan(&loaded.spec, loaded.expansion.as_ref(), 4, Some("state"), None)?;
+        let unroll = rollout_unroll(&loaded.spec, loaded.expansion.as_ref(), 4, Some("state"))?;
+        let unrolled_out = eval_spec_with_inputs(&unroll.unrolled_spec, None)?;
+        approx_eq_slice(&scan.final_state.values, &unrolled_out.values, 1e-5)?;
+        let fp = rollout_fixpoint(&loaded.spec, loaded.expansion.as_ref(), 1e-5, 50, Some("state"))?;
+        if !fp.converged {
+            return Err(format!("expected fixpoint convergence, final_delta={}", fp.final_delta_linf));
+        }
+        // s_{t+1} = 0.5 s_t + [1, 2] converges to [2.0, 4.0]
+        approx_eq_slice(&fp.final_state.values, &[2.0, 4.0], 1e-4)?;
+        Ok(format!("converged in {} steps final={:?}", fp.steps_run, fp.final_state.values))
+    }));
+
+    // 13. rollout bisect (tick + step localization)
+    checks.push(run_check("rollout_bisect_localization", || {
+        let base_raw = r#"{
+          "numSlots": 3,
+          "layers": [
+            { "constructor": "linear", "args": [0, 2, 2, false] },
+            { "constructor": "add", "args": [1] }
+          ],
+          "steps": [
+            { "kind": "unary", "layer": 0, "slots": [0, 2] },
+            { "kind": "binary", "layer": 1, "slots": [2, 1, 2] }
+          ],
+          "outputSlot": 2,
+          "ports": [
+            { "slot": 0, "role": "state", "shape": [1, 2, 1, 1] },
+            { "slot": 1, "role": "context", "shape": [1, 2, 1, 1] }
+          ],
+          "weights": { "0": [0.5, 0.0, 0.0, 0.5] },
+          "inputs": { "0": [0.0, 0.0], "1": [1.0, 2.0] }
+        }"#;
+        let cand_raw = r#"{
+          "numSlots": 3,
+          "layers": [
+            { "constructor": "linear", "args": [0, 2, 2, false] },
+            { "constructor": "add", "args": [1] }
+          ],
+          "steps": [
+            { "kind": "unary", "layer": 0, "slots": [0, 2] },
+            { "kind": "binary", "layer": 1, "slots": [2, 1, 2] }
+          ],
+          "outputSlot": 2,
+          "ports": [
+            { "slot": 0, "role": "state", "shape": [1, 2, 1, 1] },
+            { "slot": 1, "role": "context", "shape": [1, 2, 1, 1] }
+          ],
+          "weights": { "0": [0.25, 0.0, 0.0, 0.5] },
+          "inputs": { "0": [0.0, 0.0], "1": [1.0, 2.0] }
+        }"#;
+        let base = load_spec_str(base_raw, Path::new("."))?.spec;
+        let cand = load_spec_str(cand_raw, Path::new("."))?.spec;
+        // At tick 0 state=[0,0], linear([0,0])=[0,0] matches; at tick 1 state=[1,2], linear diverges at step 0!
+        let bis = rollout_bisect(&base, &cand, None, 5, Some("state"), None, 1e-5)?;
+        if bis.equivalent || bis.divergent_tick != Some(1) || bis.first_divergent_step != Some(0) {
+            return Err(format!("expected tick=1 step=0 divergence, got tick={:?} step={:?}", bis.divergent_tick, bis.first_divergent_step));
+        }
+        Ok("diverged cleanly at tick=1 step=0".into())
+    }));
+
+    // 14. profile & compare
+    checks.push(run_check("profile_and_compare", || {
+        let raw = r#"{"inputs":{"0":[1,-2]},"layers":[{"args":[0,2,2,false],"constructor":"linear"},{"args":[1],"constructor":"relu"}],"numSlots":3,"outputSlot":2,"ports":[{"shape":[1,2,1,1],"slot":0}],"steps":[{"kind":"unary","layer":0,"slots":[0,1]},{"kind":"unary","layer":1,"slots":[1,2]}],"weights":{"0":[1,0,0,1]}}"#;
+        let spec = load_spec_str(raw, Path::new("."))?.spec;
+        let prof = profile_spec(&spec, 2, 5)?;
+        let cmp = compare_specs_perf(&spec, &spec, 2, 5)?;
+        if !cmp.outputs_match || prof.steps_count != 2 {
+            return Err("profile/compare mismatch".into());
+        }
+        Ok(format!("median_ms={:.3} speedup={:.2}x", prof.median_ms, cmp.speedup))
+    }));
+
+    // 15. preconditioned solve-gd + sensitivity-guided fit
+    checks.push(run_check("recurse_preconditioned_and_sensitivity", || {
+        let raw = r#"{
+          "numSlots": 3,
+          "layers": [
+            { "constructor": "linear", "args": [0, 2, 2, false] },
+            { "constructor": "linear", "args": [1, 2, 1, true] }
+          ],
+          "steps": [
+            { "kind": "unary", "layer": 0, "slots": [0, 1] },
+            { "kind": "unary", "layer": 1, "slots": [1, 2] }
+          ],
+          "outputSlot": 2,
+          "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+          "weights": { "0": [1.0, 0.0, 0.0, 1.0], "1": [0.0, 0.0, 0.0] },
+          "inputs": { "0": [1.0, 2.0] }
+        }"#;
+        let spec = load_spec_str(raw, Path::new("."))?.spec;
+        let tf: TargetsFile = serde_json::from_str(
+            r#"{"cases":[{"inputs":{"0":[1.0,2.0]},"expected":[4.0]}]}"#,
+        ).map_err(|e| e.to_string())?;
+        let gd = solve_gd_autodiff(&spec, Some(&tf), None, 15, 0.1, true)?;
+        if !gd.preconditioned || gd.final_loss >= gd.start_loss {
+            return Err("preconditioned GD failed to reduce loss".into());
+        }
+        let fit = fit_es(&spec, &tf, 15, 12, 0.2, 0.2, 42, true, 1e-3)?;
+        if !fit.sensitivity_guided || !fit.frozen_layers.contains(&0) || fit.final_loss >= fit.start_loss {
+            return Err(format!("sensitivity-guided fit unexpected result: frozen={:?} loss {}->{}", fit.frozen_layers, fit.start_loss, fit.final_loss));
+        }
+        Ok(format!("gd_trust={:?} fit_frozen={:?}", gd.hessian_trust, fit.frozen_layers))
     }));
 
     let passed = checks.iter().filter(|c| c.ok).count();

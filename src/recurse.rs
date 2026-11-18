@@ -264,6 +264,11 @@ pub struct SolveGdResult {
     pub ok: bool,
     pub backend: &'static str,
     pub targets_mode: &'static str,
+    pub preconditioned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hessian_trust: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_damping: Option<f64>,
     pub active_layers: Vec<ActiveLayerSlice>,
     pub steps_taken: usize,
     pub backtracking_halvings: usize,
@@ -273,6 +278,85 @@ pub struct SolveGdResult {
     pub best_weights_by_layer: BTreeMap<String, Vec<f32>>,
     pub trajectory: Vec<GdStepRecord>,
     pub optimized_spec: SpecV1,
+}
+
+fn hessian_diag_second_order(
+    base_spec: &SpecV1,
+    slices: &[ActiveLayerSlice],
+    cases: &[EvalCase],
+    has_explicit: bool,
+    w: &[f32],
+    f_base: f64,
+    h: f64,
+) -> Result<Vec<f64>, String> {
+    let mut diag = Vec::with_capacity(w.len());
+    let mut work = w.to_vec();
+    for i in 0..w.len() {
+        let orig = w[i];
+        work[i] = ((orig as f64) + h) as f32;
+        let sp_plus = apply_flat_weights(base_spec, slices, &work);
+        let f_plus = eval_loss_only(&sp_plus, cases, has_explicit)?;
+        work[i] = ((orig as f64) - h) as f32;
+        let sp_minus = apply_flat_weights(base_spec, slices, &work);
+        let f_minus = eval_loss_only(&sp_minus, cases, has_explicit)?;
+        work[i] = orig;
+        diag.push((f_plus - 2.0 * f_base + f_minus) / (h * h));
+    }
+    Ok(diag)
+}
+
+fn classify_hessian_trust(coarse: &[f64], fine: &[f64], tol_abs: f64, tol_rel: f64) -> &'static str {
+    let mut max_mag = 0.0f64;
+    let mut consistent = true;
+    for (&c, &f) in coarse.iter().zip(fine.iter()) {
+        if !c.is_finite() || !f.is_finite() {
+            return "untrusted";
+        }
+        let mag = c.abs().max(f.abs());
+        if mag > max_mag {
+            max_mag = mag;
+        }
+        if (c - f).abs() > tol_abs + tol_rel * mag {
+            consistent = false;
+        }
+    }
+    if max_mag <= tol_abs {
+        "zero_within_noise"
+    } else if consistent {
+        "trusted"
+    } else {
+        "untrusted"
+    }
+}
+
+fn compute_preconditioner(
+    base_spec: &SpecV1,
+    slices: &[ActiveLayerSlice],
+    cases: &[EvalCase],
+    has_explicit: bool,
+    w: &[f32],
+    f_base: f64,
+    damping: f64,
+) -> (&'static str, Vec<f64>) {
+    if w.len() > 256 {
+        return ("skipped_high_dim", vec![1.0; w.len()]);
+    }
+    let Ok(coarse) = hessian_diag_second_order(base_spec, slices, cases, has_explicit, w, f_base, 1e-2) else {
+        return ("untrusted", vec![1.0; w.len()]);
+    };
+    let Ok(fine) = hessian_diag_second_order(base_spec, slices, cases, has_explicit, w, f_base, 5e-3) else {
+        return ("untrusted", vec![1.0; w.len()]);
+    };
+    let trust = classify_hessian_trust(&coarse, &fine, 1e-2, 0.25);
+    if trust == "trusted" {
+        let scales = fine
+            .iter()
+            .map(|&d| 1.0 / d.abs().max(damping))
+            .collect();
+        (trust, scales)
+    } else {
+        (trust, vec![1.0; w.len()])
+    }
 }
 
 fn resolve_gd_targets(
@@ -416,6 +500,7 @@ pub fn solve_gd_autodiff(
     layer_filter: Option<usize>,
     steps: usize,
     lr: f64,
+    precondition: bool,
 ) -> Result<SolveGdResult, String> {
     let v = validate_spec(spec, false);
     if !v.valid {
@@ -429,6 +514,16 @@ pub fn solve_gd_autodiff(
     let (mut cur_loss, mut cur_grad) =
         eval_loss_and_grad_autodiff(&cur_spec, &slices, &cases, has_explicit, total_dim)?;
     let start_loss = cur_loss;
+
+    let damping = 1e-2f64;
+    let mut hessian_trust: Option<&'static str> = None;
+    let mut precond_scales = vec![1.0f64; total_dim];
+    if precondition {
+        let (trust, scales) =
+            compute_preconditioner(spec, &slices, &cases, has_explicit, &cur_w, cur_loss, damping);
+        hessian_trust = Some(trust);
+        precond_scales = scales;
+    }
 
     let mut traj = Vec::new();
     let mut total_halvings = 0usize;
@@ -449,6 +544,20 @@ pub fn solve_gd_autodiff(
             break;
         }
 
+        if precondition && step > 0 && step % 5 == 0 {
+            let (trust, scales) = compute_preconditioner(
+                spec,
+                &slices,
+                &cases,
+                has_explicit,
+                &cur_w,
+                cur_loss,
+                damping,
+            );
+            hessian_trust = Some(trust);
+            precond_scales = scales;
+        }
+
         let mut step_lr = lr;
         let mut accepted = None;
         let mut halvings_used = 0usize;
@@ -457,7 +566,8 @@ pub fn solve_gd_autodiff(
             let cand_w: Vec<f32> = cur_w
                 .iter()
                 .zip(cur_grad.iter())
-                .map(|(&w, &g)| (w as f64 - step_lr * (g as f64)) as f32)
+                .zip(precond_scales.iter())
+                .map(|((&w, &g), &sc)| (w as f64 - step_lr * sc * (g as f64)) as f32)
                 .collect();
             if cand_w.iter().any(|w| !w.is_finite()) {
                 step_lr *= 0.5;
@@ -515,6 +625,9 @@ pub fn solve_gd_autodiff(
         ok: cur_loss <= start_loss + 1e-12,
         backend: "burn_flex_autodiff",
         targets_mode,
+        preconditioned: precondition,
+        hessian_trust,
+        active_damping: if precondition { Some(damping) } else { None },
         active_layers: slices,
         steps_taken: traj.len().saturating_sub(1),
         backtracking_halvings: total_halvings,
@@ -539,6 +652,11 @@ pub struct FitTrajectoryItem {
 pub struct FitResult {
     pub ok: bool,
     pub dim: usize,
+    pub sensitivity_guided: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub frozen_layers: Vec<usize>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub layer_sensitivity: BTreeMap<String, f64>,
     pub active_layers: Vec<ActiveLayerSlice>,
     pub generations: usize,
     pub pop: usize,
@@ -574,6 +692,52 @@ impl EsRng {
     }
 }
 
+fn compute_layer_sensitivities(
+    base_spec: &SpecV1,
+    slices: &[ActiveLayerSlice],
+    cases: &[EvalCase],
+    init_w: &[f32],
+) -> BTreeMap<String, f64> {
+    let start_spec = apply_flat_weights(base_spec, slices, init_w);
+    let mut out = BTreeMap::new();
+
+    if let Ok((_loss, grad)) =
+        eval_loss_and_grad_autodiff(&start_spec, slices, cases, true, init_w.len())
+    {
+        for sl in slices {
+            let max_g = grad[sl.offset..sl.offset + sl.length]
+                .iter()
+                .map(|&g| (g as f64).abs())
+                .fold(0.0f64, f64::max);
+            out.insert(sl.layer_index.to_string(), max_g);
+        }
+        return out;
+    }
+
+    // Fallback: finite differences if autodiff is unavailable for a mixed graph
+    let eps = 1e-3f64;
+    let mut work = init_w.to_vec();
+    for sl in slices {
+        let mut max_g = 0.0f64;
+        for d in sl.offset..sl.offset + sl.length {
+            let orig = init_w[d];
+            work[d] = ((orig as f64) + eps) as f32;
+            let lp = eval_loss_only(&apply_flat_weights(base_spec, slices, &work), cases, true)
+                .unwrap_or(0.0);
+            work[d] = ((orig as f64) - eps) as f32;
+            let lm = eval_loss_only(&apply_flat_weights(base_spec, slices, &work), cases, true)
+                .unwrap_or(0.0);
+            work[d] = orig;
+            let g = ((lp - lm) / (2.0 * eps)).abs();
+            if g > max_g {
+                max_g = g;
+            }
+        }
+        out.insert(sl.layer_index.to_string(), max_g);
+    }
+    out
+}
+
 pub fn fit_es(
     spec: &SpecV1,
     targets: &TargetsFile,
@@ -582,6 +746,8 @@ pub fn fit_es(
     sigma: f64,
     lr: f64,
     seed: u64,
+    sensitivity_guided: bool,
+    freeze_threshold: f64,
 ) -> Result<FitResult, String> {
     let v = validate_spec(spec, false);
     if !v.valid {
@@ -598,6 +764,38 @@ pub fn fit_es(
 
     let start_spec = apply_flat_weights(spec, &slices, &init_w);
     let start_loss = eval_loss_only(&start_spec, &targets.cases, true)?;
+
+    let mut frozen_layers = Vec::new();
+    let mut layer_sensitivity = BTreeMap::new();
+    let mut active_mask = vec![true; dim];
+
+    if sensitivity_guided {
+        layer_sensitivity = compute_layer_sensitivities(spec, &slices, &targets.cases, &init_w);
+        if slices.len() > 1 {
+            let mut candidate_frozen: Vec<usize> = Vec::new();
+            for sl in &slices {
+                let s = layer_sensitivity
+                    .get(&sl.layer_index.to_string())
+                    .copied()
+                    .unwrap_or(0.0);
+                if s < freeze_threshold {
+                    candidate_frozen.push(sl.layer_index);
+                }
+            }
+            if candidate_frozen.len() < slices.len() {
+                frozen_layers = candidate_frozen;
+                let frozen_set: HashSet<usize> = frozen_layers.iter().copied().collect();
+                for sl in &slices {
+                    if frozen_set.contains(&sl.layer_index) {
+                        for flag in &mut active_mask[sl.offset..sl.offset + sl.length] {
+                            *flag = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut best_w = init_w.clone();
     let mut best_loss = start_loss;
     let mut mean_w: Vec<f64> = init_w.iter().map(|&x| x as f64).collect();
@@ -608,7 +806,9 @@ pub fn fit_es(
         let mut losses = Vec::with_capacity(actual_pop);
 
         for _ in 0..pairs {
-            let eps: Vec<f64> = (0..dim).map(|_| rng.next_normal()).collect();
+            let eps: Vec<f64> = (0..dim)
+                .map(|d| if active_mask[d] { rng.next_normal() } else { 0.0 })
+                .collect();
             for &sign in &[1.0f64, -1.0f64] {
                 let cand: Vec<f32> = mean_w
                     .iter()
@@ -637,6 +837,9 @@ pub fn fit_es(
         let std_l = var_l.sqrt().max(1e-8);
 
         for d in 0..dim {
+            if !active_mask[d] {
+                continue;
+            }
             let mut grad_est = 0.0f64;
             for p in 0..actual_pop {
                 let adv = -(losses[p] - mean_l) / std_l;
@@ -664,6 +867,9 @@ pub fn fit_es(
     Ok(FitResult {
         ok: best_loss <= start_loss + 1e-12,
         dim,
+        sensitivity_guided,
+        frozen_layers,
+        layer_sensitivity,
         active_layers: slices,
         generations,
         pop: actual_pop,

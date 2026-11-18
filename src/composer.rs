@@ -28,6 +28,8 @@ pub struct ExpansionReceipt {
     pub steps_count: usize,
     pub compiled_sha256: String,
     pub events: Vec<ExpansionEvent>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub port_names: BTreeMap<String, usize>,
 }
 
 pub fn is_recursive_spec_v2(raw: &Value) -> bool {
@@ -1118,6 +1120,7 @@ pub fn compile_recursive_spec(raw: &Value, base_dir: &Path) -> Result<(SpecV1, E
         steps_count: spec.steps.len(),
         compiled_sha256: sha256_json(&spec),
         events: state.events,
+        port_names: name_to_slot.into_iter().collect(),
     };
     Ok((spec, receipt))
 }
