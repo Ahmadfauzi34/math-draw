@@ -1,7 +1,10 @@
 pub mod catalog;
 pub mod composer;
+pub mod cost_model;
 pub mod engine;
 pub mod gradcheck;
+pub mod harness;
+pub mod linear_equiv;
 pub mod mutate;
 pub mod profile;
 pub mod quant;
@@ -14,3 +17,4 @@ pub mod spec;
 pub mod trace;
 pub mod validate;
 pub mod verify;
+pub mod weight_lab;

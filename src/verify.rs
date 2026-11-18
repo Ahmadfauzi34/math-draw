@@ -260,3 +260,141 @@ pub fn verify_specs(
         case_details: details,
     }
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ZoomLevelRecord {
+    pub depth: usize,
+    pub radius: f64,
+    pub max_abs_error: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ZoomFuzzReport {
+    pub ok: bool,
+    pub seed: u64,
+    pub zoom_depth: usize,
+    pub samples_per_level: usize,
+    pub initial_max_abs_error: f64,
+    pub zoomed_max_abs_error: f64,
+    pub amplification_ratio: Option<f64>,
+    pub worst_case_input: BTreeMap<String, Vec<Value>>,
+    pub zoom_history: Vec<ZoomLevelRecord>,
+}
+
+/// Recursive Adversarial Interval Narrowing (Zoom Fuzzing):
+/// Sweeps initial fuzz cases at depth 0, then iteratively narrows a box (`radius *= 0.5`)
+/// around the input case that maximizes `||Base(x) - Cand(x)||_inf`.
+pub fn zoom_fuzz_specs(
+    base: &SpecV1,
+    cand: &SpecV1,
+    cfg: &FuzzConfig,
+    zoom_depth: usize,
+) -> Result<ZoomFuzzReport, String> {
+    let g_base = crate::engine::PreparedGraph::compile(base)?;
+    let g_cand = crate::engine::PreparedGraph::compile(cand)?;
+    let i64_mask = crate::engine::port_is_i64_mask(base);
+    let samples_per_level = cfg.count.max(4);
+    let init_cfg = FuzzConfig {
+        count: samples_per_level,
+        seed: cfg.seed,
+        lo: cfg.lo,
+        hi: cfg.hi,
+    };
+    let initial = generate_fuzz_cases(base, &init_cfg);
+    if initial.is_empty() {
+        return Err("zoom_fuzz: failed to generate initial cases".into());
+    }
+
+    let eval_delta = |inputs: &BTreeMap<String, Vec<Value>>| -> Result<f64, String> {
+        let ob = g_base.run_once(base, Some(inputs))?;
+        let oc = g_cand.run_once(cand, Some(inputs))?;
+        if ob.values.len() != oc.values.len() {
+            return Ok(f64::INFINITY);
+        }
+        let mut m = 0.0f64;
+        for (&a, &b) in ob.values.iter().zip(oc.values.iter()) {
+            let d = ((a as f64) - (b as f64)).abs();
+            if d > m {
+                m = d;
+            }
+        }
+        Ok(m)
+    };
+
+    let mut best_case = initial[0].inputs.clone();
+    let mut best_delta = -1.0f64;
+    for c in &initial {
+        let d = eval_delta(&c.inputs)?;
+        if d > best_delta {
+            best_delta = d;
+            best_case = c.inputs.clone();
+        }
+    }
+
+    let initial_max = best_delta.max(0.0);
+    let mut history = vec![ZoomLevelRecord {
+        depth: 0,
+        radius: (cfg.hi - cfg.lo) / 2.0,
+        max_abs_error: initial_max,
+    }];
+
+    let mut rng = XorShift64(cfg.seed ^ 0xA5A5_5A5A_F0F0_0F0F);
+    let mut radius = (cfg.hi - cfg.lo) / 4.0;
+
+    for depth in 1..=zoom_depth {
+        for _ in 0..samples_per_level {
+            let mut trial = BTreeMap::new();
+            for port in &base.ports {
+                let k = port.slot.to_string();
+                let Some(center) = best_case.get(&k) else {
+                    continue;
+                };
+                if port.slot < i64_mask.len() && i64_mask[port.slot] {
+                    trial.insert(k, center.clone());
+                } else {
+                    let mut next_vals = Vec::with_capacity(center.len());
+                    for val in center {
+                        let c_f = val.as_f64().unwrap_or(0.0);
+                        let jitter = (rng.next_f64() * 2.0 - 1.0) * radius;
+                        let clamped = (c_f + jitter).clamp(cfg.lo, cfg.hi);
+                        let rounded = (clamped * 1e6).round() / 1e6;
+                        next_vals.push(Value::from(rounded));
+                    }
+                    trial.insert(k, next_vals);
+                }
+            }
+            if let Ok(d) = eval_delta(&trial)
+                && d > best_delta
+            {
+                best_delta = d;
+                best_case = trial;
+            }
+        }
+        history.push(ZoomLevelRecord {
+            depth,
+            radius,
+            max_abs_error: best_delta.max(0.0),
+        });
+        radius *= 0.5;
+    }
+
+    let zoomed_max = best_delta.max(0.0);
+    let amp = if initial_max > 0.0 && initial_max.is_finite() && zoomed_max.is_finite() {
+        Some(((zoomed_max / initial_max) * 1e4).round() / 1e4)
+    } else {
+        None
+    };
+
+    Ok(ZoomFuzzReport {
+        ok: true,
+        seed: cfg.seed,
+        zoom_depth,
+        samples_per_level,
+        initial_max_abs_error: initial_max,
+        zoomed_max_abs_error: zoomed_max,
+        amplification_ratio: amp,
+        worst_case_input: best_case,
+        zoom_history: history,
+    })
+}
+

@@ -367,3 +367,109 @@ fn batch2_gradcheck_quant_mutate_and_shard() {
     let wide = load_spec_str(wide_raw, Path::new(".")).unwrap().spec;
     assert!(shard_spec(&wide, 3).unwrap_err().contains("unshardable"));
 }
+
+#[test]
+fn batch3_weight_lab_linear_equiv_cost_model_and_harness() {
+    use math_draw::cost_model::run_cost_model;
+    use math_draw::harness::{
+        export_subagent_branches, get_capability_catalog, merge_subagent_branches,
+        resolve_artifact_uri, store_artifact,
+    };
+    use math_draw::linear_equiv::equiv_linear;
+    use math_draw::verify::{FuzzConfig, zoom_fuzz_specs};
+    use math_draw::weight_lab::{
+        WeightProbe, WeightRequires, WeightSet, certify_weight_set, run_weight_lab_selftest,
+        spectral_radius,
+    };
+
+    // 1. weight-lab selftest + anti-diagonal oscillatory spectral radius
+    let st = run_weight_lab_selftest().unwrap();
+    assert_eq!(st["ok"], json!(true));
+    // Anti-diagonal [[0, 5], [0.05, 0]] has true eigenvalues +-0.5 (not single-step spike 5.0)
+    let (rho_osc, _) = spectral_radius(&[vec![0.0, 5.0], vec![0.05, 0.0]], 200).unwrap();
+    assert!((rho_osc - 0.5).abs() < 1e-6);
+
+    // 2. weight-lab certify refuses when probe error exceeds probe_tol
+    let bad_probe_ws = WeightSet {
+        name: Some("bad_probe".into()),
+        kind: "map".into(),
+        w: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        b: vec![0.0, 0.0],
+        probes: vec![WeightProbe {
+            input: vec![1.0, 2.0],
+            want: Some(vec![99.0, 99.0]),
+        }],
+        probe_tol: Some(1e-4),
+        requires: WeightRequires::default(),
+    };
+    let cert_bad = certify_weight_set(&bad_probe_ws, "bad", None).unwrap();
+    assert_eq!(cert_bad["ok"], json!(false));
+    assert_eq!(cert_bad["verdict"], json!("REFUSED"));
+
+    // 3. linear-equiv proves linear-branch-fusion & linear-chain-fusion exactness, and rejects non-linear
+    let branch_raw = r#"{
+      "numSlots": 4,
+      "layers": [
+        { "constructor": "linear", "args": [0, 2, 2, false] },
+        { "constructor": "linear", "args": [1, 2, 2, false] },
+        { "constructor": "add", "args": [2] }
+      ],
+      "steps": [
+        { "kind": "unary", "layer": 0, "slots": [0, 1] },
+        { "kind": "unary", "layer": 1, "slots": [0, 2] },
+        { "kind": "binary", "layer": 2, "slots": [1, 2, 3] }
+      ],
+      "outputSlot": 3,
+      "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+      "weights": { "0": [1, 2, 3, 4], "1": [0.5, -0.5, 1.0, 2.0] },
+      "inputs": { "0": [1.0, -1.0] }
+    }"#;
+    let b_spec = load_spec_str(branch_raw, Path::new(".")).unwrap().spec;
+    let b_fused = apply_rewrite("linear-branch-fusion", &b_spec).unwrap();
+    let eq = equiv_linear(&b_spec, &b_fused, 1e-7);
+    assert!(eq.ok && eq.verdict == "ACCEPT");
+
+    // 4. cost-model + zoom-fuzz
+    let cm = run_cost_model(&b_spec, 3).unwrap();
+    assert!(cm.ok && cm.per_op.len() == 3);
+    let mut pert = b_fused.clone();
+    let active_layer = pert.steps[0].layer.to_string();
+    pert.weights.get_mut(&active_layer).unwrap()[0] += 0.25;
+    let zf = zoom_fuzz_specs(&b_spec, &pert, &FuzzConfig { count: 6, seed: 7, lo: -3.0, hi: 3.0 }, 3).unwrap();
+    assert!(zf.ok && zf.zoomed_max_abs_error > 0.0 && zf.zoomed_max_abs_error >= zf.initial_max_abs_error);
+
+    // 5. harness artifact store integrity check + branch export/merge
+    assert_eq!(get_capability_catalog(Some("unknown_domain"))["ok"], json!(false));
+    let tmp_ws = std::env::temp_dir().join(format!("math_draw_test_ws_{}", std::process::id()));
+    let (uri, _, art_file) = store_artifact(&[1.5, -2.5], [1, 2, 1, 1], &tmp_ws, "tensor_f32").unwrap();
+    let resolved = resolve_artifact_uri(&uri, &tmp_ws).unwrap();
+    assert_eq!(resolved["shape"], json!([1, 2, 1, 1]));
+    // Tamper with stored artifact and verify fail-closed integrity check
+    std::fs::write(&art_file, "{\"tampered\":true}\n").unwrap();
+    assert!(
+        resolve_artifact_uri(&uri, &tmp_ws)
+            .unwrap_err()
+            .contains("artifact_integrity_failed")
+    );
+
+    let exp = export_subagent_branches(&b_spec, &tmp_ws).unwrap();
+    assert_eq!(exp["ok"], json!(true));
+    let f_good = tmp_ws.join("good_cand.json");
+    let f_bad = tmp_ws.join("bad_cand.json");
+    std::fs::write(&f_good, serde_json::to_string(&b_fused).unwrap()).unwrap();
+    std::fs::write(&f_bad, serde_json::to_string(&pert).unwrap()).unwrap();
+    let merged = merge_subagent_branches(
+        &b_spec,
+        &[
+            f_bad.display().to_string(),
+            f_good.display().to_string(),
+        ],
+        1e-4,
+    )
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&tmp_ws);
+    assert_eq!(merged["ok"], json!(true));
+    assert_eq!(merged["promoted_winner"]["branch_id"], json!("merge.2"));
+    assert_eq!(merged["promoted_winner"]["steps_count"], json!(1));
+}
+

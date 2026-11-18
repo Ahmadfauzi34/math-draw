@@ -5,6 +5,22 @@ All notable changes to `math-draw` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-18
+
+### Added
+- **Manual-Weighting Workbench (`weight-lab`, `src/weight_lab.rs`)**:
+  - `weight-lab <run|gate|certify|compose|eval|selftest>`: row-major ($m \times n$) to Burn column-major (`to_column_major`) weight verification against the forward engine (`engine_agreement`), 2-step oscillatory-safe power iteration `spectral_radius`, `orthonormality_error`, `frobenius_norm`, Gaussian elimination `det`, property checker (`check_properties`), candidate transition gate (`gate_sets`), cryptographic certificate emitter (`certify_weight_set`), 3-tier 2-stage composition prover (`compose_properties`: `norm_bound` / `orthonormal` / `measured`), recursive weight expression evaluator (`evaluate_weight_expr`: `literal` / `compose` / `blend` / `scale` / `power`), and 9-case `selftest`.
+- **Symbolic Linear Equivalence Prover (`linear-equiv`, `src/linear_equiv.rs`)**:
+  - `linear-equiv <specA.json> <specB.json> [--tol 0.0]` reduces multi-port affine DAGs (`linear`, `add`, `sub`, `concat(dim=1)`, and constant `role: "context"` ports) to canonical $(W_{\text{eff}}, b_{\text{eff}})$ and proves exact or $\varepsilon$-bounded symbolic equivalence across sharded or fused graphs.
+- **Isolated Per-Step Cost Model (`cost-model`, `src/cost_model.rs`)**:
+  - `cost-model <spec.json> [--iters 11] [--table <out.json>]` benchmarks isolated per-step micro-specs (`<op> + add(0)` minus `add(0)` baseline for `f32` unary ops, isolated binary/int/embedding harnesses), reporting `ms_median`, `share_pct`, `hotspot`, and `predicted_total_ms` vs `measured_total_ms` (`prediction_error_pct`).
+- **Recursive Adversarial Interval Narrowing (`verify --zoom`, `src/verify.rs`)**:
+  - `verify <base.json> <cand.json> --zoom [--zoom-depth 4] [--fuzz 12] [--seed S] [--lo -5] [--hi 5]` iteratively shrinks the sampling interval around the worst-case fuzz input at each depth (`zoom_fuzz_specs`).
+- **Layer-4 Agent-Harness Co-Processor (`harness`, `src/harness.rs`)**:
+  - `harness <capabilities|digest|resolve-artifact|run-workflow|branch-export|branch-merge|workspace-status>` provides progressive domain discovery (`capabilities`), context-preserving semantic tensor digests (`digest`), content-addressed `.burn-harness` artifact storage (`burn://sha256:<64-hex>`) with fail-closed tamper detection (`artifact_integrity_failed`), subagent branch export/merge with multi-case equivalence gating, and multi-stage pipeline execution (`run-workflow`).
+- **Expanded Smoke Suite & Integration Tests (`src/smoke.rs`, `tests/integration.rs`)**:
+  - Expanded built-in `smoke` suite from 19 to 23 checks (`#20`–`#23`) and added `batch3_weight_lab_linear_equiv_cost_model_and_harness` integration test.
+
 ## [0.3.0] - 2026-11-18
 
 ### Added
