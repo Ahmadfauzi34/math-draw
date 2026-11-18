@@ -12,7 +12,7 @@ cargo build --release
 ## Subcommands
 
 - `math-draw run <spec.json>` — Validate and execute a `v1` flat spec or `burn-math.recursive-spec.v2` spec on `Device::flex()`.
-- `math-draw validate <spec.json> [--explain]` — Static validation (52-constructor catalog, argument bounds, shape inference, dtype flow, dataflow & ports) with optional `--explain` trace.
+- `math-draw validate <spec.json> [--explain]` — Static validation (82-constructor catalog, argument bounds, shape inference, dtype flow, dataflow & ports) with optional `--explain` trace.
 - `math-draw verify <base.json> <cand.json> [--cases <cases.json>] [--fuzz [N]] [--zoom] [--zoom-depth 4] [--seed S] [--lo A] [--hi B] [--abs-tol T] [--rel-tol T]` — Equivalence checking across explicit cases, domain-aware fuzzing, or recursive adversarial interval narrowing (`--zoom`).
 - `math-draw linear-equiv <specA.json> <specB.json> [--tol 0.0]` — Exact symbolic affine equivalence prover over `linear`, `add`, `sub`, and `concat(dim=1)` graphs.
 - `math-draw trace-hash <spec.json> [other.json] [--max-bytes N] [--isolate]` — Per-step SHA-256 tensor fingerprinting, divergence step localization, and optional prefix subspec isolation.

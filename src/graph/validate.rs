@@ -116,11 +116,32 @@ fn check_arg_type(label: &str, name: &str, ty: ParamType, v: &Value) -> Option<S
                 None
             }
         }
+        ParamType::U32Array => {
+            let Some(arr) = v.as_array() else {
+                return Some(format!("{label}: arg '{name}' must be array of u32, got {v}"));
+            };
+            for (idx, item) in arr.iter().enumerate() {
+                let Some(n) = item.as_u64() else {
+                    return Some(format!("{label}: arg '{name}[{idx}]' must be u32, got {item}"));
+                };
+                if n > u32::MAX as u64 {
+                    return Some(format!("{label}: arg '{name}[{idx}]' exceeds u32::MAX, got {n}"));
+                }
+            }
+            None
+        }
     }
 }
 
 fn arg_usize(args: &[Value], idx: usize) -> Option<usize> {
     args.get(idx).and_then(|v| v.as_u64()).map(|n| n as usize)
+}
+
+fn arg_usize_vec(args: &[Value], idx: usize) -> Option<Vec<usize>> {
+    let arr = args.get(idx)?.as_array()?;
+    arr.iter()
+        .map(|v| v.as_u64().map(|n| n as usize))
+        .collect()
 }
 
 fn arg_opt_usize(args: &[Value], idx: usize) -> Option<usize> {
@@ -462,6 +483,175 @@ fn infer_step_shape(ctor: &str, in_shapes: &[[usize; 4]], args: &[Value]) -> Res
                 return Err("adaptiveAvgPool2d output dims must be > 0".into());
             }
             Ok([s0[0], s0[1], oh, ow])
+        }
+        // Ported pure math constructors (30)
+        "abs" | "exp" | "log" => Ok(s0),
+        "clamp" => {
+            let min = arg_f64(args, 1).ok_or("missing min")?;
+            let max = arg_f64(args, 2).ok_or("missing max")?;
+            if !min.is_finite() || !max.is_finite() || !(min as f32).is_finite() || !(max as f32).is_finite() {
+                return Err(format!("clamp bounds must be finite f32-representable, got min={min}, max={max}"));
+            }
+            if min > max {
+                return Err(format!("clamp min must be <= max, got min={min}, max={max}"));
+            }
+            Ok(s0)
+        }
+        "fillLike" => {
+            let scalar = arg_f64(args, 1).ok_or("missing scalar")?;
+            if !scalar.is_finite() || !(scalar as f32).is_finite() {
+                return Err(format!("fillLike scalar must be finite f32-representable, got {scalar}"));
+            }
+            Ok(s0)
+        }
+        "reshape" => {
+            let shape = arg_usize_vec(args, 1).ok_or("missing shape array")?;
+            if shape.len() != 4 {
+                return Err(format!("reshape expects exactly 4 dims, got {}", shape.len()));
+            }
+            let target = [shape[0], shape[1], shape[2], shape[3]];
+            if target.contains(&0) {
+                return Err(format!("reshape target dims must all be > 0, got {target:?}"));
+            }
+            let src_n = s0.into_iter().try_fold(1usize, |a, b| a.checked_mul(b))
+                .ok_or_else(|| format!("reshape source numel overflow: {s0:?}"))?;
+            let dst_n = target.into_iter().try_fold(1usize, |a, b| a.checked_mul(b))
+                .ok_or_else(|| format!("reshape target numel overflow: {target:?}"))?;
+            if src_n != dst_n {
+                return Err(format!("reshape element-count mismatch: source {s0:?} ({src_n}) vs target {target:?} ({dst_n})"));
+            }
+            Ok(target)
+        }
+        "permute" => {
+            let axes = arg_usize_vec(args, 1).ok_or("missing axes array")?;
+            if axes.len() != 4 {
+                return Err(format!("permute expects exactly 4 axes, got {}", axes.len()));
+            }
+            let mut seen = [false; 4];
+            for (pos, &ax) in axes.iter().enumerate() {
+                if ax >= 4 {
+                    return Err(format!("permute axis[{pos}] {ax} out of range 0..4"));
+                }
+                if seen[ax] {
+                    return Err(format!("permute duplicate axis {ax} at position {pos}"));
+                }
+                seen[ax] = true;
+            }
+            Ok([s0[axes[0]], s0[axes[1]], s0[axes[2]], s0[axes[3]]])
+        }
+        "slice" => {
+            let starts = arg_usize_vec(args, 1).ok_or("missing starts array")?;
+            let ends = arg_usize_vec(args, 2).ok_or("missing ends array")?;
+            if starts.len() != 4 || ends.len() != 4 {
+                return Err(format!("slice starts/ends must each have 4 elements, got {} and {}", starts.len(), ends.len()));
+            }
+            let mut out = [0usize; 4];
+            for ax in 0..4 {
+                if starts[ax] >= ends[ax] {
+                    return Err(format!("slice axis {ax} requires start < end, got {}..{}", starts[ax], ends[ax]));
+                }
+                if ends[ax] > s0[ax] {
+                    return Err(format!("slice axis {ax} end {} exceeds dim {}", ends[ax], s0[ax]));
+                }
+                out[ax] = ends[ax] - starts[ax];
+            }
+            Ok(out)
+        }
+        "selectAxis" => {
+            let axis = arg_usize(args, 1).ok_or("missing axis")?;
+            let indices = arg_usize_vec(args, 2).ok_or("missing indices array")?;
+            if axis >= 4 {
+                return Err(format!("selectAxis axis {axis} out of range 0..4"));
+            }
+            if indices.is_empty() {
+                return Err("selectAxis indices must not be empty".into());
+            }
+            for (pos, &idx) in indices.iter().enumerate() {
+                if idx >= s0[axis] {
+                    return Err(format!("selectAxis index[{pos}]={idx} out of bounds for axis {axis} dim {}", s0[axis]));
+                }
+                if idx > i64::MAX as usize {
+                    return Err(format!("selectAxis index[{pos}]={idx} exceeds i64::MAX"));
+                }
+            }
+            let mut out = s0;
+            out[axis] = indices.len();
+            Ok(out)
+        }
+        "expandLike" => {
+            let s1 = in_shapes[1];
+            for ax in 0..4 {
+                if s0[ax] == 0 || s1[ax] == 0 {
+                    return Err(format!("expandLike zero-sized dim at axis {ax}"));
+                }
+                if s0[ax] != s1[ax] && s0[ax] != 1 {
+                    return Err(format!("expandLike axis {ax}: source dim {} cannot expand to {}", s0[ax], s1[ax]));
+                }
+            }
+            Ok(s1)
+        }
+        "dot" | "l2Distance" | "crossEntropy" | "klDivergence" => {
+            let s1 = in_shapes[1];
+            if s0[2] != 1 || s0[3] != 1 {
+                return Err(format!("{ctor} requires [B,F,1,1] lhs, got {s0:?}"));
+            }
+            if s0 != s1 {
+                return Err(format!("{ctor} shape mismatch {s0:?} vs {s1:?}"));
+            }
+            Ok([s0[0], 1, 1, 1])
+        }
+        "cosineSimilarity" => {
+            let s1 = in_shapes[1];
+            if s0[2] != 1 || s0[3] != 1 {
+                return Err(format!("cosineSimilarity requires [B,F,1,1] lhs, got {s0:?}"));
+            }
+            if s0 != s1 {
+                return Err(format!("cosineSimilarity shape mismatch {s0:?} vs {s1:?}"));
+            }
+            if let Some(eps) = arg_opt_f64(args, 1)
+                && (!eps.is_finite() || eps <= 0.0 || eps > f32::MAX as f64)
+            {
+                return Err(format!("cosineSimilarity epsilon must be finite, > 0, and <= f32::MAX, got {eps}"));
+            }
+            Ok([s0[0], 1, 1, 1])
+        }
+        "l2Norm" | "sum" | "mean" | "variancePopulation" | "stdPopulation" | "min" | "max" | "entropy" => {
+            if s0[2] != 1 || s0[3] != 1 {
+                return Err(format!("{ctor} requires [B,F,1,1], got {s0:?}"));
+            }
+            Ok([s0[0], 1, 1, 1])
+        }
+        "normalize" => {
+            if s0[2] != 1 || s0[3] != 1 {
+                return Err(format!("normalize requires [B,F,1,1], got {s0:?}"));
+            }
+            Ok(s0)
+        }
+        "sumAxis" | "meanAxis" | "minAxis" | "maxAxis" => {
+            let axis = arg_usize(args, 1).ok_or("missing axis")?;
+            if axis >= 4 {
+                return Err(format!("{ctor} axis {axis} out of range 0..4"));
+            }
+            let mut out = s0;
+            out[axis] = 1;
+            Ok(out)
+        }
+        "lessEqual01" => {
+            let s1 = in_shapes[1];
+            if s0 != s1 {
+                return Err(format!("lessEqual01 shape mismatch {s0:?} vs {s1:?}; implicit broadcasting is forbidden"));
+            }
+            Ok(s0)
+        }
+        "indicesLike" => {
+            let axis = arg_usize(args, 1).ok_or("missing axis")?;
+            if axis >= 4 {
+                return Err(format!("indicesLike axis {axis} out of range 0..4"));
+            }
+            if s0[axis] > 16_777_217 {
+                return Err(format!("indicesLike axis {axis} length {} exceeds exact-f32 coordinate bound 16777217", s0[axis]));
+            }
+            Ok(s0)
         }
         _ => Err(format!("unknown constructor '{ctor}'")),
     }

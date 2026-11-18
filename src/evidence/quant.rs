@@ -355,7 +355,10 @@ fn unary_lipschitz_const(
     match c {
         "relu" | "tanh" | "softplus" | "transpose" | "shiftUp" | "shiftDown" | "shiftLeft"
         | "shiftRight" | "avgPool1d" | "avgPool2d" | "maxPool1d" | "maxPool2d"
-        | "adaptiveAvgPool2d" | "embedding" | "intToFloat" => Ok(1.0),
+        | "adaptiveAvgPool2d" | "embedding" | "intToFloat" | "abs" | "clamp" | "reshape"
+        | "permute" | "slice" | "selectAxis" | "mean" | "meanAxis" | "min" | "max"
+        | "minAxis" | "maxAxis" => Ok(1.0),
+        "fillLike" | "indicesLike" => Ok(0.0),
         "sigmoid" => Ok(0.25),
         "gelu" => Ok(1.13),
         "hardSwish" => Ok(1.5),
@@ -416,8 +419,8 @@ fn unary_lipschitz_const(
             let gm = norm_gamma_max(spec, layer_idx, nf);
             Ok((2.0 * gm) / eps.max(1e-30).sqrt())
         }
-        "div" | "sqrt" => Err(format!(
-            "bound mode refuses unbounded downstream constructor '{c}'; use --mode measured instead"
+        "div" | "sqrt" | "exp" | "log" => Err(format!(
+            "bound mode refuses unbounded/domain-sensitive constructor '{c}'; use --mode measured instead"
         )),
         other => Err(format!(
             "bound mode does not have analytical Lipschitz bound for '{other}'; use --mode measured"
@@ -449,7 +452,11 @@ fn input_slot_bounds(spec: &SpecV1, cases: &[EvalCase]) -> Result<HashMap<usize,
     Ok(bounds)
 }
 
-fn forward_value_bounds(spec: &SpecV1, init_bounds: &HashMap<usize, f64>) -> Result<HashMap<usize, f64>, String> {
+fn forward_value_bounds(
+    spec: &SpecV1,
+    init_bounds: &HashMap<usize, f64>,
+    slot_shapes: &std::collections::BTreeMap<usize, [usize; 4]>,
+) -> Result<HashMap<usize, f64>, String> {
     let mut slot_b = init_bounds.clone();
     for st in &spec.steps {
         let decl = &spec.layers[st.layer];
@@ -460,6 +467,7 @@ fn forward_value_bounds(spec: &SpecV1, init_bounds: &HashMap<usize, f64>) -> Res
                 "add" | "sub" => ba + bb,
                 "mul" => ba * bb,
                 "concat" => ba.max(bb),
+                "expandLike" => ba,
                 other => {
                     return Err(format!(
                         "bound mode unsupported binary op '{other}'; use --mode measured"
@@ -482,7 +490,22 @@ fn forward_value_bounds(spec: &SpecV1, init_bounds: &HashMap<usize, f64>) -> Res
                 }
                 "sigmoid" => 1.0f64.min(bi * 0.25 + 0.5),
                 "tanh" => 1.0f64.min(bi),
-                "relu" => bi,
+                "relu" | "abs" => bi,
+                "clamp" => {
+                    let min_v = decl.args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let max_v = decl.args.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    min_v.abs().max(max_v.abs())
+                }
+                "fillLike" => decl.args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0).abs(),
+                "indicesLike" => {
+                    let axis = decl.args.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let axis_len = slot_shapes
+                        .get(&st.slots[1])
+                        .and_then(|sh| sh.get(axis))
+                        .copied()
+                        .unwrap_or(1);
+                    axis_len.saturating_sub(1) as f64
+                }
                 _ => {
                     let l = unary_lipschitz_const(decl, spec, st.layer, bi)?;
                     bi * l
@@ -517,6 +540,7 @@ fn analytical_layer_contrib(
                         ba * db + bb * da + da * db
                     }
                     "concat" => da.max(db),
+                    "expandLike" => da,
                     other => {
                         return Err(format!(
                             "bound mode unsupported downstream binary op '{other}'"
@@ -577,7 +601,7 @@ pub fn quant_budget(
     if !(tol.is_finite() && tol >= 0.0) {
         return Err(format!("invalid quant budget tol: {tol}"));
     }
-    let val = validate_spec(spec, false);
+    let val = validate_spec(spec, mode == BudgetMode::Bound);
     if !val.valid {
         return Err(
             serde_json::to_string(&val).unwrap_or_else(|_| format!("invalid spec: {:?}", val.code)),
@@ -603,7 +627,13 @@ pub fn quant_budget(
     let mut cands = Vec::new();
     let val_bounds = if mode == BudgetMode::Bound {
         let init_b = input_slot_bounds(spec, &cases)?;
-        Some(forward_value_bounds(spec, &init_b)?)
+        let empty_shapes = std::collections::BTreeMap::new();
+        let slot_shapes = val
+            .explain
+            .as_ref()
+            .map(|e| &e.slot_shapes)
+            .unwrap_or(&empty_shapes);
+        Some(forward_value_bounds(spec, &init_b, slot_shapes)?)
     } else {
         None
     };

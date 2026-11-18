@@ -254,5 +254,51 @@ pub(crate) fn collect_advanced_checks() -> Vec<SmokeCheck> {
         Ok(format!("workflow_stages=3 optimized_steps={final_steps}"))
     }));
 
+    // 24. Ported 30 pure-math ops end-to-end pipeline
+    checks.push(run_check("ported_math_ops_end_to_end", || {
+        let raw = r#"{
+          "numSlots": 11,
+          "layers": [
+            { "constructor": "indicesLike", "args": [0, 1] },
+            { "constructor": "abs", "args": [1] },
+            { "constructor": "clamp", "args": [2, 0.25, 3.5] },
+            { "constructor": "add", "args": [3] },
+            { "constructor": "normalize", "args": [4] },
+            { "constructor": "entropy", "args": [5] },
+            { "constructor": "expandLike", "args": [6] },
+            { "constructor": "sumAxis", "args": [7, 1] },
+            { "constructor": "variancePopulation", "args": [8] },
+            { "constructor": "lessEqual01", "args": [9] }
+          ],
+          "steps": [
+            { "kind": "unary", "layer": 0, "slots": [0, 1] },
+            { "kind": "unary", "layer": 1, "slots": [0, 2] },
+            { "kind": "unary", "layer": 2, "slots": [2, 3] },
+            { "kind": "binary", "layer": 3, "slots": [1, 3, 4] },
+            { "kind": "unary", "layer": 4, "slots": [4, 5] },
+            { "kind": "unary", "layer": 5, "slots": [5, 6] },
+            { "kind": "binary", "layer": 6, "slots": [6, 4, 7] },
+            { "kind": "unary", "layer": 7, "slots": [7, 8] },
+            { "kind": "unary", "layer": 8, "slots": [4, 9] },
+            { "kind": "binary", "layer": 9, "slots": [8, 9, 10] }
+          ],
+          "outputSlot": 10,
+          "ports": [{ "slot": 0, "shape": [1, 3, 1, 1] }],
+          "inputs": { "0": [-1.0, 2.0, -4.0] }
+        }"#;
+        let spec: crate::spec::SpecV1 =
+            serde_json::from_str(raw).map_err(|e| format!("parse: {e}"))?;
+        let res = crate::engine::run_spec(&spec)?;
+        if res.outputs.shape != [1, 1, 1, 1] || res.outputs.values.len() != 1 {
+            return Err(format!("unexpected shape {:?}", res.outputs.shape));
+        }
+        // indices=[0,1,2], abs=[-1,2,-4]->[1,2,4], clamp(0.25,3.5)->[1,2,3.5], sum=[1,3,5.5]
+        // normalize -> entropy ~ 0.903 -> expandLike [1,3,1,1] -> sumAxis ~ 2.710 <= variance ~ 3.389 -> 1.0
+        if res.outputs.values[0] != 1.0 {
+            return Err(format!("expected 1.0, got {:?}", res.outputs.values));
+        }
+        Ok(format!("all_math_families predicate={}", res.outputs.values[0]))
+    }));
+
     checks
 }

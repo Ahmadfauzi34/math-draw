@@ -272,7 +272,7 @@ pub fn get_capability_catalog(domain: Option<&str>) -> Value {
         "verify": {
             "summary": "Validate plans, prove numerical and exact algebraic equivalence, zoom-fuzz worst cases, and localize step divergences.",
             "tools": [
-                { "cmd": "math-draw validate --explain", "role": "52-constructor static validation, 4D shape inference, and dtype dataflow trace" },
+                { "cmd": "math-draw validate --explain", "role": "82-constructor static validation, 4D shape inference, and dtype dataflow trace" },
                 { "cmd": "math-draw verify [--fuzz] [--zoom]", "role": "Equivalence checker with domain-aware fuzzing and recursive adversarial interval narrowing (--zoom)" },
                 { "cmd": "math-draw linear-equiv", "role": "Exact symbolic affine equivalence prover over linear, add, sub, and concat(dim=1) graphs" },
                 { "cmd": "math-draw trace-hash [--isolate]", "role": "Per-step SHA-256 tensor fingerprinting, divergence step localization, and prefix subspec isolation" },
@@ -308,7 +308,7 @@ pub fn get_capability_catalog(domain: Option<&str>) -> Value {
             "summary": "Manage persistent .burn-harness workspaces, content-addressed tensor artifacts, multi-stage workflows, and subagent branch coordination.",
             "tools": [
                 { "cmd": "math-draw harness <capabilities|digest|resolve-artifact|run-workflow|branch-export|branch-merge|workspace-status>", "role": "Unified agent-harness co-processor interface and pipeline runner" },
-                { "cmd": "math-draw find-op", "role": "Query the 52-constructor catalog and parameter schemas" }
+                { "cmd": "math-draw find-op", "role": "Query the 82-constructor catalog and parameter schemas" }
             ]
         }
     });

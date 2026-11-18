@@ -2,13 +2,13 @@
 
 ## Purpose
 
-Embeds the 23-check end-to-end verification suite directly in `math-draw` (`math-draw smoke`) so any release binary can self-verify core execution, `v2` recursion, verification, autodiff, quantization, sharding, symbolic equivalence, cost modeling, and Layer-4 workflows without external fixtures.
+Embeds the 24-check end-to-end verification suite directly in `math-draw` (`math-draw smoke`) so any release binary can self-verify core execution, `v2` recursion, verification, autodiff, quantization, sharding, symbolic equivalence, cost modeling, Layer-4 workflows, and all 7 ported pure-math families without external fixtures.
 
 ## Ownership
 
 - `SmokeCheck`, `SmokeReport`, timing/assertion helpers (`run_check`, `approx_eq_slice`), and suite runner (`run_smoke_suite`): [`mod.rs`](mod.rs)
 - Checks #1–#15 (execution parity, `v2` repeat/macros, validation, fuzz verify, tree search, autodiff GD, ES fit, mixed `i64` + batch isolation, trace isolation, rollout scan/fixpoint/unroll/bisect, profile/compare, preconditioned GD & sensitivity ES): [`core_checks.rs`](core_checks.rs)
-- Checks #16–#23 (gradcheck autodiff, quant verify/budget, multi-branch mutate, linear shard, weight-lab selftest, linear-equiv, cost-model + zoom-fuzz, harness digest & workflow): [`advanced_checks.rs`](advanced_checks.rs)
+- Checks #16–#24 (gradcheck autodiff, quant verify/budget, multi-branch mutate, linear shard, weight-lab selftest, linear-equiv, cost-model + zoom-fuzz, harness digest & workflow, ported pure-math end-to-end pipeline): [`advanced_checks.rs`](advanced_checks.rs)
 
 ## Local Contracts
 
@@ -24,7 +24,7 @@ Embeds the 23-check end-to-end verification suite directly in `math-draw` (`math
 ## Verification
 
 - `cargo test --locked --test integration smoke_suite_passes_all_checks`
-- `./target/release/math-draw smoke` (23/23 checks passing)
+- `./target/release/math-draw smoke` (24/24 checks passing)
 
 ## Child Graph Index
 

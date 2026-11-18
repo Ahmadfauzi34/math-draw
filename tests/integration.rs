@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 #[test]
-fn catalog_has_all_52_constructors() {
-    assert_eq!(CATALOG.len(), 52);
+fn catalog_has_all_82_constructors() {
+    assert_eq!(CATALOG.len(), 82);
 }
 
 #[test]
@@ -25,7 +25,7 @@ fn smoke_suite_passes_all_checks() {
 }
 
 #[test]
-fn all_52_constructors_execute_cleanly() {
+fn all_82_constructors_execute_cleanly() {
     let single_unary = |ctor: &str, args: Vec<serde_json::Value>, shape: [usize; 4], input: Vec<serde_json::Value>, weights: Option<Vec<f32>>| {
         let mut w_map = BTreeMap::new();
         if let Some(w) = weights {
@@ -55,6 +55,21 @@ fn all_52_constructors_execute_cleanly() {
             inputs: in_map,
         };
         run_spec(&spec).unwrap_or_else(|e| panic!("constructor {ctor} failed: {e}"))
+    };
+    let single_binary = |ctor: &str, args: Vec<serde_json::Value>, s0: [usize; 4], i0: Vec<serde_json::Value>, s1: [usize; 4], i1: Vec<serde_json::Value>| {
+        let spec = SpecV1 {
+            num_slots: 3,
+            layers: vec![LayerDecl { constructor: ctor.into(), args }],
+            steps: vec![StepDecl { kind: "binary".into(), layer: 0, slots: vec![0, 1, 2] }],
+            output_slot: 2,
+            ports: vec![
+                PortDecl { slot: 0, role: "observation".into(), shape: s0, layout: "any_rank4".into() },
+                PortDecl { slot: 1, role: "observation".into(), shape: s1, layout: "any_rank4".into() },
+            ],
+            weights: BTreeMap::new(),
+            inputs: BTreeMap::from([("0".to_string(), i0), ("1".to_string(), i1)]),
+        };
+        run_spec(&spec).unwrap_or_else(|e| panic!("binary constructor {ctor} failed: {e}"))
     };
 
     // Unary float activations & transforms
@@ -103,22 +118,14 @@ fn all_52_constructors_execute_cleanly() {
     // Binary float ops
     for ctor in ["add", "sub", "mul", "matmul", "div", "concat"] {
         let args = if ctor == "concat" { vec![0.into(), 1.into()] } else { vec![0.into()] };
-        let spec = SpecV1 {
-            num_slots: 3,
-            layers: vec![LayerDecl { constructor: ctor.into(), args }],
-            steps: vec![StepDecl { kind: "binary".into(), layer: 0, slots: vec![0, 1, 2] }],
-            output_slot: 2,
-            ports: vec![
-                PortDecl { slot: 0, role: "observation".into(), shape: [1, 1, 2, 2], layout: "any_rank4".into() },
-                PortDecl { slot: 1, role: "observation".into(), shape: [1, 1, 2, 2], layout: "any_rank4".into() },
-            ],
-            weights: BTreeMap::new(),
-            inputs: BTreeMap::from([
-                ("0".to_string(), vec![1.0.into(), 2.0.into(), 3.0.into(), 4.0.into()]),
-                ("1".to_string(), vec![2.0.into(), 2.0.into(), 2.0.into(), 2.0.into()]),
-            ]),
-        };
-        run_spec(&spec).unwrap_or_else(|e| panic!("binary {ctor} failed: {e}"));
+        single_binary(
+            ctor,
+            args,
+            [1, 1, 2, 2],
+            vec![1.0.into(), 2.0.into(), 3.0.into(), 4.0.into()],
+            [1, 1, 2, 2],
+            vec![2.0.into(), 2.0.into(), 2.0.into(), 2.0.into()],
+        );
     }
 
     // Int ops: intAdd, intSub, intMul, intMatmul, intDiv, intRem, intToFloat, intFromFloat
@@ -164,6 +171,80 @@ fn all_52_constructors_execute_cleanly() {
     };
     let rt_res = run_spec(&roundtrip).unwrap();
     assert_eq!(rt_res.outputs.values, vec![7.0, -3.0]);
+
+    // Ported pure math constructors (30)
+    // 1. Numeric (4)
+    assert_eq!(single_unary("abs", vec![0.into()], [1, 3, 1, 1], vec![(-2.0).into(), 0.0.into(), 3.0.into()], None).outputs.values, vec![2.0, 0.0, 3.0]);
+    let exp_out = single_unary("exp", vec![0.into()], [1, 2, 1, 1], vec![0.0.into(), 1.0.into()], None);
+    assert!((exp_out.outputs.values[0] - 1.0).abs() < 1e-6 && (exp_out.outputs.values[1] - std::f32::consts::E).abs() < 1e-5);
+    let log_out = single_unary("log", vec![0.into()], [1, 2, 1, 1], vec![1.0.into(), (std::f32::consts::E as f64).into()], None);
+    assert!(log_out.outputs.values[0].abs() < 1e-6 && (log_out.outputs.values[1] - 1.0).abs() < 1e-5);
+    assert_eq!(single_unary("clamp", vec![0.into(), 0.0.into(), 1.0.into()], [1, 3, 1, 1], vec![(-2.0).into(), 0.5.into(), 3.0.into()], None).outputs.values, vec![0.0, 0.5, 1.0]);
+
+    // 2. Tensor transforms (6)
+    let reshaped = single_unary("reshape", vec![0.into(), json!([1, 1, 3, 2])], [1, 2, 1, 3], (1..=6).map(|v| (v as f64).into()).collect(), None);
+    assert_eq!(reshaped.outputs.shape, [1, 1, 3, 2]);
+    let permuted = single_unary("permute", vec![0.into(), json!([0, 2, 3, 1])], [1, 2, 1, 3], (1..=6).map(|v| (v as f64).into()).collect(), None);
+    assert_eq!(permuted.outputs.shape, [1, 1, 3, 2]);
+    assert_eq!(permuted.outputs.values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    let sliced = single_unary("slice", vec![0.into(), json!([0, 0, 0, 1]), json!([1, 2, 2, 3])], [1, 2, 2, 3], (1..=12).map(|v| (v as f64).into()).collect(), None);
+    assert_eq!(sliced.outputs.shape, [1, 2, 2, 2]);
+    assert_eq!(sliced.outputs.values, vec![2.0, 3.0, 5.0, 6.0, 8.0, 9.0, 11.0, 12.0]);
+    let selected = single_unary("selectAxis", vec![0.into(), 1.into(), json!([1, 0])], [1, 2, 1, 3], (1..=6).map(|v| (v as f64).into()).collect(), None);
+    assert_eq!(selected.outputs.values, vec![4.0, 5.0, 6.0, 1.0, 2.0, 3.0]);
+    let filled = single_unary("fillLike", vec![0.into(), 7.5.into()], [1, 2, 2, 1], vec![0.0.into(); 4], None);
+    assert_eq!(filled.outputs.values, vec![7.5; 4]);
+    let expanded = single_binary("expandLike", vec![0.into()], [2, 1, 1, 1], vec![10.0.into(), 20.0.into()], [2, 3, 1, 1], vec![0.0.into(); 6]);
+    assert_eq!(expanded.outputs.shape, [2, 3, 1, 1]);
+    assert_eq!(expanded.outputs.values, vec![10.0, 10.0, 10.0, 20.0, 20.0, 20.0]);
+
+    // 3. Linear algebra (4)
+    let dot_out = single_binary("dot", vec![0.into()], [2, 3, 1, 1], vec![1.0.into(), 2.0.into(), 3.0.into(), 3.0.into(), 4.0.into(), 0.0.into()], [2, 3, 1, 1], vec![3.0.into(), 1.0.into(), 2.0.into(), 0.0.into(), 4.0.into(), 3.0.into()]);
+    assert_eq!(dot_out.outputs.values, vec![11.0, 16.0]);
+    let norm_out = single_unary("l2Norm", vec![0.into()], [1, 2, 1, 1], vec![3.0.into(), 4.0.into()], None);
+    assert!((norm_out.outputs.values[0] - 5.0).abs() < 1e-5);
+    let dist_out = single_binary("l2Distance", vec![0.into()], [1, 2, 1, 1], vec![1.0.into(), 2.0.into()], [1, 2, 1, 1], vec![4.0.into(), 6.0.into()]);
+    assert!((dist_out.outputs.values[0] - 5.0).abs() < 1e-5);
+    let cos_out = single_binary("cosineSimilarity", vec![0.into()], [1, 2, 1, 1], vec![3.0.into(), 4.0.into()], [1, 2, 1, 1], vec![4.0.into(), 3.0.into()]);
+    assert!((cos_out.outputs.values[0] - 0.96).abs() < 1e-5);
+
+    // 4. Statistics (6) including wide-spread f64 two-pass variance/std
+    let stat_in = vec![2.0.into(), 4.0.into(), 6.0.into(), 8.0.into()];
+    assert_eq!(single_unary("sum", vec![0.into()], [1, 4, 1, 1], stat_in.clone(), None).outputs.values, vec![20.0]);
+    assert_eq!(single_unary("mean", vec![0.into()], [1, 4, 1, 1], stat_in.clone(), None).outputs.values, vec![5.0]);
+    assert_eq!(single_unary("variancePopulation", vec![0.into()], [1, 4, 1, 1], stat_in.clone(), None).outputs.values, vec![5.0]);
+    assert!((single_unary("stdPopulation", vec![0.into()], [1, 4, 1, 1], stat_in.clone(), None).outputs.values[0] - 5.0f32.sqrt()).abs() < 1e-5);
+    assert_eq!(single_unary("min", vec![0.into()], [1, 4, 1, 1], stat_in.clone(), None).outputs.values, vec![2.0]);
+    assert_eq!(single_unary("max", vec![0.into()], [1, 4, 1, 1], stat_in, None).outputs.values, vec![8.0]);
+    let wide_in = vec![1e19.into(), (-1e19).into(), 1e19.into(), (-1e19).into()];
+    let wide_var = single_unary("variancePopulation", vec![0.into()], [1, 4, 1, 1], wide_in.clone(), None);
+    let wide_std = single_unary("stdPopulation", vec![0.into()], [1, 4, 1, 1], wide_in, None);
+    assert!((wide_var.outputs.values[0] - 1e38).abs() < 1e32);
+    assert!((wide_std.outputs.values[0] - 1e19).abs() < 1e13);
+
+    // 5. Axis reduction keepdim (4)
+    let ax_in = vec![1.0.into(), 3.0.into(), 2.0.into(), 6.0.into()];
+    assert_eq!(single_unary("sumAxis", vec![0.into(), 3.into()], [1, 1, 2, 2], ax_in.clone(), None).outputs.values, vec![4.0, 8.0]);
+    assert_eq!(single_unary("meanAxis", vec![0.into(), 3.into()], [1, 1, 2, 2], ax_in.clone(), None).outputs.values, vec![2.0, 4.0]);
+    assert_eq!(single_unary("minAxis", vec![0.into(), 3.into()], [1, 1, 2, 2], ax_in.clone(), None).outputs.values, vec![1.0, 2.0]);
+    assert_eq!(single_unary("maxAxis", vec![0.into(), 3.into()], [1, 1, 2, 2], ax_in, None).outputs.values, vec![3.0, 6.0]);
+
+    // 6. Probability (4)
+    let norm_p = single_unary("normalize", vec![0.into()], [1, 2, 1, 1], vec![1.0.into(), 3.0.into()], None);
+    assert_eq!(norm_p.outputs.values, vec![0.25, 0.75]);
+    let ent = single_unary("entropy", vec![0.into()], [1, 2, 1, 1], vec![0.5.into(), 0.5.into()], None);
+    assert!((ent.outputs.values[0] - std::f32::consts::LN_2).abs() < 1e-5);
+    let ce = single_binary("crossEntropy", vec![0.into()], [1, 2, 1, 1], vec![0.5.into(), 0.5.into()], [1, 2, 1, 1], vec![0.75.into(), 0.25.into()]);
+    let kl = single_binary("klDivergence", vec![0.into()], [1, 2, 1, 1], vec![0.5.into(), 0.5.into()], [1, 2, 1, 1], vec![0.75.into(), 0.25.into()]);
+    let exp_ce = -0.5 * 0.75_f32.ln() - 0.5 * 0.25_f32.ln();
+    assert!((ce.outputs.values[0] - exp_ce).abs() < 1e-5);
+    assert!((kl.outputs.values[0] - (exp_ce - std::f32::consts::LN_2)).abs() < 1e-5);
+
+    // 7. Comparison & Index source (2)
+    let le = single_binary("lessEqual01", vec![0.into()], [1, 4, 1, 1], vec![1.0.into(), 2.0.into(), 3.0.into(), 0.0.into()], [1, 4, 1, 1], vec![2.0.into(), 2.0.into(), 1.0.into(), (-1.0).into()]);
+    assert_eq!(le.outputs.values, vec![1.0, 1.0, 0.0, 0.0]);
+    let idx = single_unary("indicesLike", vec![0.into(), 1.into()], [2, 3, 1, 1], vec![99.0.into(); 6], None);
+    assert_eq!(idx.outputs.values, vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0]);
 }
 
 #[test]
@@ -471,5 +552,189 @@ fn batch3_weight_lab_linear_equiv_cost_model_and_harness() {
     assert_eq!(merged["ok"], json!(true));
     assert_eq!(merged["promoted_winner"]["branch_id"], json!("merge.2"));
     assert_eq!(merged["promoted_winner"]["steps_count"], json!(1));
+}
+
+#[test]
+fn ported_math_ops_domain_and_shape_fail_closed() {
+    use math_draw::quant::{BudgetMode, QuantScheme, quant_budget};
+
+    let expect_run_err = |raw: serde_json::Value, needle: &str| {
+        let s: SpecV1 = serde_json::from_value(raw).unwrap();
+        let err = run_spec(&s).unwrap_err();
+        assert!(err.contains(needle), "expected '{needle}' in '{err}'");
+    };
+    let expect_invalid = |raw: serde_json::Value| {
+        let s: SpecV1 = serde_json::from_value(raw.clone()).unwrap();
+        assert!(!validate_spec(&s, false).valid, "expected invalid spec: {raw}");
+    };
+
+    // Numeric domain failures
+    expect_run_err(json!({
+        "numSlots": 2,
+        "layers": [{ "constructor": "log", "args": [0] }],
+        "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+        "outputSlot": 1,
+        "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+        "inputs": { "0": [1.0, 0.0] }
+    }), "value must be > 0");
+    expect_run_err(json!({
+        "numSlots": 2,
+        "layers": [{ "constructor": "exp", "args": [0] }],
+        "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+        "outputSlot": 1,
+        "ports": [{ "slot": 0, "shape": [1, 1, 1, 1] }],
+        "inputs": { "0": [100.0] }
+    }), "exp output: non-finite");
+    expect_invalid(json!({
+        "numSlots": 2,
+        "layers": [{ "constructor": "clamp", "args": [0, 2.0, 1.0] }],
+        "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+        "outputSlot": 1,
+        "ports": [{ "slot": 0, "shape": [1, 1, 1, 1] }],
+        "inputs": { "0": [0.5] }
+    }));
+
+    // Tensor transform static rejections
+    expect_invalid(json!({
+        "numSlots": 2,
+        "layers": [{ "constructor": "reshape", "args": [0, [1, 2, 2, 2]] }],
+        "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+        "outputSlot": 1,
+        "ports": [{ "slot": 0, "shape": [1, 2, 1, 3] }],
+        "inputs": { "0": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0] }
+    }));
+    expect_invalid(json!({
+        "numSlots": 2,
+        "layers": [{ "constructor": "permute", "args": [0, [0, 1, 1, 3]] }],
+        "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+        "outputSlot": 1,
+        "ports": [{ "slot": 0, "shape": [1, 2, 1, 3] }],
+        "inputs": { "0": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0] }
+    }));
+    expect_invalid(json!({
+        "numSlots": 2,
+        "layers": [{ "constructor": "slice", "args": [0, [0, 0, 0, 2], [1, 2, 2, 2]] }],
+        "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+        "outputSlot": 1,
+        "ports": [{ "slot": 0, "shape": [1, 2, 2, 3] }]
+    }));
+    expect_invalid(json!({
+        "numSlots": 2,
+        "layers": [{ "constructor": "selectAxis", "args": [0, 1, [2]] }],
+        "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+        "outputSlot": 1,
+        "ports": [{ "slot": 0, "shape": [1, 2, 1, 3] }]
+    }));
+    expect_invalid(json!({
+        "numSlots": 3,
+        "layers": [{ "constructor": "expandLike", "args": [0] }],
+        "steps": [{ "kind": "binary", "layer": 0, "slots": [0, 1, 2] }],
+        "outputSlot": 2,
+        "ports": [
+            { "slot": 0, "shape": [2, 2, 1, 1] },
+            { "slot": 1, "shape": [2, 3, 1, 1] }
+        ]
+    }));
+
+    // Linalg & Reduction & Index & Comparison invalid args/shapes
+    expect_invalid(json!({
+        "numSlots": 3,
+        "layers": [{ "constructor": "cosineSimilarity", "args": [0, 0.0] }],
+        "steps": [{ "kind": "binary", "layer": 0, "slots": [0, 1, 2] }],
+        "outputSlot": 2,
+        "ports": [
+            { "slot": 0, "shape": [1, 2, 1, 1] },
+            { "slot": 1, "shape": [1, 2, 1, 1] }
+        ]
+    }));
+    expect_invalid(json!({
+        "numSlots": 2,
+        "layers": [{ "constructor": "sumAxis", "args": [0, 4] }],
+        "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+        "outputSlot": 1,
+        "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }]
+    }));
+    expect_invalid(json!({
+        "numSlots": 3,
+        "layers": [{ "constructor": "lessEqual01", "args": [0] }],
+        "steps": [{ "kind": "binary", "layer": 0, "slots": [0, 1, 2] }],
+        "outputSlot": 2,
+        "ports": [
+            { "slot": 0, "shape": [1, 2, 1, 1] },
+            { "slot": 1, "shape": [1, 1, 2, 1] }
+        ]
+    }));
+    expect_invalid(json!({
+        "numSlots": 2,
+        "layers": [{ "constructor": "indicesLike", "args": [0, 1] }],
+        "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+        "outputSlot": 1,
+        "ports": [{ "slot": 0, "shape": [1, 16777218, 1, 1] }]
+    }));
+
+    // Probability domain rejections
+    expect_run_err(json!({
+        "numSlots": 2,
+        "layers": [{ "constructor": "normalize", "args": [0] }],
+        "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+        "outputSlot": 1,
+        "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+        "inputs": { "0": [-1.0, 2.0] }
+    }), "must be >= 0");
+    expect_run_err(json!({
+        "numSlots": 2,
+        "layers": [{ "constructor": "entropy", "args": [0] }],
+        "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+        "outputSlot": 1,
+        "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+        "inputs": { "0": [0.2, 0.2] }
+    }), "must sum to 1");
+    expect_run_err(json!({
+        "numSlots": 3,
+        "layers": [{ "constructor": "klDivergence", "args": [0] }],
+        "steps": [{ "kind": "binary", "layer": 0, "slots": [0, 1, 2] }],
+        "outputSlot": 2,
+        "ports": [
+            { "slot": 0, "shape": [1, 2, 1, 1] },
+            { "slot": 1, "shape": [1, 2, 1, 1] }
+        ],
+        "inputs": { "0": [1.0, 0.0], "1": [0.0, 1.0] }
+    }), "zero support");
+
+    // Quant budget bound mode: succeeds with bounded `clamp` downstream, refuses `exp`
+    let q_clamp: SpecV1 = serde_json::from_value(json!({
+        "numSlots": 3,
+        "layers": [
+            { "constructor": "linear", "args": [0, 2, 2, false] },
+            { "constructor": "clamp", "args": [1, -2.0, 2.0] }
+        ],
+        "steps": [
+            { "kind": "unary", "layer": 0, "slots": [0, 1] },
+            { "kind": "unary", "layer": 1, "slots": [1, 2] }
+        ],
+        "outputSlot": 2,
+        "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+        "weights": { "0": [0.5, -0.5, 0.25, 0.75] },
+        "inputs": { "0": [1.0, -1.0] }
+    })).unwrap();
+    let qb_ok = quant_budget(&q_clamp, None, 0.1, QuantScheme::Q8PerBlock, BudgetMode::Bound).unwrap();
+    assert!(qb_ok.ok);
+
+    let q_exp: SpecV1 = serde_json::from_value(json!({
+        "numSlots": 3,
+        "layers": [
+            { "constructor": "linear", "args": [0, 2, 2, false] },
+            { "constructor": "exp", "args": [1] }
+        ],
+        "steps": [
+            { "kind": "unary", "layer": 0, "slots": [0, 1] },
+            { "kind": "unary", "layer": 1, "slots": [1, 2] }
+        ],
+        "outputSlot": 2,
+        "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+        "weights": { "0": [0.5, -0.5, 0.25, 0.75] },
+        "inputs": { "0": [1.0, -1.0] }
+    })).unwrap();
+    assert!(quant_budget(&q_exp, None, 0.1, QuantScheme::Q8PerBlock, BudgetMode::Bound).is_err());
 }
 

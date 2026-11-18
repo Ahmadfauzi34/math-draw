@@ -72,6 +72,36 @@ fn fill_f32_vals(n: usize, seed_offset: usize) -> Vec<Value> {
         .collect()
 }
 
+fn fill_pos_f32_vals(n: usize, seed_offset: usize) -> Vec<Value> {
+    (0..n)
+        .map(|i| {
+            let v = (((i + seed_offset) % 9) as f64) * 0.15 + 0.25;
+            Value::from((v * 1000.0).round() / 1000.0)
+        })
+        .collect()
+}
+
+fn fill_prob_vals(shape: [usize; 4]) -> Vec<Value> {
+    let b = shape[0].max(1);
+    let f = shape[1].max(1);
+    let total = shape.iter().product();
+    let mut out = Vec::with_capacity(total);
+    if f == 1 {
+        out.resize(total, Value::from(1.0));
+        return out;
+    }
+    let step = (0.5 / (f as f64)).max(1e-4);
+    let tail = 1.0 - step * ((f - 1) as f64);
+    for _ in 0..b {
+        for _ in 0..(f - 1) {
+            out.push(Value::from(step));
+        }
+        out.push(Value::from(tail));
+    }
+    out.resize(total, Value::from(1.0 / (f as f64)));
+    out
+}
+
 fn fill_int_vals(n: usize, max_val: usize) -> Vec<Value> {
     let m = max_val.max(2);
     (0..n).map(|i| Value::from(((i % (m - 1)) + 1) as i64)).collect()
@@ -130,6 +160,10 @@ pub fn run_cost_model(spec: &SpecV1, iterations: usize) -> Result<CostModelRepor
                 (0..n0).map(|idx| Value::from((idx % vocab.max(1)) as i64)).collect()
             } else if is_int && layer_decl.constructor != "intFromFloat" {
                 fill_int_vals(n0, 8)
+            } else if matches!(layer_decl.constructor.as_str(), "log" | "sqrt" | "normalize") {
+                fill_pos_f32_vals(n0, i)
+            } else if layer_decl.constructor == "entropy" {
+                fill_prob_vals(s0)
             } else {
                 fill_f32_vals(n0, i)
             };
@@ -309,11 +343,16 @@ pub fn run_cost_model(spec: &SpecV1, iterations: usize) -> Result<CostModelRepor
                 };
                 measure_steady_median_ms(&micro, iterations)?
             } else {
-                let mut v1 = fill_f32_vals(n1, i + 3);
-                if layer_decl.constructor == "div" {
-                    v1 = vec![Value::from(1.5); n1];
-                }
-                inputs.insert("0".to_string(), fill_f32_vals(n0, i));
+                let (v0, v1) = if matches!(layer_decl.constructor.as_str(), "crossEntropy" | "klDivergence") {
+                    (fill_prob_vals(s0), fill_prob_vals(s1))
+                } else {
+                    let mut rhs = fill_f32_vals(n1, i + 3);
+                    if layer_decl.constructor == "div" {
+                        rhs = vec![Value::from(1.5); n1];
+                    }
+                    (fill_f32_vals(n0, i), rhs)
+                };
+                inputs.insert("0".to_string(), v0);
                 inputs.insert("1".to_string(), v1);
                 let micro = SpecV1 {
                     num_slots: 3,

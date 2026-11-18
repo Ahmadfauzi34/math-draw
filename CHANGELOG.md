@@ -5,6 +5,28 @@ All notable changes to `math-draw` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-11-18
+
+### Added
+- **Full 82-Constructor Pure-Math Parity (`src/catalog.rs`, `src/graph/validate.rs`, `src/layers/math_numeric.rs`, `src/layers/math_stats_prob.rs`)**:
+  - Ported all 30 remaining pure-math primitives from `ai_agent_builder` (catalog expanded `52 -> 82`) with strict fail-closed validation, 4D shape inference, and deterministic Burn `0.22.1` execution kernels:
+    - **Numeric (4)**: `abs`, `exp` (overflow check), `log` (positive finite domain check), `clamp(min, max)` (`min <= max`).
+    - **Tensor Transforms (6)**: `reshape(shape)`, `permute(axes)`, `slice(starts, ends)`, `selectAxis(axis, indices)`, `fillLike(scalar)`, `expandLike`.
+    - **Linear Algebra (4)**: `dot`, `l2Norm`, `l2Distance`, `cosineSimilarity(epsilon?)` over `[B, F, 1, 1]`.
+    - **Statistics (6)**: `sum`, `mean`, `min`, `max`, plus two-pass `f64` `variancePopulation` and `stdPopulation` to avoid intermediate `f32` square overflows on wide-spread inputs.
+    - **Axis Reductions (4)**: keepdim rank-4 reducers `sumAxis`, `meanAxis`, `minAxis`, `maxAxis`.
+    - **Probability (4)**: `normalize`, `entropy`, `crossEntropy`, `klDivergence` with non-negativity, unit-mass (`1e-5`), and `Q` zero-support enforcement.
+    - **Comparison & Index Source (2)**: `lessEqual01` (exact canonical `0.0`/`1.0`, no implicit broadcast) and `indicesLike(axis)` (exact-`f32` coordinate bound `<= 2^24 + 1`).
+  - Added [`ParamType::U32Array`](src/catalog.rs) and `arg_usize_vec` arg parsing for rank-4 shape/axis/slice/index array parameters.
+- **Subsystem Integration & Expanded Verification (`src/evidence/quant.rs`, `src/runtime/cost_model.rs`, `src/smoke/advanced_checks.rs`, `tests/integration.rs`)**:
+  - Added analytical Lipschitz bounds and forward value bounds in `quant budget --mode bound` for bounded new ops (`abs`, `clamp`, `reshape`, `permute`, `slice`, `selectAxis`, `expandLike`, `fillLike`, `indicesLike`, `mean*`, `min*`, `max*`) while keeping unbounded/domain-sensitive ops (`exp`, `log`, etc.) fail-closed with `--mode measured` guidance.
+  - Updated `cost-model` synthetic probe generators for domain-sensitive ops (`log`, `normalize`, `entropy`, `crossEntropy`, `klDivergence`).
+  - Added smoke check `#24` (`ported_math_ops_end_to_end`, `24/24` passing) and integration tests `catalog_has_all_82_constructors`, `all_82_constructors_execute_cleanly`, and `ported_math_ops_domain_and_shape_fail_closed` (`9/9` passing).
+
+### Changed
+- **Modular Source Architecture & Graph Framework Contracts (`src/`, `AGENTS.md`)**:
+  - Reorganized flat modules into cohesive domain subtrees (`src/layers/`, `src/runtime/`, `src/graph/`, `src/es/`, `src/evidence/`, `src/harness/`, `src/smoke/`, `src/cli/`) while preserving backward-compatible root facades in `src/lib.rs`, with hierarchical `AGENTS.md` contracts across root, module trees, `tests/`, and `examples/`.
+
 ## [0.4.0] - 2026-11-18
 
 ### Added

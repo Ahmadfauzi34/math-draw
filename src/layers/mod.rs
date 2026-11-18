@@ -2,6 +2,8 @@ pub mod activation;
 pub mod binary_int;
 pub mod conv_pool;
 pub mod custom;
+pub mod math_numeric;
+pub mod math_stats_prob;
 pub mod norm_linear;
 
 use burn::module::Param;
@@ -117,6 +119,23 @@ pub(crate) fn arg_opt_f64(args: &[Value], idx: usize) -> Option<f64> {
         Some(Value::Null) | None => None,
         Some(v) => v.as_f64(),
     }
+}
+
+pub(crate) fn arg_usize_vec(args: &[Value], idx: usize) -> Result<Vec<usize>, String> {
+    let arr = args
+        .get(idx)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("missing u32_array arg[{idx}]"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (pos, v) in arr.iter().enumerate() {
+        let n = v
+            .as_u64()
+            .ok_or_else(|| format!("arg[{idx}][{pos}] must be non-negative integer"))?;
+        let u = usize::try_from(n)
+            .map_err(|_| format!("arg[{idx}][{pos}] overflows usize"))?;
+        out.push(u);
+    }
+    Ok(out)
 }
 
 pub(crate) fn resolved_weights(
@@ -357,6 +376,37 @@ pub enum RuntimeLayer {
     IntRem,
     IntToFloat,
     IntFromFloat,
+    // Ported pure math ops (30)
+    Abs,
+    Exp,
+    Log,
+    Clamp { min: f32, max: f32 },
+    Reshape([usize; 4]),
+    Permute([usize; 4]),
+    Slice { starts: [usize; 4], ends: [usize; 4] },
+    SelectAxis { axis: usize, indices: Vec<usize> },
+    FillLike(f32),
+    ExpandLike,
+    Dot,
+    L2Norm,
+    L2Distance,
+    CosineSimilarity(f32),
+    Sum,
+    Mean,
+    VariancePopulation,
+    StdPopulation,
+    Min,
+    Max,
+    SumAxis(usize),
+    MeanAxis(usize),
+    MinAxis(usize),
+    MaxAxis(usize),
+    Normalize,
+    Entropy,
+    CrossEntropy,
+    KlDivergence,
+    LessEqual01,
+    IndicesLike(usize),
 }
 
 pub fn build_layers(
@@ -387,6 +437,10 @@ pub fn build_layers(
             l
         } else if let Some(l) = binary_int::try_build(decl)? {
             l
+        } else if let Some(l) = math_numeric::try_build(decl)? {
+            l
+        } else if let Some(l) = math_stats_prob::try_build(decl)? {
+            l
         } else {
             return Err(format!("unsupported constructor '{}'", decl.constructor));
         };
@@ -413,6 +467,12 @@ pub fn exec_layer(
         return Ok(v);
     }
     if let Some(v) = binary_int::try_exec(layer, inputs, device)? {
+        return Ok(v);
+    }
+    if let Some(v) = math_numeric::try_exec(layer, inputs, device)? {
+        return Ok(v);
+    }
+    if let Some(v) = math_stats_prob::try_exec(layer, inputs, device)? {
         return Ok(v);
     }
     Err("unhandled runtime layer".into())
