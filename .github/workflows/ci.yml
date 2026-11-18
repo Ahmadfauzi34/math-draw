@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-x86_64:
+    name: Test & Smoke (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run cargo test
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Run release smoke suite
+        run: ./target/x86_64-unknown-linux-gnu/release/math-draw smoke
+
+      - name: Verify example specs
+        run: |
+          ./target/x86_64-unknown-linux-gnu/release/math-draw validate examples/linear-relu.json --explain
+          ./target/x86_64-unknown-linux-gnu/release/math-draw run examples/linear-relu.json
+          ./target/x86_64-unknown-linux-gnu/release/math-draw run examples/recursive-gated-residual.v2.json

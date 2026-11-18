@@ -1,0 +1,80 @@
+name: Release Linux x86_64
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-linux-x86_64:
+    name: Build & Release (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run test suite
+        run: cargo test --locked
+
+      - name: Build release binary (Linux x86_64)
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Smoke check release binary
+        run: ./target/x86_64-unknown-linux-gnu/release/math-draw smoke
+
+      - name: Package release archive & checksum
+        id: pkg
+        shell: bash
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+          ASSET_BASE="math-draw-${TAG}-linux-x86_64"
+          mkdir -p "dist/${ASSET_BASE}"
+          cp target/x86_64-unknown-linux-gnu/release/math-draw "dist/${ASSET_BASE}/math-draw"
+          cp README.md CHANGELOG.md "dist/${ASSET_BASE}/"
+          cp -r examples "dist/${ASSET_BASE}/examples"
+          tar -C dist -czf "dist/${ASSET_BASE}.tar.gz" "${ASSET_BASE}"
+          (cd dist && sha256sum "${ASSET_BASE}.tar.gz" > "${ASSET_BASE}.tar.gz.sha256")
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "archive=dist/${ASSET_BASE}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${ASSET_BASE}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.pkg.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              "${{ steps.pkg.outputs.archive }}" \
+              "${{ steps.pkg.outputs.checksum }}" \
+              --clobber
+          else
+            gh release create "$TAG" \
+              "${{ steps.pkg.outputs.archive }}" \
+              "${{ steps.pkg.outputs.checksum }}" \
+              --title "math-draw ${TAG} (Linux x86_64)" \
+              --notes-file CHANGELOG.md
+          fi
