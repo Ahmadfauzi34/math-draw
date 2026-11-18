@@ -484,8 +484,24 @@ fn infer_step_shape(ctor: &str, in_shapes: &[[usize; 4]], args: &[Value]) -> Res
             }
             Ok([s0[0], s0[1], oh, ow])
         }
-        // Ported pure math constructors (30)
-        "abs" | "exp" | "log" => Ok(s0),
+        // Ported pure math constructors (43)
+        "abs" | "exp" | "log" | "sin" | "cos" | "tan" | "floor" | "ceil" | "round" => Ok(s0),
+        "allFinite" => Ok([1, 1, 1, 1]),
+        "atan2" | "powf" | "hypot" => {
+            let s1 = in_shapes[1];
+            if s0 != s1 {
+                return Err(format!("{ctor} shape mismatch {s0:?} vs {s1:?}; implicit broadcasting is forbidden"));
+            }
+            Ok(s0)
+        }
+        "fma" => {
+            let s1 = in_shapes[1];
+            let s2 = in_shapes[2];
+            if s0 != s1 || s0 != s2 {
+                return Err(format!("fma shape mismatch {s0:?} vs {s1:?} vs {s2:?}; implicit broadcasting is forbidden"));
+            }
+            Ok(s0)
+        }
         "clamp" => {
             let min = arg_f64(args, 1).ok_or("missing min")?;
             let max = arg_f64(args, 2).ok_or("missing max")?;
@@ -618,6 +634,15 @@ fn infer_step_shape(ctor: &str, in_shapes: &[[usize; 4]], args: &[Value]) -> Res
         "l2Norm" | "sum" | "mean" | "variancePopulation" | "stdPopulation" | "min" | "max" | "entropy" => {
             if s0[2] != 1 || s0[3] != 1 {
                 return Err(format!("{ctor} requires [B,F,1,1], got {s0:?}"));
+            }
+            Ok([s0[0], 1, 1, 1])
+        }
+        "varianceSample" | "stdSample" => {
+            if s0[2] != 1 || s0[3] != 1 {
+                return Err(format!("{ctor} requires [B,F,1,1], got {s0:?}"));
+            }
+            if s0[1] < 2 {
+                return Err(format!("{ctor} requires at least 2 features (Bessel ddof=1), got {}", s0[1]));
             }
             Ok([s0[0], 1, 1, 1])
         }
@@ -813,8 +838,15 @@ pub fn validate_spec(spec: &SpecV1, include_explain: bool) -> ValidateReport {
             continue;
         };
         let meta = find_constructor(&layer.constructor).unwrap();
-        let want_kind = if meta.arity == 1 { "unary" } else { "binary" };
-        let want_slots = if meta.arity == 1 { 2 } else { 3 };
+        let Some(want_kind) = crate::spec::StepDecl::kind_for_arity(meta.arity) else {
+            mismatches.push(ShapeMismatch {
+                step: si,
+                layer: layer.constructor.clone(),
+                message: format!("unsupported constructor arity {}", meta.arity),
+            });
+            continue;
+        };
+        let want_slots = meta.arity + 1;
         if st.kind != want_kind || st.slots.len() != want_slots {
             mismatches.push(ShapeMismatch {
                 step: si,
@@ -995,7 +1027,7 @@ pub fn validate_spec(spec: &SpecV1, include_explain: bool) -> ValidateReport {
 
     let mut consumed_ports = HashSet::new();
     for st in &spec.steps {
-        let arity = if st.kind == "binary" { 2 } else { 1 };
+        let arity = st.expected_arity();
         for &s in st.slots.iter().take(arity) {
             consumed_ports.insert(s);
         }

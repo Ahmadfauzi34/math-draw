@@ -9,7 +9,7 @@ Contains the complete `math_draw` Rust library crate ([`lib.rs`](lib.rs)) and th
 - Crate root & backward-compatible module facades: [`lib.rs`](lib.rs)
 - Binary entry wrapper: [`main.rs`](main.rs) (delegates directly to [`cli::run_cli`](cli/mod.rs))
 - Canonical `SpecV1`, JSON/f32/i64 parsing, SHA-256 hashing & `v1`/`v2` loading: [`spec.rs`](spec.rs)
-- Authoritative 82-constructor metadata & weight-count registry: [`catalog.rs`](catalog.rs)
+- Authoritative 95-constructor metadata & weight-count registry: [`catalog.rs`](catalog.rs)
 
 ## Local Contracts
 
@@ -31,11 +31,11 @@ Contains the complete `math_draw` Rust library crate ([`lib.rs`](lib.rs)) and th
 
 ## Child Graph Index
 
-- [`layers/AGENTS.md`](layers/AGENTS.md) — 82 Burn layer builders, 4D tensor/int execution kernels, and autograd `GradParam` wrappers
+- [`layers/AGENTS.md`](layers/AGENTS.md) — 95 Burn layer builders, 4D tensor/int execution kernels, and autograd `GradParam` wrappers
 - [`runtime/AGENTS.md`](runtime/AGENTS.md) — `PreparedGraph` execution, step trace hashing, recurrent rollouts, profiling, and cost modeling
 - [`graph/AGENTS.md`](graph/AGENTS.md) — Static validator, `v2` recursive composer, pure rewrites, transactional/branch mutations, and sharding
 - [`es/AGENTS.md`](es/AGENTS.md) — Rewrite tree search, autodiff GD solver, and Evolutionary Strategy optimizer
 - [`evidence/AGENTS.md`](evidence/AGENTS.md) — Equivalence verifier, symbolic affine prover, gradcheck, quantization, and `weight-lab`
 - [`harness/AGENTS.md`](harness/AGENTS.md) — Layer-4 `.burn-harness` workspace, artifact store, branch coordinator, and workflow runner
-- [`smoke/AGENTS.md`](smoke/AGENTS.md) — Built-in 24-check deterministic self-verification suite
+- [`smoke/AGENTS.md`](smoke/AGENTS.md) — Built-in 25-check deterministic self-verification suite
 - [`cli/AGENTS.md`](cli/AGENTS.md) — Command parser, JSON/exit-code formatting, and domain command handlers

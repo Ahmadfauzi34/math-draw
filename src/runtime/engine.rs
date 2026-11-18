@@ -104,7 +104,7 @@ impl PreparedGraph {
                 .layers
                 .get(st.layer)
                 .ok_or_else(|| format!("step {si}: missing layer {}", st.layer))?;
-            let arity = if st.kind == "binary" { 2 } else { 1 };
+            let arity = st.expected_arity();
             let mut ins = Vec::with_capacity(arity);
             for &s in st.slots.iter().take(arity) {
                 let val = slots
@@ -242,7 +242,7 @@ pub fn execute_forward(
         let layer = layers
             .get(st.layer)
             .ok_or_else(|| format!("step {si}: missing layer {}", st.layer))?;
-        let arity = if st.kind == "binary" { 2 } else { 1 };
+        let arity = st.expected_arity();
         let mut ins = Vec::with_capacity(arity);
         for &s in st.slots.iter().take(arity) {
             let val = slots
@@ -277,7 +277,7 @@ pub fn execute_forward_traced(
         let layer = layers
             .get(st.layer)
             .ok_or_else(|| format!("step {si}: missing layer {}", st.layer))?;
-        let arity = if st.kind == "binary" { 2 } else { 1 };
+        let arity = st.expected_arity();
         let mut ins = Vec::with_capacity(arity);
         for &s in st.slots.iter().take(arity) {
             let val = slots

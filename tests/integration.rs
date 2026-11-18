@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 #[test]
-fn catalog_has_all_82_constructors() {
-    assert_eq!(CATALOG.len(), 82);
+fn catalog_has_all_95_constructors() {
+    assert_eq!(CATALOG.len(), 95);
 }
 
 #[test]
@@ -25,7 +25,7 @@ fn smoke_suite_passes_all_checks() {
 }
 
 #[test]
-fn all_82_constructors_execute_cleanly() {
+fn all_95_constructors_execute_cleanly() {
     let single_unary = |ctor: &str, args: Vec<serde_json::Value>, shape: [usize; 4], input: Vec<serde_json::Value>, weights: Option<Vec<f32>>| {
         let mut w_map = BTreeMap::new();
         if let Some(w) = weights {
@@ -70,6 +70,33 @@ fn all_82_constructors_execute_cleanly() {
             inputs: BTreeMap::from([("0".to_string(), i0), ("1".to_string(), i1)]),
         };
         run_spec(&spec).unwrap_or_else(|e| panic!("binary constructor {ctor} failed: {e}"))
+    };
+    let single_ternary = |ctor: &str,
+                          args: Vec<serde_json::Value>,
+                          s0: [usize; 4],
+                          i0: Vec<serde_json::Value>,
+                          s1: [usize; 4],
+                          i1: Vec<serde_json::Value>,
+                          s2: [usize; 4],
+                          i2: Vec<serde_json::Value>| {
+        let spec = SpecV1 {
+            num_slots: 4,
+            layers: vec![LayerDecl { constructor: ctor.into(), args }],
+            steps: vec![StepDecl { kind: "ternary".into(), layer: 0, slots: vec![0, 1, 2, 3] }],
+            output_slot: 3,
+            ports: vec![
+                PortDecl { slot: 0, role: "observation".into(), shape: s0, layout: "any_rank4".into() },
+                PortDecl { slot: 1, role: "observation".into(), shape: s1, layout: "any_rank4".into() },
+                PortDecl { slot: 2, role: "observation".into(), shape: s2, layout: "any_rank4".into() },
+            ],
+            weights: BTreeMap::new(),
+            inputs: BTreeMap::from([
+                ("0".to_string(), i0),
+                ("1".to_string(), i1),
+                ("2".to_string(), i2),
+            ]),
+        };
+        run_spec(&spec).unwrap_or_else(|e| panic!("ternary constructor {ctor} failed: {e}"))
     };
 
     // Unary float activations & transforms
@@ -245,6 +272,57 @@ fn all_82_constructors_execute_cleanly() {
     assert_eq!(le.outputs.values, vec![1.0, 1.0, 0.0, 0.0]);
     let idx = single_unary("indicesLike", vec![0.into(), 1.into()], [2, 3, 1, 1], vec![99.0.into(); 6], None);
     assert_eq!(idx.outputs.values, vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0]);
+
+    // 8. Parity 13 math constructors (11 numeric + 2 sample stats)
+    let sin_out = single_unary("sin", vec![0.into()], [1, 2, 1, 1], vec![0.0.into(), (std::f64::consts::FRAC_PI_2).into()], None);
+    assert!(sin_out.outputs.values[0].abs() < 1e-6 && (sin_out.outputs.values[1] - 1.0).abs() < 1e-5);
+    let cos_out = single_unary("cos", vec![0.into()], [1, 2, 1, 1], vec![0.0.into(), std::f64::consts::PI.into()], None);
+    assert!((cos_out.outputs.values[0] - 1.0).abs() < 1e-6 && (cos_out.outputs.values[1] + 1.0).abs() < 1e-5);
+    let tan_out = single_unary("tan", vec![0.into()], [1, 2, 1, 1], vec![0.0.into(), std::f64::consts::FRAC_PI_4.into()], None);
+    assert!(tan_out.outputs.values[0].abs() < 1e-6 && (tan_out.outputs.values[1] - 1.0).abs() < 1e-5);
+
+    assert_eq!(single_unary("floor", vec![0.into()], [1, 3, 1, 1], vec![2.9.into(), (-2.1).into(), 3.0.into()], None).outputs.values, vec![2.0, -3.0, 3.0]);
+    assert_eq!(single_unary("ceil", vec![0.into()], [1, 3, 1, 1], vec![2.1.into(), (-2.9).into(), 3.0.into()], None).outputs.values, vec![3.0, -2.0, 3.0]);
+    let rnd_out = single_unary("round", vec![0.into()], [1, 3, 1, 1], vec![2.5.into(), 3.5.into(), (-2.5).into()], None);
+    assert_eq!(rnd_out.outputs.values, vec![2.0, 4.0, -2.0]);
+
+    let at2_out = single_binary("atan2", vec![0.into()], [1, 2, 1, 1], vec![1.0.into(), (-1.0).into()], [1, 2, 1, 1], vec![1.0.into(), 0.0.into()]);
+    assert!((at2_out.outputs.values[0] - std::f32::consts::FRAC_PI_4).abs() < 1e-5);
+    assert!((at2_out.outputs.values[1] + std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+
+    let pow_out = single_binary("powf", vec![0.into()], [1, 2, 1, 1], vec![2.0.into(), 9.0.into()], [1, 2, 1, 1], vec![3.0.into(), 0.5.into()]);
+    assert!((pow_out.outputs.values[0] - 8.0).abs() < 1e-5 && (pow_out.outputs.values[1] - 3.0).abs() < 1e-5);
+
+    let hyp_out = single_binary("hypot", vec![0.into()], [1, 2, 1, 1], vec![3.0.into(), 1e38.into()], [1, 2, 1, 1], vec![4.0.into(), 1e38.into()]);
+    assert!((hyp_out.outputs.values[0] - 5.0).abs() < 1e-5);
+    assert!((hyp_out.outputs.values[1] - 1e38 * std::f32::consts::SQRT_2).abs() < 1e32);
+
+    let fma_out = single_ternary(
+        "fma",
+        vec![0.into()],
+        [1, 3, 1, 1],
+        vec![2.0.into(), (-3.0).into(), 0.5.into()],
+        [1, 3, 1, 1],
+        vec![4.0.into(), 5.0.into(), 6.0.into()],
+        [1, 3, 1, 1],
+        vec![1.5.into(), 2.0.into(), (-1.0).into()],
+    );
+    assert_eq!(fma_out.outputs.values, vec![9.5, -13.0, 2.0]);
+
+    let fin_out = single_unary("allFinite", vec![0.into()], [1, 3, 1, 1], vec![1.0.into(), (-2.0).into(), 0.0.into()], None);
+    assert_eq!(fin_out.outputs.shape, [1, 1, 1, 1]);
+    assert_eq!(fin_out.outputs.values, vec![1.0]);
+
+    let sample_in = vec![2.0.into(), 4.0.into(), 6.0.into(), 8.0.into()];
+    let vs = single_unary("varianceSample", vec![0.into()], [1, 4, 1, 1], sample_in.clone(), None);
+    let ss = single_unary("stdSample", vec![0.into()], [1, 4, 1, 1], sample_in, None);
+    assert!((vs.outputs.values[0] - (20.0 / 3.0)).abs() < 1e-5);
+    assert!((ss.outputs.values[0] - (20.0f32 / 3.0).sqrt()).abs() < 1e-5);
+    let wide_sample_in = vec![1e19.into(), (-1e19).into(), 1e19.into(), (-1e19).into()];
+    let wide_vs = single_unary("varianceSample", vec![0.into()], [1, 4, 1, 1], wide_sample_in.clone(), None);
+    let wide_ss = single_unary("stdSample", vec![0.into()], [1, 4, 1, 1], wide_sample_in, None);
+    assert!((wide_vs.outputs.values[0] - (4e38_f64 / 3.0) as f32).abs() < 1e32);
+    assert!((wide_ss.outputs.values[0] - (4e38_f64 / 3.0).sqrt() as f32).abs() < 1e13);
 }
 
 #[test]
@@ -738,3 +816,190 @@ fn ported_math_ops_domain_and_shape_fail_closed() {
     assert!(quant_budget(&q_exp, None, 0.1, QuantScheme::Q8PerBlock, BudgetMode::Bound).is_err());
 }
 
+#[test]
+fn parity_13_math_ops_fail_closed_and_ternary_pipelines() {
+    use burn::tensor::{Device, Tensor, TensorData};
+    use math_draw::cost_model::run_cost_model;
+    use math_draw::layers::{RuntimeLayer, SlotValue, exec_layer};
+    use math_draw::mutate::{MutationRequest, mutate_spec};
+    use math_draw::quant::{BudgetMode, QuantScheme, quant_budget};
+    use math_draw::trace::trace_hash_spec;
+
+    let expect_run_err = |raw: serde_json::Value, needle: &str| {
+        let s: SpecV1 = serde_json::from_value(raw).unwrap();
+        let err = run_spec(&s).unwrap_err();
+        assert!(err.contains(needle), "expected '{needle}' in '{err}'");
+    };
+    let expect_invalid = |raw: serde_json::Value| {
+        let s: SpecV1 = serde_json::from_value(raw.clone()).unwrap();
+        assert!(!validate_spec(&s, false).valid, "expected invalid spec: {raw}");
+    };
+
+    // 1. powf fail-closed domains & overflows
+    expect_run_err(json!({
+        "numSlots": 3,
+        "layers": [{ "constructor": "powf", "args": [0] }],
+        "steps": [{ "kind": "binary", "layer": 0, "slots": [0, 1, 2] }],
+        "outputSlot": 2,
+        "ports": [
+            { "slot": 0, "shape": [1, 1, 1, 1] },
+            { "slot": 1, "shape": [1, 1, 1, 1] }
+        ],
+        "inputs": { "0": [-8.0], "1": [0.33333334] }
+    }), "non-finite");
+    expect_run_err(json!({
+        "numSlots": 3,
+        "layers": [{ "constructor": "powf", "args": [0] }],
+        "steps": [{ "kind": "binary", "layer": 0, "slots": [0, 1, 2] }],
+        "outputSlot": 2,
+        "ports": [
+            { "slot": 0, "shape": [1, 1, 1, 1] },
+            { "slot": 1, "shape": [1, 1, 1, 1] }
+        ],
+        "inputs": { "0": [0.0], "1": [-1.0] }
+    }), "non-finite");
+    expect_run_err(json!({
+        "numSlots": 3,
+        "layers": [{ "constructor": "powf", "args": [0] }],
+        "steps": [{ "kind": "binary", "layer": 0, "slots": [0, 1, 2] }],
+        "outputSlot": 2,
+        "ports": [
+            { "slot": 0, "shape": [1, 1, 1, 1] },
+            { "slot": 1, "shape": [1, 1, 1, 1] }
+        ],
+        "inputs": { "0": [1e38], "1": [2.0] }
+    }), "non-finite");
+
+    // 2. hypot overflow above f32::MAX fails closed (while (1e38, 1e38) passes via scaled sqrt)
+    expect_run_err(json!({
+        "numSlots": 3,
+        "layers": [{ "constructor": "hypot", "args": [0] }],
+        "steps": [{ "kind": "binary", "layer": 0, "slots": [0, 1, 2] }],
+        "outputSlot": 2,
+        "ports": [
+            { "slot": 0, "shape": [1, 1, 1, 1] },
+            { "slot": 1, "shape": [1, 1, 1, 1] }
+        ],
+        "inputs": { "0": [3e38], "1": [3e38] }
+    }), "non-finite");
+
+    // 3. sample variance/std fail closed when features < 2
+    for ctor in ["varianceSample", "stdSample"] {
+        expect_invalid(json!({
+            "numSlots": 2,
+            "layers": [{ "constructor": ctor, "args": [0] }],
+            "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+            "outputSlot": 1,
+            "ports": [{ "slot": 0, "shape": [1, 1, 1, 1] }],
+            "inputs": { "0": [42.0] }
+        }));
+    }
+
+    // 4. fma structural validation (shape mismatch, wrong kind, wrong slot arity)
+    expect_invalid(json!({
+        "numSlots": 4,
+        "layers": [{ "constructor": "fma", "args": [0] }],
+        "steps": [{ "kind": "ternary", "layer": 0, "slots": [0, 1, 2, 3] }],
+        "outputSlot": 3,
+        "ports": [
+            { "slot": 0, "shape": [1, 2, 1, 1] },
+            { "slot": 1, "shape": [1, 3, 1, 1] },
+            { "slot": 2, "shape": [1, 2, 1, 1] }
+        ]
+    }));
+    expect_invalid(json!({
+        "numSlots": 4,
+        "layers": [{ "constructor": "fma", "args": [0] }],
+        "steps": [{ "kind": "binary", "layer": 0, "slots": [0, 1, 2, 3] }],
+        "outputSlot": 3,
+        "ports": [
+            { "slot": 0, "shape": [1, 2, 1, 1] },
+            { "slot": 1, "shape": [1, 2, 1, 1] },
+            { "slot": 2, "shape": [1, 2, 1, 1] }
+        ]
+    }));
+    expect_invalid(json!({
+        "numSlots": 3,
+        "layers": [{ "constructor": "fma", "args": [0] }],
+        "steps": [{ "kind": "ternary", "layer": 0, "slots": [0, 1, 2] }],
+        "outputSlot": 2,
+        "ports": [
+            { "slot": 0, "shape": [1, 2, 1, 1] },
+            { "slot": 1, "shape": [1, 2, 1, 1] }
+        ]
+    }));
+
+    // 5. allFinite direct tensor check with non-finite entry returns 0.0 (no error)
+    let dev = Device::flex();
+    let bad_t = Tensor::<4>::from_data(TensorData::new(vec![1.0f32, f32::NAN], [1, 2, 1, 1]), &dev);
+    let out_fin = exec_layer(&RuntimeLayer::AllFinite, &[SlotValue::F32(bad_t)], &dev).unwrap();
+    let fin_vals = out_fin.as_f32("test").unwrap().into_data().try_to_vec::<f32>().unwrap();
+    assert_eq!(fin_vals, vec![0.0]);
+
+    // 6. v2 composer + cost-model + trace-hash + quant_budget + mutate with ternary fma
+    let v2_fma = r#"{
+        "schema": "burn-math.recursive-spec.v2",
+        "ports": {
+            "a": { "slot": 0, "shape": [1, 2, 1, 1] },
+            "b": { "slot": 1, "shape": [1, 2, 1, 1] },
+            "c": { "slot": 2, "shape": [1, 2, 1, 1] }
+        },
+        "inputs": {
+            "a": [1.0, -2.0],
+            "b": [3.0, 4.0],
+            "c": [0.5, 1.5]
+        },
+        "steps": [
+            { "op": "linear", "args": [2, 2, false], "weights": [1.0, 0.0, 0.0, 1.0], "in": ["a"], "out": "la" },
+            { "op": "fma", "in": ["la", "b", "c"], "out": "y" }
+        ],
+        "output": "y"
+    }"#;
+    let compiled = load_spec_str(v2_fma, Path::new(".")).unwrap().spec;
+    assert_eq!(compiled.steps[1].kind, "ternary");
+    let res = run_spec(&compiled).unwrap();
+    assert_eq!(res.outputs.values, vec![3.5, -6.5]);
+
+    let cm = run_cost_model(&compiled, 3).unwrap();
+    assert!(cm.ok && cm.per_op.len() == 2 && cm.per_op.iter().any(|r| r.layer == "fma" && r.kind == "ternary"));
+
+    let th = trace_hash_spec(&compiled, 1024).unwrap();
+    assert!(th.ok && th.captured_steps == 2);
+
+    let qb_bound = quant_budget(&compiled, None, 0.5, QuantScheme::Q8PerBlock, BudgetMode::Bound).unwrap();
+    let qb_meas = quant_budget(&compiled, None, 0.5, QuantScheme::Int8, BudgetMode::Measured).unwrap();
+    assert!(qb_bound.ok && qb_meas.ok);
+
+    // Mutate: fuse mul(a,b) + add(t,c) into a single equivalent ternary fma step
+    let base_raw = r#"{
+        "numSlots": 5,
+        "layers": [
+            { "constructor": "mul", "args": [0] },
+            { "constructor": "add", "args": [1] }
+        ],
+        "steps": [
+            { "kind": "binary", "layer": 0, "slots": [0, 1, 3] },
+            { "kind": "binary", "layer": 1, "slots": [3, 2, 4] }
+        ],
+        "outputSlot": 4,
+        "ports": [
+            { "slot": 0, "shape": [1, 2, 1, 1] },
+            { "slot": 1, "shape": [1, 2, 1, 1] },
+            { "slot": 2, "shape": [1, 2, 1, 1] }
+        ],
+        "inputs": { "0": [1.5, -2.0], "1": [2.0, 3.0], "2": [0.25, -1.5] }
+    }"#;
+    let base = load_spec_str(base_raw, Path::new(".")).unwrap().spec;
+    let mreq: MutationRequest = serde_json::from_value(json!({
+        "commit": true,
+        "edits": [
+            { "op": "removeStep", "index": 1 },
+            { "op": "replaceStep", "index": 0, "layer": { "constructor": "fma", "args": [2] }, "slots": [0, 1, 2, 4] }
+        ]
+    })).unwrap();
+    let mrep = mutate_spec(&base, &mreq, None, 1e-6, 1e-6).unwrap();
+    assert!(mrep.ok && mrep.committed, "mutate failed: {:?}", mrep.branches);
+    let mutated = mrep.resulting_spec.as_ref().unwrap();
+    assert_eq!(mutated.steps.len(), 1);
+    assert_eq!(mutated.steps[0].kind, "ternary");
+}

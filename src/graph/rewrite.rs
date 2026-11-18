@@ -53,10 +53,11 @@ pub const SIMPLIFY_ORDER: &[&str] = &[
 ];
 
 fn inputs_of(st: &StepDecl) -> &[usize] {
-    if st.kind == "binary" && st.slots.len() >= 2 {
-        &st.slots[..2]
+    let arity = st.expected_arity();
+    if st.slots.len() > arity {
+        &st.slots[..arity]
     } else if !st.slots.is_empty() {
-        &st.slots[..1]
+        &st.slots[..st.slots.len() - 1]
     } else {
         &[]
     }

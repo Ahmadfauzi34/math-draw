@@ -129,6 +129,8 @@ pub(super) fn try_build(decl: &LayerDecl) -> Result<Option<RuntimeLayer>, String
         "mean" => RuntimeLayer::Mean,
         "variancePopulation" => RuntimeLayer::VariancePopulation,
         "stdPopulation" => RuntimeLayer::StdPopulation,
+        "varianceSample" => RuntimeLayer::VarianceSample,
+        "stdSample" => RuntimeLayer::StdSample,
         "min" => RuntimeLayer::Min,
         "max" => RuntimeLayer::Max,
         "normalize" => RuntimeLayer::Normalize,
@@ -206,16 +208,33 @@ pub(super) fn try_exec(
             let (shape, _) = validate_finite_features(&x, "max input")?;
             SlotValue::F32(checked_scalar_output(x.max_dim(1), shape[0], "max output")?)
         }
-        RuntimeLayer::VariancePopulation | RuntimeLayer::StdPopulation => {
-            let is_std = matches!(layer, RuntimeLayer::StdPopulation);
-            let ctx = if is_std {
-                "stdPopulation"
-            } else {
-                "variancePopulation"
+        RuntimeLayer::VariancePopulation
+        | RuntimeLayer::StdPopulation
+        | RuntimeLayer::VarianceSample
+        | RuntimeLayer::StdSample => {
+            let is_std = matches!(
+                layer,
+                RuntimeLayer::StdPopulation | RuntimeLayer::StdSample
+            );
+            let ddof: usize = match layer {
+                RuntimeLayer::VarianceSample | RuntimeLayer::StdSample => 1,
+                _ => 0,
+            };
+            let ctx = match layer {
+                RuntimeLayer::VariancePopulation => "variancePopulation",
+                RuntimeLayer::StdPopulation => "stdPopulation",
+                RuntimeLayer::VarianceSample => "varianceSample",
+                RuntimeLayer::StdSample => "stdSample",
+                _ => unreachable!(),
             };
             let x = inputs[0].as_f32(ctx)?;
             let (shape, values) = validate_finite_features(&x, &format!("{ctx} input"))?;
             let (batch, features) = (shape[0], shape[1]);
+            if ddof > 0 && features < 2 {
+                return Err(format!(
+                    "{ctx}: sample variance requires at least 2 features, got {features}"
+                ));
+            }
             let mut out = Vec::with_capacity(batch);
             for b in 0..batch {
                 let row = &values[b * features..(b + 1) * features];
@@ -228,7 +247,7 @@ pub(super) fn try_exec(
                         d * d
                     })
                     .sum();
-                let var = sq / n;
+                let var = sq / (n - ddof as f64);
                 let val_f64 = if is_std { var.sqrt() } else { var };
                 let val_f32 = val_f64 as f32;
                 if !val_f32.is_finite() {

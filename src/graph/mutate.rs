@@ -86,13 +86,12 @@ pub struct MutateReport {
     pub resulting_spec: Option<SpecV1>,
 }
 
-fn layer_is_binary(decl: &LayerDecl, slots_len: usize) -> Result<bool, String> {
+fn layer_expected_arity(decl: &LayerDecl, slots_len: usize) -> Result<usize, String> {
     let meta = find_constructor(&decl.constructor)
         .ok_or_else(|| format!("unknown layer constructor '{}'", decl.constructor))?;
     match meta.arity {
-        1 => Ok(false),
-        2 => Ok(true),
-        _ => Ok(slots_len == 3),
+        1..=3 => Ok(meta.arity),
+        _ => Ok(slots_len.saturating_sub(1).clamp(1, 3)),
     }
 }
 
@@ -118,8 +117,8 @@ pub fn apply_edits_to_spec(base: &SpecV1, edits: &[GraphEdit]) -> Result<(SpecV1
                 if *index >= s.steps.len() {
                     return Err(format!("replaceStep: index {index} out of bounds"));
                 }
-                let is_bin = layer_is_binary(layer, slots.len())?;
-                let expected = if is_bin { 3 } else { 2 };
+                let arity = layer_expected_arity(layer, slots.len())?;
+                let expected = arity + 1;
                 if slots.len() < expected {
                     return Err(format!(
                         "replaceStep: expected at least {expected} slots for {}, got {}",
@@ -127,6 +126,8 @@ pub fn apply_edits_to_spec(base: &SpecV1, edits: &[GraphEdit]) -> Result<(SpecV1
                         slots.len()
                     ));
                 }
+                let kind = StepDecl::kind_for_arity(arity)
+                    .ok_or_else(|| format!("unsupported arity {arity}"))?;
                 let new_li = s.layers.len();
                 s.layers.push(layer.clone());
                 let used_slots = slots[..expected].to_vec();
@@ -136,7 +137,7 @@ pub fn apply_edits_to_spec(base: &SpecV1, edits: &[GraphEdit]) -> Result<(SpecV1
                     }
                 }
                 s.steps[*index] = StepDecl {
-                    kind: if is_bin { "binary" } else { "unary" }.to_string(),
+                    kind: kind.to_string(),
                     layer: new_li,
                     slots: used_slots,
                 };
@@ -145,8 +146,8 @@ pub fn apply_edits_to_spec(base: &SpecV1, edits: &[GraphEdit]) -> Result<(SpecV1
                 if *index > s.steps.len() {
                     return Err(format!("insertStep: index {index} > steps len {}", s.steps.len()));
                 }
-                let is_bin = layer_is_binary(layer, slots.len())?;
-                let expected = if is_bin { 3 } else { 2 };
+                let arity = layer_expected_arity(layer, slots.len())?;
+                let expected = arity + 1;
                 if slots.len() < expected {
                     return Err(format!(
                         "insertStep: expected at least {expected} slots for {}, got {}",
@@ -154,6 +155,8 @@ pub fn apply_edits_to_spec(base: &SpecV1, edits: &[GraphEdit]) -> Result<(SpecV1
                         slots.len()
                     ));
                 }
+                let kind = StepDecl::kind_for_arity(arity)
+                    .ok_or_else(|| format!("unsupported arity {arity}"))?;
                 let new_li = s.layers.len();
                 s.layers.push(layer.clone());
                 let used_slots = slots[..expected].to_vec();
@@ -165,7 +168,7 @@ pub fn apply_edits_to_spec(base: &SpecV1, edits: &[GraphEdit]) -> Result<(SpecV1
                 s.steps.insert(
                     *index,
                     StepDecl {
-                        kind: if is_bin { "binary" } else { "unary" }.to_string(),
+                        kind: kind.to_string(),
                         layer: new_li,
                         slots: used_slots,
                     },
@@ -182,7 +185,7 @@ pub fn apply_edits_to_spec(base: &SpecV1, edits: &[GraphEdit]) -> Result<(SpecV1
                     .steps
                     .get_mut(*index)
                     .ok_or_else(|| format!("reconnectStep: index {index} out of bounds"))?;
-                let expected = if st.kind == "binary" { 3 } else { 2 };
+                let expected = st.expected_arity() + 1;
                 if slots.len() < expected {
                     return Err(format!(
                         "reconnectStep: expected {expected} slots for {} step",

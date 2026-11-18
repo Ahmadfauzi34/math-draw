@@ -300,5 +300,57 @@ pub(crate) fn collect_advanced_checks() -> Vec<SmokeCheck> {
         Ok(format!("all_math_families predicate={}", res.outputs.values[0]))
     }));
 
+    // 25. Parity 13 math ops + ternary fma end-to-end (compiled from v2)
+    checks.push(run_check("parity_13_math_ops_and_ternary_fma", || {
+        let raw = r#"{
+          "schema": "burn-math.recursive-spec.v2",
+          "ports": {
+            "x0": { "slot": 0, "shape": [1, 2, 1, 1] },
+            "x2": { "slot": 1, "shape": [1, 2, 1, 1] }
+          },
+          "inputs": {
+            "x0": [0.0, 1.0],
+            "x2": [2.5, 3.5]
+          },
+          "steps": [
+            { "op": "sin", "in": ["x0"], "out": "s_sin" },
+            { "op": "cos", "in": ["x0"], "out": "s_cos" },
+            { "op": "tan", "in": ["x0"], "out": "s_tan" },
+            { "op": "floor", "in": ["x2"], "out": "s_flr" },
+            { "op": "ceil", "in": ["x2"], "out": "s_ceil" },
+            { "op": "round", "in": ["x2"], "out": "s_rnd" },
+            { "op": "atan2", "in": ["s_sin", "s_cos"], "out": "s_at2" },
+            { "op": "hypot", "in": ["s_flr", "s_rnd"], "out": "s_hyp" },
+            { "op": "powf", "in": ["s_flr", "s_ceil"], "out": "s_pow" },
+            { "op": "fma", "in": ["s_at2", "s_hyp", "s_pow"], "out": "s_fma" },
+            { "op": "varianceSample", "in": ["s_fma"], "out": "s_vs" },
+            { "op": "stdSample", "in": ["s_fma"], "out": "s_ss" },
+            { "op": "allFinite", "in": ["s_tan"], "out": "t_fin" },
+            { "op": "fma", "in": ["s_vs", "t_fin", "s_ss"], "out": "final_out" }
+          ],
+          "output": "final_out"
+        }"#;
+        let loaded = load_spec_str(raw, Path::new("."))?;
+        let ternary_count = loaded.spec.steps.iter().filter(|s| s.kind == "ternary").count();
+        if ternary_count != 2 {
+            return Err(format!("expected 2 ternary steps, got {ternary_count}"));
+        }
+        let res = crate::engine::run_spec(&loaded.spec)?;
+        let expected = 3042.0f32 + 3042.0f32.sqrt();
+        if res.outputs.shape != [1, 1, 1, 1]
+            || res.outputs.values.len() != 1
+            || (res.outputs.values[0] - expected).abs() > 1e-2
+        {
+            return Err(format!(
+                "expected [{expected}], got {:?} (shape {:?})",
+                res.outputs.values, res.outputs.shape
+            ));
+        }
+        Ok(format!(
+            "13_ops_ternary_fma out={:.4} ternary_steps={ternary_count}",
+            res.outputs.values[0]
+        ))
+    }));
+
     checks
 }

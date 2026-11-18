@@ -377,7 +377,7 @@ pub fn rollout_unroll(
         slot_map.insert(state_port, cur_state_slot);
 
         for st in &spec.steps {
-            let arity = if st.kind == "binary" { 2 } else { 1 };
+            let arity = st.expected_arity();
             let mut new_slots = Vec::with_capacity(arity + 1);
             for &s_in in st.slots.iter().take(arity) {
                 let mapped_in = *slot_map

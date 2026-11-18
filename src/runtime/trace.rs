@@ -92,12 +92,12 @@ pub fn extract_prefix_subspec(spec: &SpecV1, step_inclusive: usize) -> Option<Sp
     let end = step_inclusive.min(spec.steps.len() - 1);
     let prefix_steps = spec.steps[..=end].to_vec();
     let last_step = prefix_steps.last()?;
-    let arity = if last_step.kind == "binary" { 2 } else { 1 };
+    let arity = last_step.expected_arity();
     let out_slot = *last_step.slots.get(arity)?;
 
     let mut used_in_slots = HashSet::new();
     for st in &prefix_steps {
-        let a = if st.kind == "binary" { 2 } else { 1 };
+        let a = st.expected_arity();
         for &s in st.slots.iter().take(a) {
             used_in_slots.insert(s);
         }

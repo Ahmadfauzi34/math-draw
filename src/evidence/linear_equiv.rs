@@ -97,7 +97,7 @@ fn compute_live_step_indices(spec: &SpecV1) -> BTreeSet<usize> {
         };
         if live_slots.contains(&out_slot) {
             live_steps.insert(si);
-            let in_count = if st.kind == "binary" { 2 } else { 1 };
+            let in_count = st.expected_arity();
             for &in_s in st.slots.iter().take(in_count) {
                 live_slots.insert(in_s);
             }

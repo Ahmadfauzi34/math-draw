@@ -19,6 +19,40 @@ pub struct StepDecl {
     pub slots: Vec<usize>,
 }
 
+impl StepDecl {
+    pub fn expected_arity(&self) -> usize {
+        match self.kind.as_str() {
+            "unary" => 1,
+            "binary" => 2,
+            "ternary" => 3,
+            _ => 1,
+        }
+    }
+
+    pub fn kind_for_arity(arity: usize) -> Option<&'static str> {
+        match arity {
+            1 => Some("unary"),
+            2 => Some("binary"),
+            3 => Some("ternary"),
+            _ => None,
+        }
+    }
+
+    pub fn input_slots(&self) -> &[usize] {
+        let a = self.expected_arity();
+        if self.slots.len() > a {
+            &self.slots[..a]
+        } else {
+            &[]
+        }
+    }
+
+    pub fn output_slot(&self) -> Option<usize> {
+        let a = self.expected_arity();
+        self.slots.get(a).copied()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PortDecl {
     pub slot: usize,

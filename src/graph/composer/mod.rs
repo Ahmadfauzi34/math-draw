@@ -183,7 +183,7 @@ fn expand_step_list(
             st.get("kind").and_then(|v| v.as_str()),
             st.get("layer").and_then(|v| v.as_u64()),
             st.get("slots").and_then(|v| v.as_array()),
-        ) && (kind == "unary" || kind == "binary")
+        ) && (kind == "unary" || kind == "binary" || kind == "ternary")
             && !slots_arr.is_empty()
         {
             let mut mapped = Vec::with_capacity(slots_arr.len());
@@ -626,11 +626,11 @@ fn expand_step_list(
         }
         let out_slot = resolve_out(raw_out, scope_env, &mut state.alloc)?;
         let arity = in_slots.len();
-        if arity != 1 && arity != 2 {
+        let Some(step_kind) = crate::spec::StepDecl::kind_for_arity(arity) else {
             return Err(format!(
-                "invalid_primitive_arity: primitive op '{op}' at {step_prefix} requires 1 or 2 inputs, got {arity}"
+                "invalid_primitive_arity: primitive op '{op}' at {step_prefix} requires 1, 2, or 3 inputs, got {arity}"
             ));
-        }
+        };
 
         let tie_key = tied_cache.as_ref().map(|_| {
             let sig = st
@@ -661,7 +661,7 @@ fn expand_step_list(
         let mut step_slots = in_slots;
         step_slots.push(out_slot);
         state.steps.push(StepDecl {
-            kind: if arity == 2 { "binary" } else { "unary" }.to_string(),
+            kind: step_kind.to_string(),
             layer: layer_idx,
             slots: step_slots,
         });

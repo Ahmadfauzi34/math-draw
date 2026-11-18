@@ -101,6 +101,17 @@ pub(super) fn try_build(decl: &LayerDecl) -> Result<Option<RuntimeLayer>, String
                 max: max as f32,
             }
         }
+        "sin" => RuntimeLayer::Sin,
+        "cos" => RuntimeLayer::Cos,
+        "tan" => RuntimeLayer::Tan,
+        "floor" => RuntimeLayer::Floor,
+        "ceil" => RuntimeLayer::Ceil,
+        "round" => RuntimeLayer::Round,
+        "atan2" => RuntimeLayer::Atan2,
+        "powf" => RuntimeLayer::Powf,
+        "hypot" => RuntimeLayer::Hypot,
+        "fma" => RuntimeLayer::Fma,
+        "allFinite" => RuntimeLayer::AllFinite,
         "reshape" => {
             let shape = parse_rank4_shape(&arg_usize_vec(args, 1)?, "reshape")?;
             RuntimeLayer::Reshape(shape)
@@ -249,6 +260,146 @@ pub(super) fn try_exec(
             let x = inputs[0].as_f32("clamp")?;
             validate_finite(&x, "clamp input")?;
             SlotValue::F32(checked_f32_output(x.clamp(*min, *max), "clamp output")?)
+        }
+        RuntimeLayer::Sin => {
+            let x = inputs[0].as_f32("sin")?;
+            validate_finite(&x, "sin input")?;
+            SlotValue::F32(checked_f32_output(x.sin(), "sin output")?)
+        }
+        RuntimeLayer::Cos => {
+            let x = inputs[0].as_f32("cos")?;
+            validate_finite(&x, "cos input")?;
+            SlotValue::F32(checked_f32_output(x.cos(), "cos output")?)
+        }
+        RuntimeLayer::Tan => {
+            let x = inputs[0].as_f32("tan")?;
+            validate_finite(&x, "tan input")?;
+            SlotValue::F32(checked_f32_output(x.tan(), "tan output")?)
+        }
+        RuntimeLayer::Floor => {
+            let x = inputs[0].as_f32("floor")?;
+            validate_finite(&x, "floor input")?;
+            SlotValue::F32(checked_f32_output(x.floor(), "floor output")?)
+        }
+        RuntimeLayer::Ceil => {
+            let x = inputs[0].as_f32("ceil")?;
+            validate_finite(&x, "ceil input")?;
+            SlotValue::F32(checked_f32_output(x.ceil(), "ceil output")?)
+        }
+        RuntimeLayer::Round => {
+            let x = inputs[0].as_f32("round")?;
+            validate_finite(&x, "round input")?;
+            SlotValue::F32(checked_f32_output(x.round(), "round output")?)
+        }
+        RuntimeLayer::Atan2 => {
+            let y = inputs[0].as_f32("atan2 y")?;
+            let x = inputs[1].as_f32("atan2 x")?;
+            if y.dims() != x.dims() {
+                return Err(format!(
+                    "atan2: shape mismatch {:?} vs {:?}; implicit broadcasting forbidden",
+                    y.dims(),
+                    x.dims()
+                ));
+            }
+            validate_finite(&y, "atan2 y")?;
+            validate_finite(&x, "atan2 x")?;
+            SlotValue::F32(checked_f32_output(y.atan2(x), "atan2 output")?)
+        }
+        RuntimeLayer::Powf => {
+            let base = inputs[0].as_f32("powf base")?;
+            let exp = inputs[1].as_f32("powf exp")?;
+            if base.dims() != exp.dims() {
+                return Err(format!(
+                    "powf: shape mismatch {:?} vs {:?}; implicit broadcasting forbidden",
+                    base.dims(),
+                    exp.dims()
+                ));
+            }
+            validate_finite(&base, "powf base")?;
+            validate_finite(&exp, "powf exp")?;
+            SlotValue::F32(checked_f32_output(base.powf(exp), "powf output")?)
+        }
+        RuntimeLayer::Hypot => {
+            let x = inputs[0].as_f32("hypot x")?;
+            let y = inputs[1].as_f32("hypot y")?;
+            let dims = x.dims();
+            if dims != y.dims() {
+                return Err(format!(
+                    "hypot: shape mismatch {dims:?} vs {:?}; implicit broadcasting forbidden",
+                    y.dims()
+                ));
+            }
+            validate_finite(&x, "hypot x")?;
+            validate_finite(&y, "hypot y")?;
+            let dx = x.into_data();
+            let dy = y.into_data();
+            let vx = dx.as_slice::<f32>().map_err(|_| "hypot x: expected f32 tensor")?;
+            let vy = dy.as_slice::<f32>().map_err(|_| "hypot y: expected f32 tensor")?;
+            let out: Vec<f32> = vx
+                .iter()
+                .zip(vy.iter())
+                .map(|(&a, &b)| {
+                    let ax = a.abs();
+                    let ay = b.abs();
+                    let m = ax.max(ay);
+                    let n = ax.min(ay);
+                    if m == 0.0 {
+                        0.0
+                    } else {
+                        let r = n / m;
+                        m * (1.0 + r * r).sqrt()
+                    }
+                })
+                .collect();
+            let t = Tensor::<4>::from_data(TensorData::new(out, dims), device);
+            SlotValue::F32(checked_f32_output(t, "hypot output")?)
+        }
+        RuntimeLayer::Fma => {
+            let a = inputs[0].as_f32("fma a")?;
+            let b = inputs[1].as_f32("fma b")?;
+            let c = inputs[2].as_f32("fma c")?;
+            let dims = a.dims();
+            if dims != b.dims() || dims != c.dims() {
+                return Err(format!(
+                    "fma: shape mismatch {:?} vs {:?} vs {:?}; implicit broadcasting forbidden",
+                    dims,
+                    b.dims(),
+                    c.dims()
+                ));
+            }
+            validate_finite(&a, "fma a")?;
+            validate_finite(&b, "fma b")?;
+            validate_finite(&c, "fma c")?;
+            let da = a.into_data();
+            let db = b.into_data();
+            let dc = c.into_data();
+            let va = da.as_slice::<f32>().map_err(|_| "fma a: expected f32 tensor")?;
+            let vb = db.as_slice::<f32>().map_err(|_| "fma b: expected f32 tensor")?;
+            let vc = dc.as_slice::<f32>().map_err(|_| "fma c: expected f32 tensor")?;
+            let out: Vec<f32> = va
+                .iter()
+                .zip(vb.iter())
+                .zip(vc.iter())
+                .map(|((&x, &y), &z)| x.mul_add(y, z))
+                .collect();
+            let t = Tensor::<4>::from_data(TensorData::new(out, dims), device);
+            SlotValue::F32(checked_f32_output(t, "fma output")?)
+        }
+        RuntimeLayer::AllFinite => {
+            let x = inputs[0].as_f32("allFinite")?;
+            let data = x.into_data();
+            let values = data
+                .as_slice::<f32>()
+                .map_err(|_| "allFinite: expected f32 tensor")?;
+            let flag = if values.iter().all(|v| v.is_finite()) {
+                1.0f32
+            } else {
+                0.0f32
+            };
+            SlotValue::F32(Tensor::<4>::from_data(
+                TensorData::new(vec![flag], [1, 1, 1, 1]),
+                device,
+            ))
         }
         RuntimeLayer::Reshape(target) => {
             let x = inputs[0].as_f32("reshape")?;

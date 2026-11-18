@@ -26,7 +26,7 @@ This repository follows the graph (Documentation-as-Contract) hierarchical syste
 - **Zero-Warning & Locked Dependency Gate**: Every build and test gate MUST pass with `--locked` and zero compiler warnings in `cargo test --locked` and `cargo build --release --locked`.
 - **Fail-Closed Validation**: Untrusted or malformed graph specs must fail closed before execution (unknown constructors, arity/arg mismatches, shape/dtype errors, canonical registry ID uniqueness, division-by-zero, integer overflow, NaN/Inf inputs).
 - **Backward-Compatible Crate Facade**: [`src/lib.rs`](src/lib.rs) must preserve root facade module paths (`engine`, `trace`, `rollout`, `profile`, `cost_model`, `validate`, `composer`, `rewrite`, `mutate`, `shard`, `recurse`, `verify`, `linear_equiv`, `gradcheck`, `quant`, `weight_lab`) so integration tests and external library callers never break.
-- **82-Constructor Alignment**: Constructor inventory in [`src/catalog.rs`](src/catalog.rs), shape inference in [`src/graph/validate.rs`](src/graph/validate.rs), and Burn execution kernels in [`src/layers/`](src/layers/AGENTS.md) must always stay in strict 1-to-1 parity across all 82 constructors.
+- **95-Constructor Alignment**: Constructor inventory in [`src/catalog.rs`](src/catalog.rs), shape inference in [`src/graph/validate.rs`](src/graph/validate.rs), and Burn execution kernels in [`src/layers/`](src/layers/AGENTS.md) must always stay in strict 1-to-1 parity across all 95 constructors (covering `unary`, `binary`, and `ternary` step arities).
 
 ## Work Guidance
 
@@ -37,7 +37,7 @@ This repository follows the graph (Documentation-as-Contract) hierarchical syste
 
 ## Verification
 
-- `cargo test --locked` (runs all 9 integration suites in [`tests/integration.rs`](tests/integration.rs), including the 24-check smoke suite)
+- `cargo test --locked` (runs all 10 integration suites in [`tests/integration.rs`](tests/integration.rs), including the 25-check smoke suite)
 - `cargo clippy --all-targets --locked`
 - `cargo build --release --locked`
 - `./target/release/math-draw smoke`

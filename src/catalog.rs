@@ -252,11 +252,22 @@ pub static CATALOG: &[ConstructorMeta] = &[
     ConstructorMeta { name: "intRem", family: "int_binary", arity: 2, signature: "intRem(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
     ConstructorMeta { name: "intToFloat", family: "int_cast", arity: 1, signature: "intToFloat(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
     ConstructorMeta { name: "intFromFloat", family: "int_cast", arity: 1, signature: "intFromFloat(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
-    // Numeric primitives (4)
+    // Numeric primitives (15)
     ConstructorMeta { name: "abs", family: "numeric", arity: 1, signature: "abs(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
     ConstructorMeta { name: "exp", family: "numeric", arity: 1, signature: "exp(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
     ConstructorMeta { name: "log", family: "numeric", arity: 1, signature: "log(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
     ConstructorMeta { name: "clamp", family: "numeric", arity: 1, signature: "clamp(id,min,max)", expected_layout: "any_rank4", parameters: PARAMS_CLAMP },
+    ConstructorMeta { name: "sin", family: "numeric", arity: 1, signature: "sin(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
+    ConstructorMeta { name: "cos", family: "numeric", arity: 1, signature: "cos(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
+    ConstructorMeta { name: "tan", family: "numeric", arity: 1, signature: "tan(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
+    ConstructorMeta { name: "floor", family: "numeric", arity: 1, signature: "floor(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
+    ConstructorMeta { name: "ceil", family: "numeric", arity: 1, signature: "ceil(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
+    ConstructorMeta { name: "round", family: "numeric", arity: 1, signature: "round(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
+    ConstructorMeta { name: "atan2", family: "numeric", arity: 2, signature: "atan2(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
+    ConstructorMeta { name: "powf", family: "numeric", arity: 2, signature: "powf(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
+    ConstructorMeta { name: "hypot", family: "numeric", arity: 2, signature: "hypot(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
+    ConstructorMeta { name: "fma", family: "numeric", arity: 3, signature: "fma(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
+    ConstructorMeta { name: "allFinite", family: "numeric", arity: 1, signature: "allFinite(id)", expected_layout: "any_rank4", parameters: PARAMS_ID_ONLY },
     // Tensor transforms (6)
     ConstructorMeta { name: "reshape", family: "transform", arity: 1, signature: "reshape(id,shape)", expected_layout: "any_rank4", parameters: PARAMS_RESHAPE },
     ConstructorMeta { name: "permute", family: "transform", arity: 1, signature: "permute(id,axes)", expected_layout: "any_rank4", parameters: PARAMS_PERMUTE },
@@ -269,11 +280,13 @@ pub static CATALOG: &[ConstructorMeta] = &[
     ConstructorMeta { name: "l2Norm", family: "linalg", arity: 1, signature: "l2Norm(id)", expected_layout: "feature_axis1_singleton", parameters: PARAMS_ID_ONLY },
     ConstructorMeta { name: "l2Distance", family: "linalg", arity: 2, signature: "l2Distance(id)", expected_layout: "feature_axis1_singleton", parameters: PARAMS_ID_ONLY },
     ConstructorMeta { name: "cosineSimilarity", family: "linalg", arity: 2, signature: "cosineSimilarity(id,epsilon?)", expected_layout: "feature_axis1_singleton", parameters: PARAMS_EPS_OPT },
-    // Statistics over [B,F,1,1] (6)
+    // Statistics over [B,F,1,1] (8)
     ConstructorMeta { name: "sum", family: "statistics", arity: 1, signature: "sum(id)", expected_layout: "feature_axis1_singleton", parameters: PARAMS_ID_ONLY },
     ConstructorMeta { name: "mean", family: "statistics", arity: 1, signature: "mean(id)", expected_layout: "feature_axis1_singleton", parameters: PARAMS_ID_ONLY },
     ConstructorMeta { name: "variancePopulation", family: "statistics", arity: 1, signature: "variancePopulation(id)", expected_layout: "feature_axis1_singleton", parameters: PARAMS_ID_ONLY },
     ConstructorMeta { name: "stdPopulation", family: "statistics", arity: 1, signature: "stdPopulation(id)", expected_layout: "feature_axis1_singleton", parameters: PARAMS_ID_ONLY },
+    ConstructorMeta { name: "varianceSample", family: "statistics", arity: 1, signature: "varianceSample(id)", expected_layout: "feature_axis1_singleton", parameters: PARAMS_ID_ONLY },
+    ConstructorMeta { name: "stdSample", family: "statistics", arity: 1, signature: "stdSample(id)", expected_layout: "feature_axis1_singleton", parameters: PARAMS_ID_ONLY },
     ConstructorMeta { name: "min", family: "statistics", arity: 1, signature: "min(id)", expected_layout: "feature_axis1_singleton", parameters: PARAMS_ID_ONLY },
     ConstructorMeta { name: "max", family: "statistics", arity: 1, signature: "max(id)", expected_layout: "feature_axis1_singleton", parameters: PARAMS_ID_ONLY },
     // Rank-4 axis reduction keepdim (4)

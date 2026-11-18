@@ -357,7 +357,7 @@ fn unary_lipschitz_const(
         | "shiftRight" | "avgPool1d" | "avgPool2d" | "maxPool1d" | "maxPool2d"
         | "adaptiveAvgPool2d" | "embedding" | "intToFloat" | "abs" | "clamp" | "reshape"
         | "permute" | "slice" | "selectAxis" | "mean" | "meanAxis" | "min" | "max"
-        | "minAxis" | "maxAxis" => Ok(1.0),
+        | "minAxis" | "maxAxis" | "sin" | "cos" => Ok(1.0),
         "fillLike" | "indicesLike" => Ok(0.0),
         "sigmoid" => Ok(0.25),
         "gelu" => Ok(1.13),
@@ -419,8 +419,8 @@ fn unary_lipschitz_const(
             let gm = norm_gamma_max(spec, layer_idx, nf);
             Ok((2.0 * gm) / eps.max(1e-30).sqrt())
         }
-        "div" | "sqrt" | "exp" | "log" => Err(format!(
-            "bound mode refuses unbounded/domain-sensitive constructor '{c}'; use --mode measured instead"
+        "div" | "sqrt" | "exp" | "log" | "tan" | "powf" | "floor" | "ceil" | "round" | "allFinite" => Err(format!(
+            "bound mode refuses unbounded/discontinuous constructor '{c}'; use --mode measured instead"
         )),
         other => Err(format!(
             "bound mode does not have analytical Lipschitz bound for '{other}'; use --mode measured"
@@ -460,7 +460,20 @@ fn forward_value_bounds(
     let mut slot_b = init_bounds.clone();
     for st in &spec.steps {
         let decl = &spec.layers[st.layer];
-        if st.kind == "binary" {
+        if st.kind == "ternary" {
+            let ba = *slot_b.get(&st.slots[0]).unwrap_or(&0.0);
+            let bb = *slot_b.get(&st.slots[1]).unwrap_or(&0.0);
+            let bc = *slot_b.get(&st.slots[2]).unwrap_or(&0.0);
+            let out_b = match decl.constructor.as_str() {
+                "fma" => ba * bb + bc,
+                other => {
+                    return Err(format!(
+                        "bound mode unsupported ternary op '{other}'; use --mode measured"
+                    ))
+                }
+            };
+            slot_b.insert(st.slots[3], out_b);
+        } else if st.kind == "binary" {
             let ba = *slot_b.get(&st.slots[0]).unwrap_or(&0.0);
             let bb = *slot_b.get(&st.slots[1]).unwrap_or(&0.0);
             let out_b = match decl.constructor.as_str() {
@@ -468,6 +481,8 @@ fn forward_value_bounds(
                 "mul" => ba * bb,
                 "concat" => ba.max(bb),
                 "expandLike" => ba,
+                "hypot" => ba.hypot(bb),
+                "atan2" => std::f64::consts::PI,
                 other => {
                     return Err(format!(
                         "bound mode unsupported binary op '{other}'; use --mode measured"
@@ -490,6 +505,9 @@ fn forward_value_bounds(
                 }
                 "sigmoid" => 1.0f64.min(bi * 0.25 + 0.5),
                 "tanh" => 1.0f64.min(bi),
+                "sin" => bi.clamp(0.0, 1.0),
+                "cos" => 1.0,
+                "allFinite" => 1.0,
                 "relu" | "abs" => bi,
                 "clamp" => {
                     let min_v = decl.args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -526,7 +544,28 @@ fn analytical_layer_contrib(
     let mut delta: HashMap<usize, f64> = HashMap::new();
     for st in &spec.steps {
         let decl = &spec.layers[st.layer];
-        if st.kind == "binary" {
+        if st.kind == "ternary" {
+            let da = *delta.get(&st.slots[0]).unwrap_or(&0.0);
+            let db = *delta.get(&st.slots[1]).unwrap_or(&0.0);
+            let dc = *delta.get(&st.slots[2]).unwrap_or(&0.0);
+            let dout = if da == 0.0 && db == 0.0 && dc == 0.0 {
+                0.0
+            } else {
+                match decl.constructor.as_str() {
+                    "fma" => {
+                        let ba = *val_bounds.get(&st.slots[0]).unwrap_or(&0.0);
+                        let bb = *val_bounds.get(&st.slots[1]).unwrap_or(&0.0);
+                        ba * db + bb * da + da * db + dc
+                    }
+                    other => {
+                        return Err(format!(
+                            "bound mode unsupported downstream ternary op '{other}'"
+                        ))
+                    }
+                }
+            };
+            delta.insert(st.slots[3], dout);
+        } else if st.kind == "binary" {
             let da = *delta.get(&st.slots[0]).unwrap_or(&0.0);
             let db = *delta.get(&st.slots[1]).unwrap_or(&0.0);
             let dout = if da == 0.0 && db == 0.0 {
@@ -541,6 +580,7 @@ fn analytical_layer_contrib(
                     }
                     "concat" => da.max(db),
                     "expandLike" => da,
+                    "hypot" => da + db,
                     other => {
                         return Err(format!(
                             "bound mode unsupported downstream binary op '{other}'"

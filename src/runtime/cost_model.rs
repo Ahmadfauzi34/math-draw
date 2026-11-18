@@ -150,7 +150,8 @@ pub fn run_cost_model(spec: &SpecV1, iterations: usize) -> Result<CostModelRepor
         let is_emb = layer_decl.constructor == "embedding";
 
         let mut clamped_zero = false;
-        let ms = if st_decl.kind == "unary" {
+        let arity = st_decl.expected_arity();
+        let ms = if arity == 1 {
             let in_vals = if is_emb {
                 let vocab = layer_decl
                     .args
@@ -295,7 +296,7 @@ pub fn run_cost_model(spec: &SpecV1, iterations: usize) -> Result<CostModelRepor
                 };
                 measure_steady_median_ms(&micro, iterations)?
             }
-        } else {
+        } else if arity == 2 {
             let s1 = ex.in_shapes.get(1).and_then(|o| *o).unwrap_or(s0);
             let n1: usize = s1.iter().product();
             let mut inputs = BTreeMap::new();
@@ -345,6 +346,8 @@ pub fn run_cost_model(spec: &SpecV1, iterations: usize) -> Result<CostModelRepor
             } else {
                 let (v0, v1) = if matches!(layer_decl.constructor.as_str(), "crossEntropy" | "klDivergence") {
                     (fill_prob_vals(s0), fill_prob_vals(s1))
+                } else if layer_decl.constructor == "powf" {
+                    (fill_pos_f32_vals(n0, i), fill_f32_vals(n1, i + 3))
                 } else {
                     let mut rhs = fill_f32_vals(n1, i + 3);
                     if layer_decl.constructor == "div" {
@@ -382,6 +385,48 @@ pub fn run_cost_model(spec: &SpecV1, iterations: usize) -> Result<CostModelRepor
                 };
                 measure_steady_median_ms(&micro, iterations)?
             }
+        } else {
+            let s1 = ex.in_shapes.get(1).and_then(|o| *o).unwrap_or(s0);
+            let s2 = ex.in_shapes.get(2).and_then(|o| *o).unwrap_or(s0);
+            let n1: usize = s1.iter().product();
+            let n2: usize = s2.iter().product();
+            let mut inputs = BTreeMap::new();
+            inputs.insert("0".to_string(), fill_f32_vals(n0, i));
+            inputs.insert("1".to_string(), fill_f32_vals(n1, i + 3));
+            inputs.insert("2".to_string(), fill_f32_vals(n2, i + 7));
+            let micro = SpecV1 {
+                num_slots: 4,
+                layers: vec![layer_decl.clone()],
+                steps: vec![StepDecl {
+                    kind: "ternary".into(),
+                    layer: 0,
+                    slots: vec![0, 1, 2, 3],
+                }],
+                output_slot: 3,
+                ports: vec![
+                    PortDecl {
+                        slot: 0,
+                        role: "observation".into(),
+                        shape: s0,
+                        layout: "any_rank4".into(),
+                    },
+                    PortDecl {
+                        slot: 1,
+                        role: "observation".into(),
+                        shape: s1,
+                        layout: "any_rank4".into(),
+                    },
+                    PortDecl {
+                        slot: 2,
+                        role: "observation".into(),
+                        shape: s2,
+                        layout: "any_rank4".into(),
+                    },
+                ],
+                weights: BTreeMap::new(),
+                inputs,
+            };
+            measure_steady_median_ms(&micro, iterations)?
         };
 
         per_op.push(OpCostRow {

@@ -5,6 +5,20 @@ All notable changes to `math-draw` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-11-18
+
+### Added
+- **Full 95-Constructor Pure-Math Kernel Parity & Ternary `fma` (`src/catalog.rs`, `src/spec.rs`, `src/layers/math_numeric.rs`, `src/layers/math_stats_prob.rs`)**:
+  - Ported the remaining 13 pure-math constructors from `ai_agent_builder` (catalog expanded `82 -> 95`), achieving 100% pure-math kernel parity:
+    - **Numeric Unary (7)**: `sin`, `cos`, `tan`, `floor`, `ceil`, `round` (half-to-even), and `allFinite` (emits canonical `[1, 1, 1, 1]` float `1.0`/`0.0`).
+    - **Numeric Binary (3)**: `atan2(y, x)`, `powf(base, exp)` (fail-closed NaN/Inf/overflow checks), and overflow-safe scaled `hypot(x, y)`.
+    - **Numeric Ternary (1)**: `fma(a, b, c)` using `f32::mul_add` with strict 3-way shape match and `"ternary"` step kind (`slots: [a, b, c, out]`).
+    - **Sample Statistics (2)**: `varianceSample` and `stdSample` over `[B, F, 1, 1]` with Bessel correction (`ddof = 1`, fail-closed `F < 2`, two-pass `f64`).
+- **End-to-End Ternary Arity Integration (`src/graph/`, `src/runtime/`, `src/evidence/`)**:
+  - Added [`StepDecl`](src/spec.rs) arity helpers (`expected_arity`, `kind_for_arity`, `input_slots`, `output_slot`) and wired `"ternary"` steps cleanly across [`validate.rs`](src/graph/validate.rs), `v2` [`composer`](src/graph/composer/mod.rs), [`mutate.rs`](src/graph/mutate.rs), [`rewrite.rs`](src/graph/rewrite.rs), [`engine.rs`](src/runtime/engine.rs), [`trace.rs`](src/runtime/trace.rs), [`rollout.rs`](src/runtime/rollout.rs), [`cost_model.rs`](src/runtime/cost_model.rs), [`linear_equiv.rs`](src/evidence/linear_equiv.rs), and [`quant.rs`](src/evidence/quant.rs) (`fma`/`sin`/`cos`/`hypot`/`atan2`/`allFinite` bounds + fail-closed `bound` refusals for `tan`, `powf`, `floor`, `ceil`, `round`, `allFinite`).
+- **Smoke Suite #25 & Integration Coverage (`src/smoke/advanced_checks.rs`, `tests/integration.rs`)**:
+  - Added smoke check `#25` (`parity_13_math_ops_and_ternary_fma`, `25/25` passing), renamed/expanded `catalog_has_all_95_constructors` & `all_95_constructors_execute_cleanly`, and added `parity_13_math_ops_fail_closed_and_ternary_pipelines` (`10/10` passing).
+
 ## [0.5.0] - 2026-11-18
 
 ### Added
