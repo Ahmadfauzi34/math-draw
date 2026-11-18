@@ -4,12 +4,16 @@ use std::process::ExitCode;
 
 use math_draw::catalog::{CATALOG, find_constructor};
 use math_draw::engine::run_spec;
+use math_draw::gradcheck::gradcheck_spec;
+use math_draw::mutate::{MutationRequest, mutate_spec};
 use math_draw::profile::{compare_specs_perf, profile_spec};
+use math_draw::quant::{BudgetMode, QuantScheme, quant_budget, quant_verify};
 use math_draw::recurse::{fit_es, search_graph_tree, solve_gd_autodiff};
 use math_draw::rewrite::{REWRITE_RULES, apply_rewrite, apply_rewrites_recursive};
 use math_draw::rollout::{
     parse_inputs_sequence, rollout_bisect, rollout_fixpoint, rollout_scan, rollout_unroll,
 };
+use math_draw::shard::shard_spec;
 use math_draw::smoke::run_smoke_suite;
 use math_draw::spec::{load_spec_file, sha256_json};
 use math_draw::trace::{DEFAULT_MAX_TENSOR_BYTES, compare_trace_hashes, trace_hash_spec};
@@ -33,6 +37,11 @@ USAGE:
   math-draw rollout bisect <base.json> <cand.json> [--steps N] [--state-port <slot|name>] [--inputs-seq <seq.json>] [--abs-tol 1e-5]
   math-draw profile <spec.json> [--iters 30] [--warmup 5]
   math-draw compare <base.json> <cand.json> [--iters 30] [--warmup 5]
+  math-draw gradcheck <spec.json> [analytic.json] [--eps 1e-3] [--tol 1e-3] [--weights] [--autodiff]
+  math-draw quant verify <spec.json> [--scheme int8|q8-per-block|fp16] [--cases <cases.json>] [--abs-tol 1e-2] [--rel-tol 1e-2] [--out <quant.json>]
+  math-draw quant budget <spec.json> [--cases <cases.json>] [--tol 0.05] [--scheme q8-per-block|int8|fp16] [--mode bound|measured] [--out <plan.json>]
+  math-draw mutate <spec.json> <mutation.json> [--cases <cases.json>] [--abs-tol 1e-6] [--rel-tol 1e-6] [--out <out.json>]
+  math-draw shard <spec.json> [--max-weights 65535] [--out <out.json>]
   math-draw find-op [--list | <constructor>]
   math-draw rewrite list
   math-draw rewrite apply <rule|all> <spec.json> [--out <out.json>]
@@ -412,6 +421,188 @@ fn main() -> ExitCode {
             let warmup = flag_val(rest, "--warmup").and_then(|s| s.parse().ok()).unwrap_or(5usize);
             match compare_specs_perf(&base, &cand, warmup, iters) {
                 Ok(rep) => print_json_exit(&rep, rep.ok),
+                Err(e) => err_exit(&e),
+            }
+        }
+        "gradcheck" => {
+            let valued = ["--eps", "--tol"];
+            let pos = positional_args(rest, &valued);
+            let Some(spec_file) = pos.first() else {
+                return err_exit("usage: math-draw gradcheck <spec.json> [analytic.json] [--eps 1e-3] [--tol 1e-3] [--weights] [--autodiff]");
+            };
+            let loaded = match load_spec_file(Path::new(spec_file)) {
+                Ok(l) => l,
+                Err(e) => return err_exit(&e),
+            };
+            let analytic = if let Some(af) = pos.get(1) {
+                let raw = match std::fs::read_to_string(af) {
+                    Ok(r) => r,
+                    Err(e) => return err_exit(&format!("cannot read analytic JSON '{af}': {e}")),
+                };
+                match serde_json::from_str::<serde_json::Value>(&raw) {
+                    Ok(v) => Some(v),
+                    Err(e) => return err_exit(&format!("invalid analytic JSON '{af}': {e}")),
+                }
+            } else {
+                None
+            };
+            let eps = flag_val(rest, "--eps").and_then(|s| s.parse().ok()).unwrap_or(1e-3f64);
+            let tol = flag_val(rest, "--tol").and_then(|s| s.parse().ok()).unwrap_or(1e-3f64);
+            let include_weights = has_flag(rest, "--weights");
+            let check_autodiff = has_flag(rest, "--autodiff");
+            match gradcheck_spec(&loaded.spec, analytic.as_ref(), eps, tol, include_weights, check_autodiff) {
+                Ok(rep) => print_json_exit(&rep, rep.ok),
+                Err(e) => err_exit(&e),
+            }
+        }
+        "quant" => {
+            let Some(sub) = rest.first().map(|s| s.as_str()) else {
+                return err_exit("usage: math-draw quant <verify|budget> ...");
+            };
+            let sub_rest = &rest[1..];
+            match sub {
+                "verify" => {
+                    let valued = ["--scheme", "--cases", "--abs-tol", "--rel-tol", "--out"];
+                    let pos = positional_args(sub_rest, &valued);
+                    let Some(file) = pos.first() else {
+                        return err_exit("usage: math-draw quant verify <spec.json> [--scheme int8|q8-per-block|fp16] [--cases <cases.json>] [--abs-tol 1e-2] [--rel-tol 1e-2] [--out <quant.json>]");
+                    };
+                    let loaded = match load_spec_file(Path::new(file)) {
+                        Ok(l) => l,
+                        Err(e) => return err_exit(&e),
+                    };
+                    let scheme = match QuantScheme::parse(flag_val(sub_rest, "--scheme").unwrap_or("int8")) {
+                        Ok(s) => s,
+                        Err(e) => return err_exit(&e),
+                    };
+                    let abs_tol = flag_val(sub_rest, "--abs-tol").and_then(|s| s.parse().ok()).unwrap_or(1e-2f64);
+                    let rel_tol = flag_val(sub_rest, "--rel-tol").and_then(|s| s.parse().ok()).unwrap_or(1e-2f64);
+                    let cases = if let Some(cf) = flag_val(sub_rest, "--cases") {
+                        match read_cases_file(cf) {
+                            Ok(c) => Some(c),
+                            Err(e) => return err_exit(&e),
+                        }
+                    } else {
+                        None
+                    };
+                    match quant_verify(&loaded.spec, scheme, cases.as_deref(), abs_tol, rel_tol) {
+                        Ok(rep) => {
+                            if let Some(op) = flag_val(sub_rest, "--out")
+                                && let Err(e) = write_pretty_json(op, &rep.quantized_spec)
+                            {
+                                return err_exit(&e);
+                            }
+                            print_json_exit(&rep, rep.ok)
+                        }
+                        Err(e) => err_exit(&e),
+                    }
+                }
+                "budget" => {
+                    let valued = ["--cases", "--tol", "--scheme", "--mode", "--out"];
+                    let pos = positional_args(sub_rest, &valued);
+                    let Some(file) = pos.first() else {
+                        return err_exit("usage: math-draw quant budget <spec.json> [--cases <cases.json>] [--tol 0.05] [--scheme q8-per-block|int8|fp16] [--mode bound|measured] [--out <plan.json>]");
+                    };
+                    let loaded = match load_spec_file(Path::new(file)) {
+                        Ok(l) => l,
+                        Err(e) => return err_exit(&e),
+                    };
+                    let scheme = match QuantScheme::parse(flag_val(sub_rest, "--scheme").unwrap_or("q8-per-block")) {
+                        Ok(s) => s,
+                        Err(e) => return err_exit(&e),
+                    };
+                    let mode = match BudgetMode::parse(flag_val(sub_rest, "--mode").unwrap_or("bound")) {
+                        Ok(m) => m,
+                        Err(e) => return err_exit(&e),
+                    };
+                    let tol = flag_val(sub_rest, "--tol").and_then(|s| s.parse().ok()).unwrap_or(0.05f64);
+                    let cases = if let Some(cf) = flag_val(sub_rest, "--cases") {
+                        match read_cases_file(cf) {
+                            Ok(c) => Some(c),
+                            Err(e) => return err_exit(&e),
+                        }
+                    } else {
+                        None
+                    };
+                    match quant_budget(&loaded.spec, cases.as_deref(), tol, scheme, mode) {
+                        Ok(rep) => {
+                            if let Some(op) = flag_val(sub_rest, "--out")
+                                && let Err(e) = write_pretty_json(op, &rep.planned_spec)
+                            {
+                                return err_exit(&e);
+                            }
+                            print_json_exit(&rep, rep.ok)
+                        }
+                        Err(e) => err_exit(&e),
+                    }
+                }
+                _ => err_exit(&format!("unknown quant subcommand '{sub}' (use: verify | budget)")),
+            }
+        }
+        "mutate" => {
+            let valued = ["--cases", "--abs-tol", "--rel-tol", "--out"];
+            let pos = positional_args(rest, &valued);
+            if pos.len() < 2 {
+                return err_exit("usage: math-draw mutate <spec.json> <mutation.json> [--cases <cases.json>] [--abs-tol 1e-6] [--rel-tol 1e-6] [--out <out.json>]");
+            }
+            let base = match load_spec_file(Path::new(&pos[0])) {
+                Ok(l) => l.spec,
+                Err(e) => return err_exit(&e),
+            };
+            let mut_raw = match std::fs::read_to_string(&pos[1]) {
+                Ok(r) => r,
+                Err(e) => return err_exit(&format!("cannot read mutation JSON '{}': {e}", pos[1])),
+            };
+            let req: MutationRequest = match serde_json::from_str(&mut_raw) {
+                Ok(r) => r,
+                Err(e) => return err_exit(&format!("invalid mutation JSON '{}': {e}", pos[1])),
+            };
+            let abs_tol = flag_val(rest, "--abs-tol").and_then(|s| s.parse().ok()).unwrap_or(1e-6f64);
+            let rel_tol = flag_val(rest, "--rel-tol").and_then(|s| s.parse().ok()).unwrap_or(1e-6f64);
+            let cases = if let Some(cf) = flag_val(rest, "--cases") {
+                match read_cases_file(cf) {
+                    Ok(c) => Some(c),
+                    Err(e) => return err_exit(&e),
+                }
+            } else {
+                None
+            };
+            match mutate_spec(&base, &req, cases.as_deref(), abs_tol, rel_tol) {
+                Ok(rep) => {
+                    if let Some(op) = flag_val(rest, "--out")
+                        && let Some(ref sp) = rep.resulting_spec
+                        && rep.ok
+                        && let Err(e) = write_pretty_json(op, sp)
+                    {
+                        return err_exit(&e);
+                    }
+                    print_json_exit(&rep, rep.ok)
+                }
+                Err(e) => err_exit(&e),
+            }
+        }
+        "shard" => {
+            let valued = ["--max-weights", "--out"];
+            let pos = positional_args(rest, &valued);
+            let Some(file) = pos.first() else {
+                return err_exit("usage: math-draw shard <spec.json> [--max-weights 65535] [--out <out.json>]");
+            };
+            let loaded = match load_spec_file(Path::new(file)) {
+                Ok(l) => l,
+                Err(e) => return err_exit(&e),
+            };
+            let max_weights = flag_val(rest, "--max-weights")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(65535usize);
+            match shard_spec(&loaded.spec, max_weights) {
+                Ok(rep) => {
+                    if let Some(op) = flag_val(rest, "--out")
+                        && let Err(e) = write_pretty_json(op, &rep.spec)
+                    {
+                        return err_exit(&e);
+                    }
+                    print_json_exit(&rep, rep.ok)
+                }
                 Err(e) => err_exit(&e),
             }
         }

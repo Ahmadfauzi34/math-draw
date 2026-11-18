@@ -1,10 +1,14 @@
 pub mod catalog;
 pub mod composer;
 pub mod engine;
+pub mod gradcheck;
+pub mod mutate;
 pub mod profile;
+pub mod quant;
 pub mod recurse;
 pub mod rewrite;
 pub mod rollout;
+pub mod shard;
 pub mod smoke;
 pub mod spec;
 pub mod trace;

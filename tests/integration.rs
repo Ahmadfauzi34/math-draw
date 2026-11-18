@@ -314,3 +314,56 @@ fn batch1_trace_rollout_profile_and_preconditioned() {
     assert!(gd_pre.preconditioned);
     assert!(gd_pre.final_loss < gd_pre.start_loss);
 }
+
+#[test]
+fn batch2_gradcheck_quant_mutate_and_shard() {
+    use math_draw::gradcheck::gradcheck_spec;
+    use math_draw::mutate::{MutationRequest, mutate_spec};
+    use math_draw::quant::{BudgetMode, QuantScheme, f32_to_f16_roundtrip, quant_budget, quant_verify};
+    use math_draw::shard::shard_spec;
+
+    // 1. IEEE-754 f16 roundtrip sanity
+    assert_eq!(f32_to_f16_roundtrip(0.0), 0.0);
+    assert_eq!(f32_to_f16_roundtrip(1.0), 1.0);
+    assert_eq!(f32_to_f16_roundtrip(-2.5), -2.5);
+    assert!((f32_to_f16_roundtrip(0.3333333) - 0.33325195).abs() < 1e-4);
+
+    // 2. gradcheck detects mismatch cleanly (fail-closed)
+    let raw = r#"{"inputs":{"0":[1.0,2.0]},"layers":[{"args":[0,2,1,false],"constructor":"linear"}],"numSlots":2,"outputSlot":1,"ports":[{"shape":[1,2,1,1],"slot":0}],"steps":[{"kind":"unary","layer":0,"slots":[0,1]}],"weights":{"0":[3.0,-4.0]}}"#;
+    let spec = load_spec_str(raw, Path::new(".")).unwrap().spec;
+    let bad_an = json!({ "0": [[9.0, -4.0]] });
+    let gc_bad = gradcheck_spec(&spec, Some(&bad_an), 1e-3, 1e-3, false, false).unwrap();
+    assert!(!gc_bad.ok);
+    let gc_ok = gradcheck_spec(&spec, None, 1e-3, 1e-2, true, true).unwrap();
+    assert!(gc_ok.ok);
+    assert!(gc_ok.autodiff_check.unwrap().ok);
+
+    // 3. quant budget bound mode refuses unbounded `div` loudly
+    let div_spec_raw = r#"{
+      "numSlots": 4,
+      "layers": [{ "constructor": "linear", "args": [0, 2, 2, false] }, { "constructor": "div", "args": [1] }],
+      "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 2] }, { "kind": "binary", "layer": 1, "slots": [2, 1, 3] }],
+      "outputSlot": 3,
+      "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }, { "slot": 1, "shape": [1, 2, 1, 1] }],
+      "weights": { "0": [1, 0, 0, 1] },
+      "inputs": { "0": [1.0, 2.0], "1": [2.0, 2.0] }
+    }"#;
+    let div_spec = load_spec_str(div_spec_raw, Path::new(".")).unwrap().spec;
+    assert!(quant_budget(&div_spec, None, 0.1, QuantScheme::Int8, BudgetMode::Bound).is_err());
+    // While measured mode works cleanly on bounded inputs
+    assert!(quant_budget(&div_spec, None, 0.1, QuantScheme::Int8, BudgetMode::Measured).unwrap().ok);
+    assert!(quant_verify(&div_spec, QuantScheme::Q8PerBlock, None, 1e-2, 1e-2).unwrap().ok);
+
+    // 4. mutate refuses commit when no branch passes equivalence gate
+    let req_fail: MutationRequest = serde_json::from_value(json!({
+        "commit": true,
+        "edits": [{ "op": "setWeights", "layer_index": 0, "values": [10.0, 10.0] }]
+    })).unwrap();
+    let mr = mutate_spec(&spec, &req_fail, None, 1e-5, 1e-5).unwrap();
+    assert!(!mr.ok && !mr.committed && !mr.equivalent);
+
+    // 5. shard fail-closed when in_dim exceeds max_weights
+    let wide_raw = r#"{"inputs":{"0":[1.0,2.0,3.0,4.0]},"layers":[{"args":[0,4,2,true],"constructor":"linear"}],"numSlots":2,"outputSlot":1,"ports":[{"shape":[1,4,1,1],"slot":0}],"steps":[{"kind":"unary","layer":0,"slots":[0,1]}],"weights":{"0":[1,1,1,1,1,1,1,1,0,0]}}"#;
+    let wide = load_spec_str(wide_raw, Path::new(".")).unwrap().spec;
+    assert!(shard_spec(&wide, 3).unwrap_err().contains("unshardable"));
+}

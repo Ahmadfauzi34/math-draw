@@ -5,6 +5,22 @@ All notable changes to `math-draw` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-18
+
+### Added
+- **Numeric Jacobian & Autodiff Gradient Checker (`gradcheck`, `src/gradcheck.rs`)**:
+  - `gradcheck <spec.json> [analytic.json] [--eps 1e-3] [--tol 1e-3] [--weights] [--autodiff]` computes central finite-difference Jacobians for `f32` input ports (skipping `i64` ports via `port_is_i64_mask`) and active trainable weights (`--weights`), compares against optional analytic matrices, and cross-checks weight gradients against Burn `Device::flex().autodiff()` (`--autodiff`).
+- **Weight Quantization Verification & Mixed-Precision Planner (`quant <verify|budget>`, `src/quant.rs`)**:
+  - Supports `int8`, `q8-per-block` (block size 32), and pure-Rust IEEE-754 binary16 round-to-nearest-even (`fp16`) quantization schemes (`f32_to_f16_roundtrip`).
+  - `quant verify`: quantizes all weighted layers and runs end-to-end equivalence verification with byte compression metrics.
+  - `quant budget`: plans per-layer mixed precision under `--tol` using either analytical DAG Lipschitz propagation (`--mode bound`, failing closed on unbounded downstream ops such as `div` or `sqrt`) or empirical greedy measurement (`--mode measured`).
+- **Transactional & Multi-Branch Equivalence-Gated Graph Mutation (`mutate`, `src/mutate.rs`)**:
+  - `mutate <spec.json> <mutation.json> [--cases ...] [--abs-tol 1e-6] [--rel-tol 1e-6] [--out <out.json>]` applies `setWeights`, `replaceStep`, `insertStep`, `removeStep`, `reconnectStep`, and `setOutput` across single transactions or multi-branch candidate sets (`branches`, `promote_branch`) with a fail-closed equivalence gate on `commit`.
+- **Linear Layer Output-Row Sharding (`shard`, `src/shard.rs`)**:
+  - `shard <spec.json> [--max-weights 65535] [--out <out.json>]` splits oversized `linear` layers along output rows (`out_dim`), chains `concat(dim=1)` steps, verifies exact weight reassembly (`reassembly_exact`), and runs full equivalence verification.
+- **Expanded Smoke Suite & Integration Tests (`src/smoke.rs`, `tests/integration.rs`)**:
+  - Expanded built-in `smoke` suite from 15 to 19 checks (`#16`–`#19`) and added `batch2_gradcheck_quant_mutate_and_shard` integration test.
+
 ## [0.2.0] - 2026-11-18
 
 ### Added

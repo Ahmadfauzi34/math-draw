@@ -198,7 +198,7 @@ fn default_weights_for_layer(spec: &SpecV1, layer_idx: usize) -> Vec<f32> {
     }
 }
 
-fn discover_trainable_slices(
+pub fn discover_trainable_slices(
     spec: &SpecV1,
     layer_filter: Option<usize>,
 ) -> Result<(Vec<ActiveLayerSlice>, Vec<f32>), String> {
@@ -239,7 +239,7 @@ fn discover_trainable_slices(
     Ok((slices, flat))
 }
 
-fn apply_flat_weights(spec: &SpecV1, slices: &[ActiveLayerSlice], flat: &[f32]) -> SpecV1 {
+pub fn apply_flat_weights(spec: &SpecV1, slices: &[ActiveLayerSlice], flat: &[f32]) -> SpecV1 {
     let mut s = spec.clone();
     for sl in slices {
         s.weights.insert(

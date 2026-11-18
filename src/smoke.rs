@@ -4,9 +4,13 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::engine::{eval_spec_with_inputs, run_spec};
+use crate::gradcheck::gradcheck_spec;
+use crate::mutate::{MutationRequest, mutate_spec};
 use crate::profile::{compare_specs_perf, profile_spec};
+use crate::quant::{BudgetMode, QuantScheme, quant_budget, quant_verify};
 use crate::recurse::{fit_es, search_graph_tree, solve_gd_autodiff};
 use crate::rollout::{rollout_bisect, rollout_fixpoint, rollout_scan, rollout_unroll};
+use crate::shard::shard_spec;
 use crate::spec::{load_spec_str, SpecV1};
 use crate::trace::{DEFAULT_MAX_TENSOR_BYTES, compare_trace_hashes};
 use crate::validate::validate_spec;
@@ -465,6 +469,108 @@ pub fn run_smoke_suite() -> SmokeReport {
             return Err(format!("sensitivity-guided fit unexpected result: frozen={:?} loss {}->{}", fit.frozen_layers, fit.start_loss, fit.final_loss));
         }
         Ok(format!("gd_trust={:?} fit_frozen={:?}", gd.hessian_trust, fit.frozen_layers))
+    }));
+
+    // 16. gradcheck numeric Jacobian + Burn autodiff cross-check
+    checks.push(run_check("gradcheck_jacobian_and_autodiff", || {
+        let raw = r#"{"inputs":{"0":[1.0,2.0]},"layers":[{"args":[0,2,2,true],"constructor":"linear"}],"numSlots":2,"outputSlot":1,"ports":[{"shape":[1,2,1,1],"slot":0}],"steps":[{"kind":"unary","layer":0,"slots":[0,1]}],"weights":{"0":[1.0,2.0,3.0,4.0,0.5,-0.5]}}"#;
+        let spec = load_spec_str(raw, Path::new("."))?.spec;
+        let analytic = json!({
+            "0": [[1.0, 3.0], [2.0, 4.0]]
+        });
+        let rep = gradcheck_spec(&spec, Some(&analytic), 1e-3, 1e-2, true, true)?;
+        if !rep.ok || !rep.passed || !rep.autodiff_check.as_ref().map(|a| a.ok).unwrap_or(false) {
+            return Err(format!("gradcheck failed: max_abs={}", rep.max_abs_error));
+        }
+        Ok(format!("max_abs={:.2e} autodiff_weights={}", rep.max_abs_error, rep.autodiff_check.unwrap().checked_weights))
+    }));
+
+    // 17. quant verify (int8 + fp16) & quant budget (bound + measured)
+    checks.push(run_check("quant_verify_and_budget", || {
+        let raw = r#"{
+          "numSlots": 4,
+          "layers": [
+            { "constructor": "linear", "args": [0, 4, 4, true] },
+            { "constructor": "relu", "args": [1] },
+            { "constructor": "linear", "args": [2, 4, 2, true] }
+          ],
+          "steps": [
+            { "kind": "unary", "layer": 0, "slots": [0, 1] },
+            { "kind": "unary", "layer": 1, "slots": [1, 2] },
+            { "kind": "unary", "layer": 2, "slots": [2, 3] }
+          ],
+          "outputSlot": 3,
+          "ports": [{ "slot": 0, "shape": [1, 4, 1, 1] }],
+          "weights": {
+            "0": [0.5,-0.25,0.1,0.3, -0.4,0.6,0.2,-0.1, 0.2,0.1,-0.5,0.4, 0.3,-0.2,0.1,0.5, 0.1,0.0,-0.1,0.2],
+            "2": [0.4,-0.2, 0.3,0.5, -0.1,0.2, 0.5,-0.3, 0.1,-0.1]
+          },
+          "inputs": { "0": [1.0, -0.5, 0.25, 2.0] }
+        }"#;
+        let spec = load_spec_str(raw, Path::new("."))?.spec;
+        let qv = quant_verify(&spec, QuantScheme::Fp16, None, 1e-2, 1e-2)?;
+        if !qv.ok {
+            return Err(format!("fp16 quant_verify failed: diff={}", qv.verification.max_abs_diff));
+        }
+        let qb_bound = quant_budget(&spec, None, 0.5, QuantScheme::Q8PerBlock, BudgetMode::Bound)?;
+        let qb_meas = quant_budget(&spec, None, 0.5, QuantScheme::Int8, BudgetMode::Measured)?;
+        if !qb_bound.ok || !qb_meas.ok || qb_meas.quantized_layers.is_empty() {
+            return Err("quant_budget failed to find valid plan".into());
+        }
+        Ok(format!("fp16_diff={:.5} saved_measured={}B", qv.verification.max_abs_diff, qb_meas.total_saved_bytes))
+    }));
+
+    // 18. mutate multi-branch equivalence gate
+    checks.push(run_check("mutate_branch_equivalence_gate", || {
+        let raw = r#"{
+          "numSlots": 4,
+          "layers": [
+            { "constructor": "linear", "args": [0, 2, 2, false] },
+            { "constructor": "relu", "args": [1] },
+            { "constructor": "relu", "args": [2] }
+          ],
+          "steps": [
+            { "kind": "unary", "layer": 0, "slots": [0, 1] },
+            { "kind": "unary", "layer": 1, "slots": [1, 2] },
+            { "kind": "unary", "layer": 2, "slots": [2, 3] }
+          ],
+          "outputSlot": 3,
+          "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+          "weights": { "0": [1, 0, 0, 1] },
+          "inputs": { "0": [1.5, -2.0] }
+        }"#;
+        let spec = load_spec_str(raw, Path::new("."))?.spec;
+        let req: MutationRequest = serde_json::from_value(json!({
+            "commit": true,
+            "branches": [
+                { "branch_id": "bad", "edits": [{ "op": "setWeights", "layer_index": 0, "values": [9.0, 0.0, 0.0, 1.0] }] },
+                { "branch_id": "good", "edits": [{ "op": "removeStep", "index": 2 }, { "op": "setOutput", "slot": 2 }] }
+            ]
+        })).map_err(|e| e.to_string())?;
+        let rep = mutate_spec(&spec, &req, None, 1e-6, 1e-6)?;
+        if !rep.ok || !rep.committed || rep.winning_branch.as_deref() != Some("good") {
+            return Err(format!("expected winning_branch=good, got {:?}", rep.winning_branch));
+        }
+        Ok(format!("winner=good diff_bad={:.2}", rep.branches[0].max_abs_error))
+    }));
+
+    // 19. shard linear layer output-row splitting + exact reassembly
+    checks.push(run_check("shard_linear_exact_reassembly", || {
+        let raw = r#"{
+          "numSlots": 2,
+          "layers": [{ "constructor": "linear", "args": [0, 3, 5, true] }],
+          "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+          "outputSlot": 1,
+          "ports": [{ "slot": 0, "shape": [1, 3, 1, 1] }],
+          "weights": { "0": [1,2,3,4,5, 6,7,8,9,10, 11,12,13,14,15, 0.1,0.2,0.3,0.4,0.5] },
+          "inputs": { "0": [1.0, -1.0, 0.5] }
+        }"#;
+        let spec = load_spec_str(raw, Path::new("."))?.spec;
+        let rep = shard_spec(&spec, 8)?;
+        if !rep.ok || !rep.sharded || !rep.reassembly_exact || !rep.verified || rep.shards[0].num_shards != 3 {
+            return Err(format!("shard failed: exact={} verified={} shards={}", rep.reassembly_exact, rep.verified, rep.shards.len()));
+        }
+        Ok(format!("num_shards={} max_abs={:.2e}", rep.shards[0].num_shards, rep.max_abs_error))
     }));
 
     let passed = checks.iter().filter(|c| c.ok).count();

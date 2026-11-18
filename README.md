@@ -21,6 +21,11 @@ cargo build --release
 - `math-draw rollout bisect <base.json> <cand.json> [--steps N] [--state-port <slot|name>] [--inputs-seq <seq.json>] [--abs-tol 1e-5]` — Pinpoint both the first divergent rollout tick and the exact divergent intra-tick step.
 - `math-draw profile <spec.json> [--iters 30] [--warmup 5]` — Benchmark latency (`min`/`median`/`p95`/`mean`/`max` ms), step count, parameter count, and output hash using a compiled `PreparedGraph`.
 - `math-draw compare <base.json> <cand.json> [--iters 30] [--warmup 5]` — Benchmark and equivalence-check a baseline vs candidate spec.
+- `math-draw gradcheck <spec.json> [analytic.json] [--eps 1e-3] [--tol 1e-3] [--weights] [--autodiff]` — Numeric central-difference Jacobians w.r.t. inputs and weights, analytic verification, and Burn autodiff cross-checking.
+- `math-draw quant verify <spec.json> [--scheme int8|q8-per-block|fp16] [--cases <cases.json>] [--abs-tol 1e-2] [--rel-tol 1e-2] [--out <quant.json>]` — Weight quantization simulation (`int8`, `q8-per-block`, IEEE-754 `fp16`) and end-to-end equivalence verification.
+- `math-draw quant budget <spec.json> [--cases <cases.json>] [--tol 0.05] [--scheme q8-per-block|int8|fp16] [--mode bound|measured] [--out <plan.json>]` — Per-layer quantization planner using analytical DAG Lipschitz propagation (`bound`) or empirical greedy measurement (`measured`).
+- `math-draw mutate <spec.json> <mutation.json> [--cases <cases.json>] [--abs-tol 1e-6] [--rel-tol 1e-6] [--out <out.json>]` — Equivalence-gated single-transaction and multi-branch graph mutation (`setWeights`, `replaceStep`, `insertStep`, `removeStep`, `reconnectStep`, `setOutput`).
+- `math-draw shard <spec.json> [--max-weights 65535] [--out <out.json>]` — Output-row linear layer sharding with exact weight reassembly and equivalence verification.
 - `math-draw find-op [--list | <constructor>]` — Inspect supported constructors and parameter schemas.
 - `math-draw rewrite list` / `math-draw rewrite apply <rule|all> <spec.json> [--out <out.json>]` — Pure graph rewrites (`linear-branch-fusion`, `linear-chain-fusion`, `relu-idempotent`, `transpose-involution`, `dead-step-elimination`, `add-commute`).
 - `math-draw recurse expand <spec.v2.json> [--out <out.v1.json>]` — Compile recursive `v2` graph specs (subgraphs, `repeat` with `tie_weights`/`weights_per_depth`, `residual`, `parallel_concat`, `$ref`, built-in macros) into canonical flat `v1`.
@@ -39,5 +44,7 @@ cargo run -- validate examples/linear-relu.json --explain
 cargo run -- trace-hash examples/linear-relu.json
 cargo run -- rollout fixpoint examples/recursive-gated-residual.v2.json --tol 1e-5
 cargo run -- profile examples/linear-relu.json --iters 20
+cargo run -- gradcheck examples/linear-relu.json --weights --autodiff
+cargo run -- quant verify examples/linear-relu.json --scheme q8-per-block
 cargo run -- recurse solve-gd examples/linear-relu.json --targets examples/targets-linear.json --steps 20 --lr 0.05 --precondition
 ```

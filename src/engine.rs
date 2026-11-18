@@ -1034,12 +1034,7 @@ fn exec_layer(
     }
 }
 
-fn load_port_inputs(
-    spec: &SpecV1,
-    device: &Device,
-    overrides: Option<&BTreeMap<String, Vec<Value>>>,
-) -> Result<Vec<Option<SlotValue>>, String> {
-    let mut slots: Vec<Option<SlotValue>> = vec![None; spec.num_slots];
+pub fn port_is_i64_mask(spec: &SpecV1) -> Vec<bool> {
     let mut i64_ports = vec![false; spec.num_slots];
     for st in &spec.steps {
         if let Some(layer) = spec.layers.get(st.layer)
@@ -1053,6 +1048,16 @@ fn load_port_inputs(
             }
         }
     }
+    i64_ports
+}
+
+fn load_port_inputs(
+    spec: &SpecV1,
+    device: &Device,
+    overrides: Option<&BTreeMap<String, Vec<Value>>>,
+) -> Result<Vec<Option<SlotValue>>, String> {
+    let mut slots: Vec<Option<SlotValue>> = vec![None; spec.num_slots];
+    let i64_ports = port_is_i64_mask(spec);
 
     for port in &spec.ports {
         let key = port.slot.to_string();
