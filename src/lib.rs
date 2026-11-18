@@ -1,20 +1,16 @@
 pub mod catalog;
-pub mod composer;
-pub mod cost_model;
-pub mod engine;
-pub mod gradcheck;
+pub mod cli;
+pub mod es;
+pub mod evidence;
+pub mod graph;
 pub mod harness;
-pub mod linear_equiv;
-pub mod mutate;
-pub mod profile;
-pub mod quant;
-pub mod recurse;
-pub mod rewrite;
-pub mod rollout;
-pub mod shard;
+pub mod layers;
+pub mod runtime;
 pub mod smoke;
 pub mod spec;
-pub mod trace;
-pub mod validate;
-pub mod verify;
-pub mod weight_lab;
+
+// Backward-compatible root module facades (matching ai_agent_builder style)
+pub use es as recurse;
+pub use evidence::{gradcheck, linear_equiv, quant, verify, weight_lab};
+pub use graph::{composer, mutate, rewrite, shard, validate};
+pub use runtime::{cost_model, engine, profile, rollout, trace};

@@ -1,10 +1,15 @@
+mod macros;
+mod subst;
+
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use crate::catalog::find_constructor;
 use crate::spec::{LayerDecl, PortDecl, SpecV1, StepDecl, parse_f32_values, sha256_json};
+
+use macros::{expand_builtin_macro, is_builtin_macro};
+use subst::{build_args_from_params, substitute_step};
 
 pub const RECURSIVE_SPEC_SCHEMA: &str = "burn-math.recursive-spec.v2";
 const MAX_RECURSION_DEPTH: usize = 32;
@@ -43,9 +48,9 @@ pub fn is_recursive_spec_v2(raw: &Value) -> bool {
         || (obj.contains_key("output") && !obj.contains_key("outputSlot"))
 }
 
-struct Allocator {
-    next_layer_id: usize,
-    next_slot_id: usize,
+pub(super) struct Allocator {
+    pub(super) next_layer_id: usize,
+    pub(super) next_slot_id: usize,
     slot_names: HashMap<String, usize>,
 }
 
@@ -97,258 +102,26 @@ impl Allocator {
         Ok(slot)
     }
 
-    fn fresh_slot(&mut self) -> usize {
+    pub(super) fn fresh_slot(&mut self) -> usize {
         let s = self.next_slot_id;
         self.next_slot_id += 1;
         s
     }
 
-    fn fresh_layer_id(&mut self) -> usize {
+    pub(super) fn fresh_layer_id(&mut self) -> usize {
         let id = self.next_layer_id;
         self.next_layer_id += 1;
         id
     }
 }
 
-struct CompileState {
-    alloc: Allocator,
-    layers: Vec<LayerDecl>,
-    steps: Vec<StepDecl>,
-    weights: BTreeMap<String, Vec<f32>>,
-    subgraphs: HashMap<String, Value>,
-    events: Vec<ExpansionEvent>,
-}
-
-fn is_builtin_macro(name: &str) -> bool {
-    matches!(
-        name,
-        "mlp" | "gated_unit" | "residual_mlp" | "transformer_ffn" | "recurrent_cell"
-    )
-}
-
-fn need_usize(params: &Map<String, Value>, key: &str) -> Result<usize, String> {
-    params
-        .get(key)
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .ok_or_else(|| format!("macro param '{key}' (positive integer) is required"))
-}
-
-fn expand_builtin_macro(
-    macro_name: &str,
-    params: &Map<String, Value>,
-    step_weights: Option<&Value>,
-    in_slots: &[usize],
-    out_slot: usize,
-    state: &mut CompileState,
-    prefix: &str,
-) -> Result<(), String> {
-    let base_layer_idx = state.layers.len();
-    let mut local_layers = Vec::new();
-    let mut local_steps = Vec::new();
-
-    match macro_name {
-        "mlp" => {
-            if in_slots.is_empty() {
-                return Err("macro 'mlp' requires 1 input".into());
-            }
-            let in_dim = need_usize(params, "in_dim")?;
-            let hid = need_usize(params, "hidden_dim")?;
-            let out_dim = need_usize(params, "out_dim")?;
-            let bias = params.get("bias").and_then(|v| v.as_bool()).unwrap_or(true);
-            let s_in = in_slots[0];
-            let s_h1 = state.alloc.fresh_slot();
-            let s_h2 = state.alloc.fresh_slot();
-            let l0 = state.alloc.fresh_layer_id();
-            let l1 = state.alloc.fresh_layer_id();
-            let l2 = state.alloc.fresh_layer_id();
-            local_layers.push(LayerDecl { constructor: "linear".into(), args: vec![l0.into(), in_dim.into(), hid.into(), bias.into()] });
-            local_layers.push(LayerDecl { constructor: "relu".into(), args: vec![l1.into()] });
-            local_layers.push(LayerDecl { constructor: "linear".into(), args: vec![l2.into(), hid.into(), out_dim.into(), bias.into()] });
-            local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx, slots: vec![s_in, s_h1] });
-            local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 1, slots: vec![s_h1, s_h2] });
-            local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 2, slots: vec![s_h2, out_slot] });
-        }
-        "gated_unit" => {
-            if in_slots.is_empty() {
-                return Err("macro 'gated_unit' requires 1 input".into());
-            }
-            let in_dim = need_usize(params, "in_dim")?;
-            let dim = need_usize(params, "dim")?;
-            let bias = params.get("bias").and_then(|v| v.as_bool()).unwrap_or(true);
-            let s_in = in_slots[0];
-            let s_a1 = state.alloc.fresh_slot();
-            let s_a2 = state.alloc.fresh_slot();
-            let s_b = state.alloc.fresh_slot();
-            let l0 = state.alloc.fresh_layer_id();
-            let l1 = state.alloc.fresh_layer_id();
-            let l2 = state.alloc.fresh_layer_id();
-            let l3 = state.alloc.fresh_layer_id();
-            local_layers.push(LayerDecl { constructor: "linear".into(), args: vec![l0.into(), in_dim.into(), dim.into(), bias.into()] });
-            local_layers.push(LayerDecl { constructor: "sigmoid".into(), args: vec![l1.into()] });
-            local_layers.push(LayerDecl { constructor: "linear".into(), args: vec![l2.into(), in_dim.into(), dim.into(), bias.into()] });
-            local_layers.push(LayerDecl { constructor: "mul".into(), args: vec![l3.into()] });
-            local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx, slots: vec![s_in, s_a1] });
-            local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 1, slots: vec![s_a1, s_a2] });
-            local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 2, slots: vec![s_in, s_b] });
-            local_steps.push(StepDecl { kind: "binary".into(), layer: base_layer_idx + 3, slots: vec![s_a2, s_b, out_slot] });
-        }
-        "residual_mlp" => {
-            if in_slots.is_empty() {
-                return Err("macro 'residual_mlp' requires 1 input".into());
-            }
-            let in_dim = need_usize(params, "in_dim")?;
-            let hid = need_usize(params, "hidden_dim")?;
-            let bias = params.get("bias").and_then(|v| v.as_bool()).unwrap_or(true);
-            let s_in = in_slots[0];
-            let s_h1 = state.alloc.fresh_slot();
-            let s_h2 = state.alloc.fresh_slot();
-            let s_h3 = state.alloc.fresh_slot();
-            let l0 = state.alloc.fresh_layer_id();
-            let l1 = state.alloc.fresh_layer_id();
-            let l2 = state.alloc.fresh_layer_id();
-            let l3 = state.alloc.fresh_layer_id();
-            local_layers.push(LayerDecl { constructor: "linear".into(), args: vec![l0.into(), in_dim.into(), hid.into(), bias.into()] });
-            local_layers.push(LayerDecl { constructor: "relu".into(), args: vec![l1.into()] });
-            local_layers.push(LayerDecl { constructor: "linear".into(), args: vec![l2.into(), hid.into(), in_dim.into(), bias.into()] });
-            local_layers.push(LayerDecl { constructor: "add".into(), args: vec![l3.into()] });
-            local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx, slots: vec![s_in, s_h1] });
-            local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 1, slots: vec![s_h1, s_h2] });
-            local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 2, slots: vec![s_h2, s_h3] });
-            local_steps.push(StepDecl { kind: "binary".into(), layer: base_layer_idx + 3, slots: vec![s_h3, s_in, out_slot] });
-        }
-        "transformer_ffn" => {
-            if in_slots.is_empty() {
-                return Err("macro 'transformer_ffn' requires 1 input".into());
-            }
-            let d = need_usize(params, "d_model")?;
-            let d_ff = params.get("d_ff").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(4 * d);
-            let bias = params.get("bias").and_then(|v| v.as_bool()).unwrap_or(true);
-            let s_in = in_slots[0];
-            let s_h1 = state.alloc.fresh_slot();
-            let s_h2 = state.alloc.fresh_slot();
-            let s_h3 = state.alloc.fresh_slot();
-            let l0 = state.alloc.fresh_layer_id();
-            let l1 = state.alloc.fresh_layer_id();
-            let l2 = state.alloc.fresh_layer_id();
-            let l3 = state.alloc.fresh_layer_id();
-            local_layers.push(LayerDecl { constructor: "linear".into(), args: vec![l0.into(), d.into(), d_ff.into(), bias.into()] });
-            local_layers.push(LayerDecl { constructor: "gelu".into(), args: vec![l1.into()] });
-            local_layers.push(LayerDecl { constructor: "linear".into(), args: vec![l2.into(), d_ff.into(), d.into(), bias.into()] });
-            local_layers.push(LayerDecl { constructor: "add".into(), args: vec![l3.into()] });
-            local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx, slots: vec![s_in, s_h1] });
-            local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 1, slots: vec![s_h1, s_h2] });
-            local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 2, slots: vec![s_h2, s_h3] });
-            local_steps.push(StepDecl { kind: "binary".into(), layer: base_layer_idx + 3, slots: vec![s_h3, s_in, out_slot] });
-        }
-        "recurrent_cell" => {
-            if in_slots.len() < 2 {
-                return Err("macro 'recurrent_cell' requires 2 inputs (state, input)".into());
-            }
-            let in_dim = need_usize(params, "in_dim")?;
-            let state_dim = need_usize(params, "state_dim")?;
-            let bias = params.get("bias").and_then(|v| v.as_bool()).unwrap_or(true);
-            let s_state = in_slots[0];
-            let s_in = in_slots[1];
-            let s_ws = state.alloc.fresh_slot();
-            let s_wx = state.alloc.fresh_slot();
-            let s_sum = state.alloc.fresh_slot();
-            let s_act = state.alloc.fresh_slot();
-            let l0 = state.alloc.fresh_layer_id();
-            let l1 = state.alloc.fresh_layer_id();
-            let l2 = state.alloc.fresh_layer_id();
-            let l3 = state.alloc.fresh_layer_id();
-            let l4 = state.alloc.fresh_layer_id();
-            local_layers.push(LayerDecl { constructor: "linear".into(), args: vec![l0.into(), state_dim.into(), state_dim.into(), bias.into()] });
-            local_layers.push(LayerDecl { constructor: "linear".into(), args: vec![l1.into(), in_dim.into(), state_dim.into(), bias.into()] });
-            local_layers.push(LayerDecl { constructor: "add".into(), args: vec![l2.into()] });
-            local_layers.push(LayerDecl { constructor: "tanh".into(), args: vec![l3.into()] });
-            local_layers.push(LayerDecl { constructor: "add".into(), args: vec![l4.into()] });
-            local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx, slots: vec![s_state, s_ws] });
-            local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 1, slots: vec![s_in, s_wx] });
-            local_steps.push(StepDecl { kind: "binary".into(), layer: base_layer_idx + 2, slots: vec![s_ws, s_wx, s_sum] });
-            local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 3, slots: vec![s_sum, s_act] });
-            local_steps.push(StepDecl { kind: "binary".into(), layer: base_layer_idx + 4, slots: vec![s_act, s_state, out_slot] });
-        }
-        _ => {
-            return Err(format!("unknown built-in macro '{macro_name}'"));
-        }
-    }
-
-    state.layers.extend(local_layers);
-    state.steps.extend(local_steps);
-
-    if let Some(obj) = step_weights.and_then(|v| v.as_object()) {
-        for (k, v) in obj {
-            if let Ok(local_idx) = k.parse::<usize>()
-                && let Some(arr) = v.as_array()
-            {
-                let floats = parse_f32_values(arr, &format!("{prefix}:{macro_name}.weights[{k}]"))?;
-                state.weights.insert((base_layer_idx + local_idx).to_string(), floats);
-            }
-        }
-    }
-
-    state.events.push(ExpansionEvent {
-        kind: "builtin_macro".to_string(),
-        target: macro_name.to_string(),
-        prefix: prefix.to_string(),
-        depth: None,
-        tie_weights: None,
-    });
-    Ok(())
-}
-
-fn build_args_from_params(op: &str, reg_id: usize, params: &Map<String, Value>) -> Result<Vec<Value>, String> {
-    let Some(meta) = find_constructor(op) else {
-        return Err(format!("unknown_layer_constructor: '{op}'"));
-    };
-    let mut out = vec![Value::from(reg_id)];
-    for p in meta.parameters.iter().skip(1) {
-        if let Some(v) = params.get(p.name) {
-            out.push(v.clone());
-        } else if !p.optional {
-            return Err(format!(
-                "missing required parameter '{}' for constructor '{op}'",
-                p.name
-            ));
-        }
-    }
-    Ok(out)
-}
-
-fn substitute_value(v: &Value, param_map: &Map<String, Value>) -> Value {
-    if let Some(s) = v.as_str()
-        && let Some(key) = s.strip_prefix('$')
-        && let Some(rep) = param_map.get(key)
-    {
-        return rep.clone();
-    }
-    v.clone()
-}
-
-fn substitute_step(step_val: &Value, param_map: &Map<String, Value>, caller_weights: Option<&Value>) -> Value {
-    let mut s = step_val.clone();
-    if let Some(obj) = s.as_object_mut() {
-        if let Some(args) = obj.get_mut("args").and_then(|a| a.as_array_mut()) {
-            for item in args.iter_mut() {
-                *item = substitute_value(item, param_map);
-            }
-        }
-        if let Some(p_obj) = obj.get_mut("params").and_then(|p| p.as_object_mut()) {
-            for (_, v) in p_obj.iter_mut() {
-                *v = substitute_value(v, param_map);
-            }
-        }
-        if !obj.contains_key("weights")
-            && let Some(cw) = caller_weights.and_then(|w| w.as_object())
-            && let Some(wk) = obj.get("weight_key").and_then(|v| v.as_str())
-            && let Some(w_val) = cw.get(wk)
-        {
-            obj.insert("weights".to_string(), w_val.clone());
-        }
-    }
-    s
+pub(super) struct CompileState {
+    pub(super) alloc: Allocator,
+    pub(super) layers: Vec<LayerDecl>,
+    pub(super) steps: Vec<StepDecl>,
+    pub(super) weights: BTreeMap<String, Vec<f32>>,
+    pub(super) subgraphs: HashMap<String, Value>,
+    pub(super) events: Vec<ExpansionEvent>,
 }
 
 fn expand_step_list(
@@ -701,7 +474,6 @@ fn expand_step_list(
             let child_dir = canon.parent().unwrap_or(base_dir);
             let (child_v1, _) = compile_recursive_spec(&child_val, child_dir)?;
 
-            // Inline child v1 into current state
             let mut in_slots = Vec::new();
             for item in &in_list {
                 in_slots.push(resolve_in(item, scope_env, &mut state.alloc)?);
