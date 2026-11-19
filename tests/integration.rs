@@ -1003,3 +1003,1090 @@ fn parity_13_math_ops_fail_closed_and_ternary_pipelines() {
     assert_eq!(mutated.steps.len(), 1);
     assert_eq!(mutated.steps[0].kind, "ternary");
 }
+
+#[test]
+fn es_rng_vectors_mu_lambda_and_strict_validation() {
+    use math_draw::recurse::{
+        AnyRng, EsStrategyKind, FitEsConfig, Mulberry32, Pcg32, Philox4x32, RngKind, diversity,
+        fit_es_with_config,
+    };
+
+    // 1. Published PCG32 pcg-c-basic test vector (seed=42, seq=54)
+    let mut pcg = Pcg32::new(42, 54);
+    assert_eq!(
+        [
+            pcg.next_u32(),
+            pcg.next_u32(),
+            pcg.next_u32(),
+            pcg.next_u32(),
+            pcg.next_u32()
+        ],
+        [0xa15c02b7, 0x7b47f409, 0xba1d3330, 0x83d2f293, 0xbfa4784b]
+    );
+
+    // 2. Published Philox4x32-10 Random123 test vectors
+    let mut ph0 = Philox4x32::with_key([0, 0]);
+    assert_eq!(
+        [ph0.next_u32(), ph0.next_u32(), ph0.next_u32(), ph0.next_u32()],
+        [0x6627e8d5, 0xe169c58d, 0xbc57ac4c, 0x9b00dbd8]
+    );
+    let mut ph_ff = Philox4x32::with_key_counter(
+        [0xFFFF_FFFF, 0xFFFF_FFFF],
+        [0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF],
+    );
+    assert_eq!(
+        [ph_ff.next_u32(), ph_ff.next_u32(), ph_ff.next_u32(), ph_ff.next_u32()],
+        [0x408f276d, 0x41c83b0e, 0xa20bc7c6, 0x6d5451fd]
+    );
+    let mut ph_12 = Philox4x32::with_key_counter([1, 2], [3, 4, 5, 6]);
+    assert_eq!(
+        [ph_12.next_u32(), ph_12.next_u32(), ph_12.next_u32(), ph_12.next_u32()],
+        [0x8850da9c, 0xc159ff4c, 0x75752dca, 0x7d607cf9]
+    );
+
+    // 3. Philox seek equivalence & fail-closed seek on non-Philox PRNGs
+    let mut seq = Philox4x32::new(7);
+    let seq_out: Vec<u32> = (0..12).map(|_| seq.next_u32()).collect();
+    let mut jumped = Philox4x32::new(7);
+    jumped.seek(2);
+    let jumped_out: Vec<u32> = (0..4).map(|_| jumped.next_u32()).collect();
+    assert_eq!(jumped_out, seq_out[8..12]);
+
+    let mut pcg_any = AnyRng::new(RngKind::Pcg32, 7);
+    assert!(pcg_any.philox_seek(0).is_err());
+    let mut ph_any = AnyRng::new(RngKind::Philox4x32, 7);
+    assert!(ph_any.philox_seek(2).is_ok());
+
+    // 4. Mulberry32 oracle vector (matching ai_agent_builder::es::rng::Rng)
+    let mut mb = Mulberry32::new(7);
+    assert_eq!(mb.next_u32(), 0x02ff_152c);
+
+    // 5. Ragged diversity returns NaN rather than panicking
+    assert!(diversity(&[vec![1.0, 2.0], vec![1.0]]).is_nan());
+    assert_eq!(diversity(&[vec![1.0, 2.0]]), 0.0);
+
+    // 6. Convergence + determinism across MuLambda & all PRNGs + strict validation
+    let spec: SpecV1 = serde_json::from_value(json!({
+        "numSlots": 2,
+        "layers": [{ "constructor": "linear", "args": [0, 2, 2, false] }],
+        "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+        "outputSlot": 1,
+        "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+        "weights": { "0": [0.1, 0.0, 0.0, 0.1] },
+        "inputs": { "0": [1.0, 1.0] }
+    }))
+    .unwrap();
+    let tf: TargetsFile = serde_json::from_value(json!({
+        "cases": [
+            { "inputs": { "0": [1.0, 0.0] }, "expected": [1.5, 0.0] },
+            { "inputs": { "0": [0.0, 1.0] }, "expected": [0.0, -1.5] }
+        ]
+    }))
+    .unwrap();
+
+    for rng in [
+        RngKind::Xorshift64,
+        RngKind::Mulberry32,
+        RngKind::Pcg32,
+        RngKind::Philox4x32,
+    ] {
+        let cfg = FitEsConfig {
+            generations: 18,
+            pop: 10,
+            mu: Some(3),
+            sigma: 0.25,
+            lr: 0.0,
+            seed: 123,
+            strategy: EsStrategyKind::MuLambda,
+            rng,
+            sensitivity_guided: false,
+            freeze_threshold: 1e-6,
+        };
+        let r1 = fit_es_with_config(&spec, &tf, &cfg).unwrap();
+        let r2 = fit_es_with_config(&spec, &tf, &cfg).unwrap();
+        assert!(r1.ok && r1.final_loss < r1.start_loss);
+        assert_eq!(r1.best_weights, r2.best_weights);
+        assert_eq!(r1.trajectory.len(), 18);
+        assert!(r1.trajectory.iter().all(|t| t.diversity.is_finite() && t.worst_loss >= t.best_loss));
+    }
+
+    // Fail-closed hyperparameter checks
+    let odd_openes = FitEsConfig {
+        pop: 7,
+        strategy: EsStrategyKind::OpenEs,
+        ..FitEsConfig::default()
+    };
+    assert!(fit_es_with_config(&spec, &tf, &odd_openes).is_err());
+
+    let bad_mu = FitEsConfig {
+        pop: 6,
+        mu: Some(7),
+        strategy: EsStrategyKind::MuLambda,
+        ..FitEsConfig::default()
+    };
+    assert!(fit_es_with_config(&spec, &tf, &bad_mu).is_err());
+
+    let bad_sigma = FitEsConfig {
+        sigma: 0.0,
+        ..FitEsConfig::default()
+    };
+    assert!(fit_es_with_config(&spec, &tf, &bad_sigma).is_err());
+
+    let bad_lr = FitEsConfig {
+        lr: f64::NAN,
+        strategy: EsStrategyKind::OpenEs,
+        ..FitEsConfig::default()
+    };
+    assert!(fit_es_with_config(&spec, &tf, &bad_lr).is_err());
+
+    assert!(EsStrategyKind::parse("bogus").is_err());
+    assert!(RngKind::parse("bogus").is_err());
+}
+
+#[test]
+fn program_bundle_binding_replay_and_tamper_detection() {
+    use math_draw::bundle::{
+        apply_bound_flat_weights, compute_parameter_binding, compute_program_identity,
+        export_bundle, read_bound_flat_weights, verify_bundle,
+    };
+
+    // Weight-tied graph: layer 0 (linear 2->2, 6 params) used twice + layer 1 (relu, stateless) + layer 2 (linear 2->1, 3 params)
+    let spec: SpecV1 = serde_json::from_value(json!({
+        "numSlots": 5,
+        "layers": [
+            { "constructor": "linear", "args": [11, 2, 2, true] },
+            { "constructor": "relu", "args": [12] },
+            { "constructor": "linear", "args": [13, 2, 1, true] }
+        ],
+        "steps": [
+            { "kind": "unary", "layer": 0, "slots": [0, 1] },
+            { "kind": "unary", "layer": 1, "slots": [1, 2] },
+            { "kind": "unary", "layer": 0, "slots": [2, 3] },
+            { "kind": "unary", "layer": 2, "slots": [3, 4] }
+        ],
+        "outputSlot": 4,
+        "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+        "weights": {
+            "0": [1.0, 0.5, -0.5, 1.0, 0.1, -0.1],
+            "2": [2.0, -1.0, 0.25]
+        },
+        "inputs": { "0": [1.5, -0.5] }
+    }))
+    .unwrap();
+
+    // 1. Unique-first-use binding deduplicates repeated layer 0
+    let binding = compute_parameter_binding(&spec).unwrap();
+    assert_eq!(binding.ordering, "unique_first_use_graph_plan");
+    assert_eq!(binding.owners.len(), 2);
+    assert_eq!(binding.owners[0].layer_index, 0);
+    assert_eq!(binding.owners[0].offset, 0);
+    assert_eq!(binding.owners[0].len, 6);
+    assert_eq!(binding.owners[1].layer_index, 2);
+    assert_eq!(binding.owners[1].offset, 6);
+    assert_eq!(binding.owners[1].len, 3);
+    assert_eq!(binding.total_params, 9);
+    assert_eq!(binding.trainable_params, 9);
+    assert_eq!(binding.stateless_layers_count, 1);
+
+    // 2. Round-trip read/apply flat weights preserves structural program_identity
+    let flat = read_bound_flat_weights(&spec, &binding).unwrap();
+    assert_eq!(flat.len(), 9);
+    let shifted: Vec<f32> = flat.iter().map(|&v| v + 0.25).collect();
+    let updated = apply_bound_flat_weights(&spec, &binding, &shifted).unwrap();
+    assert_eq!(compute_program_identity(&updated), binding.program_identity);
+    assert_eq!(read_bound_flat_weights(&updated, &binding).unwrap(), shifted);
+
+    // Non-finite or wrong-length flat vector fails closed
+    let mut bad_nan = shifted.clone();
+    bad_nan[3] = f32::NAN;
+    assert!(apply_bound_flat_weights(&spec, &binding, &bad_nan).is_err());
+    assert!(apply_bound_flat_weights(&spec, &binding, &shifted[..8]).is_err());
+
+    // 3. Export & verify clean bundle (with custom user attestation)
+    let bundle = export_bundle(&spec, true, &["ci_release_gate".to_string()]).unwrap();
+    assert_eq!(bundle.attestations.len(), 3);
+    let rep = verify_bundle(&bundle);
+    assert!(rep.ok, "clean bundle verification failed: {:?}", rep.checks);
+    assert!(rep.replayed_execution);
+    assert_eq!(rep.checked_attestations, 3);
+
+    // 4. Tamper detection: weight tamper triggers bundle_integrity_failed + parameter_binding_mismatch + execution_receipt_mismatch
+    let mut tamper_w = bundle.clone();
+    tamper_w.spec.weights.insert("2".into(), vec![9.0, -1.0, 0.25]);
+    let rep_w = verify_bundle(&tamper_w);
+    assert!(!rep_w.ok);
+    assert_eq!(rep_w.code.as_deref(), Some("bundle_integrity_failed"));
+    assert!(rep_w.checks.iter().any(|c| c.name == "parameter_binding" && !c.passed));
+    assert!(rep_w.checks.iter().any(|c| c.name == "execution_replay" && !c.passed));
+
+    // 5. Tamper detection: output receipt tamper
+    let mut tamper_out = bundle.clone();
+    if let Some(ref mut exec) = tamper_out.reference_execution {
+        exec.output_values[0] += 1.0;
+    }
+    let rep_out = verify_bundle(&tamper_out);
+    assert!(!rep_out.ok);
+    assert!(rep_out.checks.iter().any(|c| c.name == "execution_replay" && !c.passed));
+
+    // 6. Tamper detection: attestation digest tamper
+    let mut tamper_att = bundle.clone();
+    tamper_att.attestations[0].digest = "sha256:0000".to_string();
+    let rep_att = verify_bundle(&tamper_att);
+    assert!(!rep_att.ok);
+    assert!(rep_att.checks.iter().any(|c| c.name == "attestation_provenance" && !c.passed));
+
+    // 7. Tamper detection: wrong schema
+    let mut tamper_schema = bundle.clone();
+    tamper_schema.schema = "burn-math.program-bundle.v999".to_string();
+    let rep_schema = verify_bundle(&tamper_schema);
+    assert!(!rep_schema.ok);
+    assert_eq!(rep_schema.code.as_deref(), Some("invalid_bundle_schema"));
+}
+
+#[test]
+fn error_handling_phase1_cli_and_library_fail_closed() {
+    use math_draw::harness::{
+        ensure_workspace_dir, execute_harness_workflow, store_artifact,
+    };
+    use math_draw::recurse::{FitEsConfig, fit_es_with_config, solve_gd_autodiff};
+    use math_draw::verify::TargetsFile;
+    use math_draw::weight_lab::{WeightRequires, WeightSet, certify_weight_set};
+    use std::process::Command;
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "math_draw_phase1_err_test_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    let spec_raw = r#"{
+      "numSlots": 2,
+      "layers": [{ "constructor": "linear", "args": [0, 2, 2, false] }],
+      "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+      "outputSlot": 1,
+      "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+      "weights": { "0": [1.0, 0.0, 0.0, 1.0] },
+      "inputs": { "0": [1.0, 2.0] }
+    }"#;
+    let spec_path = tmp_dir.join("spec.json");
+    std::fs::write(&spec_path, spec_raw).unwrap();
+    let spec = load_spec_str(spec_raw, Path::new(".")).unwrap().spec;
+
+    // --- P1 Library guarantees ---
+    // 1. Missing 'expected' in TargetsFile returns Err instead of panicking
+    let missing_expected: TargetsFile =
+        serde_json::from_str(r#"{"cases":[{"inputs":{"0":[1.0,2.0]}}]}"#).unwrap();
+    let gd_err = solve_gd_autodiff(&spec, Some(&missing_expected), Some(0), 2, 0.1, false)
+        .unwrap_err();
+    assert!(
+        gd_err.contains("expected"),
+        "expected missing-expected error in solve_gd, got: {gd_err}"
+    );
+    let es_err =
+        fit_es_with_config(&spec, &missing_expected, &FitEsConfig::default()).unwrap_err();
+    assert!(
+        es_err.contains("expected"),
+        "expected missing-expected error in fit_es, got: {es_err}"
+    );
+
+    // 2. Corrupted workspace-state.json fails closed in store_artifact & execute_harness_workflow
+    let bad_ws_dir = tmp_dir.join("corrupted_ws");
+    let ws = ensure_workspace_dir(&bad_ws_dir).unwrap();
+    std::fs::write(&ws.state_file, "{not-valid-json").unwrap();
+    let art_err = store_artifact(&[1.0, 2.0], [1, 2, 1, 1], &bad_ws_dir, "tensor_f32")
+        .unwrap_err();
+    assert!(
+        art_err.contains("corrupted workspace state"),
+        "expected corrupted workspace state error, got: {art_err}"
+    );
+    let wf = json!({
+        "spec": spec_path.display().to_string(),
+        "pipeline": [{ "stage": "validate" }]
+    });
+    let wf_err = execute_harness_workflow(&wf, &tmp_dir, Some(&bad_ws_dir)).unwrap_err();
+    assert!(
+        wf_err.contains("corrupted workspace state"),
+        "expected corrupted workspace state error from workflow, got: {wf_err}"
+    );
+
+    // 3. Corrupted existing repertoire file fails closed in certify_weight_set (no silent overwrite)
+    let bad_rep = tmp_dir.join("bad_repertoire.json");
+    std::fs::write(&bad_rep, "{broken-repertoire").unwrap();
+    let ws_ok = WeightSet {
+        name: Some("id_set".into()),
+        kind: "map".into(),
+        w: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        b: vec![0.0, 0.0],
+        probes: vec![],
+        probe_tol: None,
+        requires: WeightRequires::default(),
+    };
+    let cert_err = certify_weight_set(&ws_ok, "id_set", Some(&bad_rep)).unwrap_err();
+    assert!(
+        cert_err.contains("failed to parse repertoire"),
+        "expected repertoire parse error, got: {cert_err}"
+    );
+
+    // --- P0 CLI guarantees ---
+    let bin = env!("CARGO_BIN_EXE_math-draw");
+    let run_cli = |args: &[&str]| -> (i32, serde_json::Value) {
+        let out = Command::new(bin).args(args).output().unwrap();
+        let code = out.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!("CLI stdout must be valid JSON for args {args:?}: {e}\nstdout={stdout}")
+        });
+        (code, parsed)
+    };
+    let sp = spec_path.to_str().unwrap();
+
+    // Unknown flag rejected fail-closed
+    for args in [
+        vec!["run", sp, "--typo"],
+        vec!["validate", sp, "--bogus"],
+        vec!["profile", sp, "--unknown-flag"],
+        vec!["smoke", "--extra"],
+        vec!["find-op", "-z"],
+    ] {
+        let (code, val) = run_cli(&args);
+        assert_eq!(code, 2, "expected exit 2 for {args:?}");
+        assert_eq!(val["ok"], json!(false));
+        assert!(
+            val["error"].as_str().unwrap_or("").contains("unknown flag"),
+            "expected 'unknown flag' for {args:?}, got {val}"
+        );
+    }
+
+    // Missing value on valued flag rejected
+    for args in [
+        vec!["profile", sp, "--iters"],
+        vec!["verify", sp, sp, "--abs-tol", "--zoom"],
+        vec!["bundle", "export", sp, "--attest"],
+    ] {
+        let (code, val) = run_cli(&args);
+        assert_eq!(code, 2, "expected exit 2 for {args:?}");
+        assert_eq!(val["ok"], json!(false));
+        assert!(
+            val["error"].as_str().unwrap_or("").contains("requires a value"),
+            "expected 'requires a value' for {args:?}, got {val}"
+        );
+    }
+
+    // Duplicate single-valued flag rejected
+    let (code, val) = run_cli(&["profile", sp, "--iters", "3", "--iters", "5"]);
+    assert_eq!(code, 2);
+    assert!(val["error"].as_str().unwrap_or("").contains("duplicate flag"));
+
+    // Invalid / non-finite / out-of-domain numeric flag values rejected
+    for (args, needle) in [
+        (vec!["profile", sp, "--iters", "abc"], "invalid --iters"),
+        (vec!["linear-equiv", sp, sp, "--tol", "NaN"], "must be finite"),
+        (vec!["linear-equiv", sp, sp, "--tol", "inf"], "must be finite"),
+        (vec!["linear-equiv", sp, sp, "--tol", "-0.1"], "must be >= 0"),
+        (vec!["gradcheck", sp, "--eps", "0"], "must be > 0"),
+        (vec!["verify", sp, sp, "--fuzz", "abc"], "invalid --fuzz"),
+        (vec!["verify", sp, sp, "--fuzz", "4", "--lo", "5.0", "--hi", "-5.0"], "invalid fuzz range"),
+    ] {
+        let (code, val) = run_cli(&args);
+        assert_eq!(code, 2, "expected exit 2 for {args:?}");
+        assert_eq!(val["ok"], json!(false));
+        assert!(
+            val["error"].as_str().unwrap_or("").contains(needle),
+            "expected '{needle}' for {args:?}, got {val}"
+        );
+    }
+
+    // Unexpected extra positional rejected
+    let (code, val) = run_cli(&["validate", sp, sp]);
+    assert_eq!(code, 2);
+    assert!(val["error"].as_str().unwrap_or("").contains("unexpected positional"));
+
+    // Corrupted --repertoire fails closed in weight-lab eval
+    let expr_path = tmp_dir.join("expr.json");
+    std::fs::write(&expr_path, r#"{"expr":{"ref":"id_set"}}"#).unwrap();
+    let (code, val) = run_cli(&[
+        "weight-lab",
+        "eval",
+        expr_path.to_str().unwrap(),
+        "--repertoire",
+        bad_rep.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2);
+    assert!(val["error"].as_str().unwrap_or("").contains("invalid repertoire JSON"));
+
+    // Corrupted workspace-state.json fails closed in harness workspace-status
+    let (code, val) = run_cli(&[
+        "harness",
+        "workspace-status",
+        "--workspace",
+        bad_ws_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2);
+    assert!(val["error"].as_str().unwrap_or("").contains("corrupted workspace state"));
+
+    // Valid special CLI forms still succeed cleanly with exit 0
+    for args in [
+        vec!["verify", sp, sp, "--fuzz"],
+        vec!["verify", "--fuzz", sp, sp],
+        vec!["verify", sp, sp, "--fuzz", "4", "--lo", "-3.5", "--hi", "3.5"],
+        vec!["bundle", "export", sp, "--attest", "ci", "--attest", "prod"],
+    ] {
+        let (code, val) = run_cli(&args);
+        assert_eq!(code, 0, "expected exit 0 for valid args {args:?}, got {val}");
+        assert_eq!(val["ok"], json!(true));
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn error_handling_phase2_typed_codes_and_envelopes() {
+    use math_draw::error::{ErrorCode, ErrorEnvelope, MathDrawError, classify_error};
+    use math_draw::harness::{ensure_workspace_dir, execute_harness_workflow};
+    use std::process::Command;
+
+    // 1. Direct MathDrawError / ErrorEnvelope JSON structure & trait impls
+    let err = MathDrawError::new(
+        ErrorCode::CliInvalidRange,
+        "invalid --tol value '-0.1': must be >= 0",
+    )
+    .with_stage("cli_parse")
+    .with_hint("Use a non-negative finite tolerance.");
+    assert_eq!(err.to_string(), "invalid --tol value '-0.1': must be >= 0");
+    let as_string: String = err.clone().into();
+    assert_eq!(as_string, err.message);
+    let env: ErrorEnvelope = err.to_envelope();
+    let env_val = serde_json::to_value(&env).unwrap();
+    assert_eq!(env_val["ok"], json!(false));
+    assert_eq!(env_val["code"], json!("cli_invalid_range"));
+    assert_eq!(env_val["stage"], json!("cli_parse"));
+    assert_eq!(
+        env_val["hint"],
+        json!("Use a non-negative finite tolerance.")
+    );
+    assert_eq!(
+        env_val["error"],
+        json!("invalid --tol value '-0.1': must be >= 0")
+    );
+
+    // 2. Deterministic classify_error mappings across domain errors
+    let cases: &[(&str, Option<&str>, ErrorCode)] = &[
+        (
+            "div step 1: division by zero",
+            Some("run"),
+            ErrorCode::DivisionByZero,
+        ),
+        (
+            "intMul: integer overflow",
+            Some("run"),
+            ErrorCode::IntOverflow,
+        ),
+        (
+            "artifact_integrity_failed: digest mismatch",
+            Some("harness.resolve"),
+            ErrorCode::ArtifactIntegrityFailed,
+        ),
+        (
+            "corrupted workspace state in workspace-state.json",
+            Some("harness.workspace_status"),
+            ErrorCode::WorkspaceCorrupted,
+        ),
+        (
+            "layer 0 is unshardable under max_weights=3",
+            Some("shard"),
+            ErrorCode::ShardFailed,
+        ),
+        (
+            "case 0 missing 'expected' target vector",
+            Some("recurse.solve_gd"),
+            ErrorCode::MissingExpectedTarget,
+        ),
+        (
+            "fit: targets.cases must be non-empty",
+            Some("recurse.fit"),
+            ErrorCode::MissingExpectedTarget,
+        ),
+        (
+            "fit: openes requires an even pop >= 2, got 7",
+            Some("recurse.fit"),
+            ErrorCode::EsConfigInvalid,
+        ),
+        (
+            "fit: sigma must be finite and > 0, got 0",
+            Some("fit"),
+            ErrorCode::EsConfigInvalid,
+        ),
+        (
+            "unknown ES strategy 'bogus'",
+            Some("recurse.fit"),
+            ErrorCode::EsConfigInvalid,
+        ),
+        (
+            "unknown rng 'bogus'",
+            Some("fit"),
+            ErrorCode::EsConfigInvalid,
+        ),
+        (
+            "quant bound mode does not support unbounded op exp",
+            Some("quant"),
+            ErrorCode::QuantBoundUnsupported,
+        ),
+        (
+            "unknown workflow pipeline stage 'bogus'",
+            Some("bogus"),
+            ErrorCode::WorkflowFailed,
+        ),
+        (
+            "invalid repertoire JSON: expected object",
+            Some("weight_lab.eval"),
+            ErrorCode::RepertoireInvalid,
+        ),
+        (
+            "bundle signature failed",
+            Some("bundle"),
+            ErrorCode::BundleInvalid,
+        ),
+        (
+            "unknown rewrite rule 'nope'",
+            Some("rewrite"),
+            ErrorCode::RewriteFailed,
+        ),
+        (
+            "tensor shape mismatch at slot 2",
+            Some("run"),
+            ErrorCode::ShapeMismatch,
+        ),
+    ];
+    for (msg, stage, expected_code) in cases {
+        let classified = classify_error(msg, *stage);
+        assert_eq!(
+            classified.code, *expected_code,
+            "classify_error({msg:?}, {stage:?}) returned {:?}",
+            classified.code
+        );
+        assert_eq!(classified.stage.as_deref(), *stage);
+        assert!(
+            classified.hint.as_deref().is_some_and(|h| !h.is_empty()),
+            "expected non-empty hint for {:?}",
+            expected_code
+        );
+    }
+
+    // 3. Workflow stage failure emits typed `code` and `hint` at both stage_reports and top-level
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "math_draw_phase2_err_test_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    let spec_raw = r#"{
+      "numSlots": 2,
+      "layers": [{ "constructor": "linear", "args": [0, 2, 2, false] }],
+      "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+      "outputSlot": 1,
+      "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+      "weights": { "0": [1.0, 0.0, 0.0, 1.0] },
+      "inputs": { "0": [1.0, 2.0] }
+    }"#;
+    let spec_path = tmp_dir.join("spec.json");
+    std::fs::write(&spec_path, spec_raw).unwrap();
+
+    let targets_path = tmp_dir.join("targets.json");
+    std::fs::write(
+        &targets_path,
+        r#"{"cases":[{"inputs":{"0":[1.0,0.0]},"expected":[2.0,0.0]}]}"#,
+    )
+    .unwrap();
+
+    let ws_dir = tmp_dir.join("ws");
+    let wf_unknown = json!({
+        "spec": spec_path.display().to_string(),
+        "pipeline": [{ "stage": "bogus_stage" }]
+    });
+    let wf_rep = execute_harness_workflow(&wf_unknown, &tmp_dir, Some(&ws_dir)).unwrap();
+    assert_eq!(wf_rep["ok"], json!(false));
+    assert_eq!(wf_rep["code"], json!("workflow_failed"));
+    assert_eq!(wf_rep["failed_stage"], json!("bogus_stage"));
+    assert!(wf_rep["hint"].as_str().is_some_and(|h| !h.is_empty()));
+    assert_eq!(wf_rep["stage_reports"][0]["code"], json!("workflow_failed"));
+    assert!(
+        wf_rep["stage_reports"][0]["hint"]
+            .as_str()
+            .is_some_and(|h| !h.is_empty())
+    );
+
+    let wf_bad_fit = json!({
+        "spec": spec_path.display().to_string(),
+        "pipeline": [{
+            "stage": "fit",
+            "targets": targets_path.display().to_string(),
+            "strategy": "openes",
+            "pop": 7,
+            "gens": 2
+        }]
+    });
+    let wf_fit_rep = execute_harness_workflow(&wf_bad_fit, &tmp_dir, Some(&ws_dir)).unwrap();
+    assert_eq!(wf_fit_rep["ok"], json!(false));
+    assert_eq!(wf_fit_rep["code"], json!("es_config_invalid"));
+    assert_eq!(wf_fit_rep["failed_stage"], json!("fit"));
+    assert_eq!(
+        wf_fit_rep["stage_reports"][0]["code"],
+        json!("es_config_invalid")
+    );
+    assert!(
+        wf_fit_rep["stage_reports"][0]["hint"]
+            .as_str()
+            .is_some_and(|h| !h.is_empty())
+    );
+
+    // 4. Live CLI binary tests asserting structured JSON ErrorEnvelope fields (ok, code, stage, error, hint)
+    let bin = env!("CARGO_BIN_EXE_math-draw");
+    let run_cli = |args: &[&str]| -> (i32, serde_json::Value) {
+        let out = Command::new(bin).args(args).output().unwrap();
+        let code = out.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!("CLI stdout must be valid JSON for args {args:?}: {e}\nstdout={stdout}")
+        });
+        (code, parsed)
+    };
+
+    let bad_rep = tmp_dir.join("bad_rep.json");
+    std::fs::write(&bad_rep, "{not-json").unwrap();
+    let expr_path = tmp_dir.join("expr.json");
+    std::fs::write(&expr_path, r#"{"expr":{"ref":"id_set"}}"#).unwrap();
+
+    let bad_ws_dir = tmp_dir.join("bad_ws");
+    let bad_ws = ensure_workspace_dir(&bad_ws_dir).unwrap();
+    std::fs::write(&bad_ws.state_file, "{broken-ws").unwrap();
+
+    let div0_path = tmp_dir.join("div0.json");
+    std::fs::write(
+        &div0_path,
+        r#"{
+          "numSlots": 3,
+          "layers": [{ "constructor": "div", "args": [0] }],
+          "steps": [{ "kind": "binary", "layer": 0, "slots": [0, 1, 2] }],
+          "outputSlot": 2,
+          "ports": [
+            { "slot": 0, "shape": [1, 2, 1, 1] },
+            { "slot": 1, "shape": [1, 2, 1, 1] }
+          ],
+          "inputs": { "0": [1.0, 2.0], "1": [1.0, 0.0] }
+        }"#,
+    )
+    .unwrap();
+
+    let sp = spec_path.to_str().unwrap();
+    let missing = tmp_dir.join("does_not_exist.json");
+    let missing_s = missing.to_str().unwrap();
+    let div0_s = div0_path.to_str().unwrap();
+    let expr_s = expr_path.to_str().unwrap();
+    let bad_rep_s = bad_rep.to_str().unwrap();
+    let bad_ws_s = bad_ws_dir.to_str().unwrap();
+
+    let cli_checks: Vec<(Vec<&str>, &str, &str)> = vec![
+        (vec!["nope-cmd"], "cli_unknown_command", "cli_dispatch"),
+        (vec!["run", sp, "--typo"], "cli_unknown_flag", "cli_parse"),
+        (vec!["profile", sp, "--iters"], "cli_missing_value", "cli_parse"),
+        (
+            vec!["profile", sp, "--iters", "2", "--iters", "3"],
+            "cli_duplicate_flag",
+            "cli_parse",
+        ),
+        (
+            vec!["profile", sp, "--iters", "abc"],
+            "cli_invalid_number",
+            "cli_parse",
+        ),
+        (
+            vec!["linear-equiv", sp, sp, "--tol", "NaN"],
+            "cli_invalid_number",
+            "cli_parse",
+        ),
+        (
+            vec!["linear-equiv", sp, sp, "--tol", "-0.1"],
+            "cli_invalid_range",
+            "cli_parse",
+        ),
+        (
+            vec!["gradcheck", sp, "--eps", "0"],
+            "cli_invalid_range",
+            "cli_parse",
+        ),
+        (
+            vec!["verify", sp, sp, "--fuzz", "4", "--lo", "5", "--hi", "-5"],
+            "cli_invalid_range",
+            "cli_parse",
+        ),
+        (
+            vec!["validate", sp, sp],
+            "cli_unexpected_positional",
+            "cli_parse",
+        ),
+        (vec!["run", missing_s], "io_read_failed", "load_spec"),
+        (
+            vec!["weight-lab", "eval", expr_s, "--repertoire", bad_rep_s],
+            "repertoire_invalid",
+            "weight_lab.eval",
+        ),
+        (
+            vec!["harness", "workspace-status", "--workspace", bad_ws_s],
+            "workspace_corrupted",
+            "harness.workspace_status",
+        ),
+        (
+            vec!["rewrite", "bogus-sub"],
+            "cli_unknown_command",
+            "rewrite",
+        ),
+        (vec!["run", div0_s], "division_by_zero", "run"),
+    ];
+
+    for (args, expected_code, expected_stage) in cli_checks {
+        let (exit_code, val) = run_cli(&args);
+        assert_eq!(exit_code, 2, "expected exit 2 for {args:?}, got {val}");
+        assert_eq!(
+            val["ok"],
+            json!(false),
+            "expected ok=false for {args:?}, got {val}"
+        );
+        assert_eq!(
+            val["code"],
+            json!(expected_code),
+            "expected code={expected_code} for {args:?}, got {val}"
+        );
+        assert_eq!(
+            val["stage"],
+            json!(expected_stage),
+            "expected stage={expected_stage} for {args:?}, got {val}"
+        );
+        assert!(
+            val["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "expected non-empty error string for {args:?}, got {val}"
+        );
+        assert!(
+            val["hint"].as_str().is_some_and(|h| !h.is_empty()),
+            "expected non-empty hint string for {args:?}, got {val}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn error_handling_phase3_workflow_schema_and_domain_guards() {
+    use math_draw::harness::{execute_harness_workflow, merge_subagent_branches};
+    use math_draw::linear_equiv::equiv_linear;
+    use math_draw::mutate::{MutationRequest, mutate_spec};
+    use math_draw::quant::{QuantScheme, quant_verify};
+    use math_draw::recurse::{fit_es, search_graph_tree, solve_gd_autodiff};
+    use math_draw::rollout::rollout_bisect;
+    use math_draw::verify::{FuzzConfig, default_cases_from_spec, verify_specs, zoom_fuzz_specs};
+    use math_draw::weight_lab::{WeightRequires, WeightSet, gate_sets, spectral_radius};
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "math_draw_phase3_err_test_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    let spec_raw = r#"{
+      "numSlots": 2,
+      "layers": [{ "constructor": "linear", "args": [0, 2, 2, false] }],
+      "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+      "outputSlot": 1,
+      "ports": [{ "slot": 0, "shape": [1, 2, 1, 1], "role": "state" }],
+      "weights": { "0": [0.5, 0.0, 0.0, 0.5] },
+      "inputs": { "0": [1.0, 2.0] }
+    }"#;
+    let spec_path = tmp_dir.join("spec.json");
+    std::fs::write(&spec_path, spec_raw).unwrap();
+    let spec = load_spec_str(spec_raw, Path::new(".")).unwrap().spec;
+
+    let targets_path = tmp_dir.join("targets.json");
+    let tf_raw = r#"{"cases":[{"inputs":{"0":[1.0,0.0]},"expected":[0.5,0.0]}]}"#;
+    std::fs::write(&targets_path, tf_raw).unwrap();
+    let tf: TargetsFile = serde_json::from_str(tf_raw).unwrap();
+
+    let ws_dir = tmp_dir.join("ws");
+
+    // 1. Top-level workflow structural & field-type errors fail closed with Err
+    for (bad_wf, needle) in [
+        (json!(["not-an-object"]), "workflow JSON root must be an object"),
+        (
+            json!({ "spec": spec_path.display().to_string(), "pipeline": [], "typo_key": 1 }),
+            "unknown field 'typo_key'",
+        ),
+        (
+            json!({ "spec": spec_path.display().to_string(), "workspace": 123, "pipeline": [] }),
+            "field 'workspace' must be a string",
+        ),
+        (
+            json!({ "spec": spec_path.display().to_string(), "workspace": "  ", "pipeline": [] }),
+            "field 'workspace' must be a non-empty string",
+        ),
+        (
+            json!({ "spec": 42, "pipeline": [] }),
+            "field 'spec' must be a file path string or inline spec object",
+        ),
+        (
+            json!({ "spec": spec_path.display().to_string() }),
+            "workflow must provide 'pipeline' array",
+        ),
+        (
+            json!({ "spec": spec_path.display().to_string(), "pipeline": "not-an-array" }),
+            "field 'pipeline' must be an array",
+        ),
+        (
+            json!({ "spec": spec_path.display().to_string(), "pipeline": [123] }),
+            "pipeline[0] must be a JSON object",
+        ),
+        (
+            json!({ "spec": spec_path.display().to_string(), "pipeline": [{}] }),
+            "pipeline[0] is missing required 'stage'",
+        ),
+        (
+            json!({ "spec": spec_path.display().to_string(), "pipeline": [{ "stage": 99 }] }),
+            "pipeline[0] 'stage' must be a non-empty string",
+        ),
+    ] {
+        let err = execute_harness_workflow(&bad_wf, &tmp_dir, Some(&ws_dir)).unwrap_err();
+        assert!(
+            err.contains(needle),
+            "expected '{needle}' for workflow {bad_wf}, got: {err}"
+        );
+    }
+
+    // 2. Per-stage unknown keys, wrong types, and out-of-domain numerics fail closed with code="workflow_failed"
+    for (stage_obj, expected_stage, needle) in [
+        (
+            json!({ "stage": "validate", "explain": "yes" }),
+            "validate",
+            "field 'explain' must be a boolean",
+        ),
+        (
+            json!({ "stage": "validate", "bogus_opt": true }),
+            "validate",
+            "unknown field 'bogus_opt'",
+        ),
+        (
+            json!({ "stage": "rollout_unroll", "steps": "three" }),
+            "rollout_unroll",
+            "field 'steps' must be a non-negative integer",
+        ),
+        (
+            json!({ "stage": "rollout_unroll", "steps": 0 }),
+            "rollout_unroll",
+            "field 'steps' must be >= 1",
+        ),
+        (
+            json!({ "stage": "search_rewrites", "abs_tol": -0.01 }),
+            "search_rewrites",
+            "field 'abs_tol' must be >= 0",
+        ),
+        (
+            json!({ "stage": "quant_budget", "tol": -1.0 }),
+            "quant_budget",
+            "field 'tol' must be >= 0",
+        ),
+        (
+            json!({
+                "stage": "fit",
+                "targets": targets_path.display().to_string(),
+                "generations": 5,
+                "gens": 5
+            }),
+            "fit",
+            "specify either 'generations' or 'gens', not both",
+        ),
+        (
+            json!({
+                "stage": "fit",
+                "targets": targets_path.display().to_string(),
+                "pop": "twelve"
+            }),
+            "fit",
+            "field 'pop' must be a non-negative integer",
+        ),
+        (
+            json!({
+                "stage": "solve_gd",
+                "targets": targets_path.display().to_string(),
+                "lr": 0.0
+            }),
+            "solve_gd",
+            "field 'lr' must be > 0",
+        ),
+        (
+            json!({
+                "stage": "solve_gd",
+                "targets": targets_path.display().to_string(),
+                "steps": 0
+            }),
+            "solve_gd",
+            "field 'steps' must be >= 1",
+        ),
+        (
+            json!({ "stage": "rollout_scan", "steps": -2 }),
+            "rollout_scan",
+            "field 'steps' must be a non-negative integer",
+        ),
+        (
+            json!({ "stage": "rollout_fixpoint", "tol": -1e-5 }),
+            "rollout_fixpoint",
+            "field 'tol' must be >= 0",
+        ),
+        (
+            json!({ "stage": "rollout_fixpoint", "max_steps": 0 }),
+            "rollout_fixpoint",
+            "field 'max_steps' must be >= 1",
+        ),
+        (
+            json!({ "stage": "run", "extra": 1 }),
+            "run",
+            "unknown field 'extra'",
+        ),
+    ] {
+        let wf = json!({
+            "spec": spec_path.display().to_string(),
+            "pipeline": [stage_obj]
+        });
+        let rep = execute_harness_workflow(&wf, &tmp_dir, Some(&ws_dir)).unwrap();
+        assert_eq!(rep["ok"], json!(false), "expected ok=false for {wf}");
+        assert_eq!(
+            rep["failed_stage"],
+            json!(expected_stage),
+            "unexpected failed_stage for {wf}: {rep}"
+        );
+        assert_eq!(
+            rep["code"],
+            json!("workflow_failed"),
+            "expected code=workflow_failed for {wf}: {rep}"
+        );
+        let err_str = rep["error"].as_str().unwrap_or("");
+        assert!(
+            err_str.contains(needle),
+            "expected '{needle}' in '{err_str}' for {wf}"
+        );
+    }
+
+    // Valid workflow with 'gens' alias in 'fit' and 'layer' in 'solve_gd' succeeds cleanly
+    let wf_ok = json!({
+        "name": "phase3_valid_pipeline",
+        "spec": spec_path.display().to_string(),
+        "pipeline": [
+            { "stage": "validate", "explain": true },
+            { "stage": "fit", "targets": targets_path.display().to_string(), "gens": 2, "pop": 4 },
+            { "stage": "solve_gd", "targets": targets_path.display().to_string(), "steps": 2, "lr": 0.05, "layer": 0 },
+            { "stage": "run" }
+        ]
+    });
+    let rep_ok = execute_harness_workflow(&wf_ok, &tmp_dir, Some(&ws_dir)).unwrap();
+    assert_eq!(rep_ok["ok"], json!(true), "valid workflow failed: {rep_ok}");
+    assert_eq!(rep_ok["stages_completed"], json!(4));
+
+    // 3. Uniform domain numeric boundary guards across public Rust library APIs
+    assert!(solve_gd_autodiff(&spec, Some(&tf), None, 0, 0.1, false).is_err());
+    assert!(solve_gd_autodiff(&spec, Some(&tf), None, 5, 0.0, false).is_err());
+    assert!(solve_gd_autodiff(&spec, Some(&tf), None, 5, -0.1, false).is_err());
+    assert!(solve_gd_autodiff(&spec, Some(&tf), None, 5, f64::NAN, false).is_err());
+
+    assert!(search_graph_tree(&spec, 2, None, -1e-5, 1e-5).is_err());
+    assert!(search_graph_tree(&spec, 2, None, 1e-5, f64::NAN).is_err());
+
+    // Legacy fit_es no longer silently clamps pop=0 or odd pop=3
+    assert!(fit_es(&spec, &tf, 5, 0, 0.1, 0.1, 42, false, 1e-6).is_err());
+    assert!(fit_es(&spec, &tf, 5, 3, 0.1, 0.1, 42, false, 1e-6).is_err());
+
+    let cases = default_cases_from_spec(&spec);
+    let vr_neg = verify_specs(&spec, &spec, &cases, -1e-5, 1e-5);
+    assert!(!vr_neg.ok && !vr_neg.equivalent && vr_neg.verdict == "REJECT");
+    let vr_nan = verify_specs(&spec, &spec, &cases, f64::NAN, 1e-5);
+    assert!(!vr_nan.ok && !vr_nan.equivalent && vr_nan.verdict == "REJECT");
+
+    assert!(
+        zoom_fuzz_specs(
+            &spec,
+            &spec,
+            &FuzzConfig {
+                count: 0,
+                seed: 1,
+                lo: -1.0,
+                hi: 1.0
+            },
+            2
+        )
+        .is_err()
+    );
+    assert!(
+        zoom_fuzz_specs(
+            &spec,
+            &spec,
+            &FuzzConfig {
+                count: 4,
+                seed: 1,
+                lo: 2.0,
+                hi: -2.0
+            },
+            2
+        )
+        .is_err()
+    );
+    assert!(
+        zoom_fuzz_specs(
+            &spec,
+            &spec,
+            &FuzzConfig {
+                count: 4,
+                seed: 1,
+                lo: f64::NAN,
+                hi: 1.0
+            },
+            2
+        )
+        .is_err()
+    );
+
+    assert!(quant_verify(&spec, QuantScheme::Int8, None, -1e-3, 1e-3).is_err());
+    assert!(quant_verify(&spec, QuantScheme::Int8, None, 1e-3, f64::NAN).is_err());
+
+    let le_neg = equiv_linear(&spec, &spec, -1e-6);
+    assert!(!le_neg.ok && le_neg.verdict == "REJECT");
+    let le_nan = equiv_linear(&spec, &spec, f64::NAN);
+    assert!(!le_nan.ok && le_nan.verdict == "REJECT");
+
+    assert!(rollout_bisect(&spec, &spec, None, 4, None, None, -1e-5).is_err());
+    assert!(rollout_bisect(&spec, &spec, None, 4, None, None, f64::NAN).is_err());
+
+    let mreq: MutationRequest = serde_json::from_value(json!({
+        "commit": false,
+        "edits": [{ "op": "setWeights", "layer_index": 0, "values": [0.5, 0.0, 0.0, 0.5] }]
+    }))
+    .unwrap();
+    assert!(mutate_spec(&spec, &mreq, None, -1e-5, 1e-5).is_err());
+    assert!(mutate_spec(&spec, &mreq, None, 1e-5, f64::NAN).is_err());
+
+    assert!(merge_subagent_branches(&spec, &[], -1e-4).is_err());
+    assert!(merge_subagent_branches(&spec, &[], f64::NAN).is_err());
+
+    assert!(spectral_radius(&[vec![1.0, 0.0], vec![0.0, 1.0]], 0).is_err());
+    let ws_set = WeightSet {
+        name: Some("s".into()),
+        kind: "map".into(),
+        w: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+        b: vec![0.0, 0.0],
+        probes: vec![],
+        probe_tol: None,
+        requires: WeightRequires::default(),
+    };
+    assert!(gate_sets(&ws_set, &ws_set, -0.1).is_err());
+    assert!(gate_sets(&ws_set, &ws_set, f64::NAN).is_err());
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+

@@ -167,6 +167,27 @@ pub fn verify_specs(
     abs_tol: f64,
     rel_tol: f64,
 ) -> VerifyReport {
+    if !(abs_tol.is_finite() && abs_tol >= 0.0) || !(rel_tol.is_finite() && rel_tol >= 0.0) {
+        return VerifyReport {
+            ok: false,
+            equivalent: false,
+            verdict: "REJECT",
+            cases: cases.len(),
+            max_abs_diff: f64::INFINITY,
+            max_rel_diff: f64::INFINITY,
+            abs_tol,
+            rel_tol,
+            case_details: vec![CaseDiffDetail {
+                case_index: 0,
+                ok: false,
+                max_abs_diff: f64::INFINITY,
+                max_rel_diff: f64::INFINITY,
+                error: Some(format!(
+                    "invalid tolerance: abs_tol ({abs_tol}) and rel_tol ({rel_tol}) must be finite and >= 0"
+                )),
+            }],
+        };
+    }
     let mut details = Vec::with_capacity(cases.len());
     let mut global_abs = 0.0f64;
     let mut global_rel = 0.0f64;
@@ -290,6 +311,21 @@ pub fn zoom_fuzz_specs(
     cfg: &FuzzConfig,
     zoom_depth: usize,
 ) -> Result<ZoomFuzzReport, String> {
+    if cfg.count == 0 {
+        return Err("zoom_fuzz: fuzz count must be >= 1".into());
+    }
+    if !(cfg.lo.is_finite() && cfg.hi.is_finite()) {
+        return Err(format!(
+            "zoom_fuzz: lo ({}) and hi ({}) must be finite",
+            cfg.lo, cfg.hi
+        ));
+    }
+    if cfg.lo > cfg.hi {
+        return Err(format!(
+            "zoom_fuzz: invalid fuzz range lo ({}) > hi ({})",
+            cfg.lo, cfg.hi
+        ));
+    }
     let g_base = crate::engine::PreparedGraph::compile(base)?;
     let g_cand = crate::engine::PreparedGraph::compile(cand)?;
     let i64_mask = crate::engine::port_is_i64_mask(base);

@@ -10,14 +10,16 @@ Provides formal, numerical, differential, and algebraic verification gates acros
 - Exact symbolic affine equivalence prover (`equiv_linear`) across `linear`, `add`, `sub`, and `concat(dim=1)`: [`linear_equiv.rs`](linear_equiv.rs)
 - Central finite-difference Jacobian checker & Burn autodiff cross-verification (`gradcheck_spec`): [`gradcheck.rs`](gradcheck.rs)
 - Weight quantization simulation (`int8`, `q8-per-block`, `fp16`) & DAG Lipschitz/measured budget planning: [`quant.rs`](quant.rs)
+- Portable program bundles (`burn-math.program-bundle.v1`), canonical unique-first-use parameter binding (`burn-math.graph-parameter-binding.v1`), live replay & proof provenance verification (`compute_parameter_binding`, `export_bundle`, `verify_bundle`): [`bundle.rs`](bundle.rs)
 - Manual-weighting linear algebra workbench, certification, composition & selftests: [`weight_lab/`](weight_lab/AGENTS.md)
 
 ## Local Contracts
 
-- **Accept/Reject Precision**: Equivalence checks (`verify_specs`, `equiv_linear`, `quant_verify`) must fail closed on shape, dtype, runtime, NaN/Inf, or tolerance violations (`verdict: "REJECT"` / `equivalent: false`).
+- **Accept/Reject Precision & Domain Guards**: Equivalence checks (`verify_specs`, `equiv_linear`, `quant_verify`) must fail closed on non-finite or negative tolerances (`abs_tol`, `rel_tol`, `tol`), shape/dtype mismatches, runtime errors, NaN/Inf outputs, or tolerance violations (`verdict: "REJECT"` / `equivalent: false` or `Err(String)`). `zoom_fuzz_specs` must reject `count == 0`, non-finite `lo`/`hi`, or `lo > hi`.
 - **Affine Restriction Soundness**: [`linear_equiv.rs`](linear_equiv.rs) must refuse graphs containing non-affine operations (`relu`, `conv2d`, `softmax`, etc.) rather than falsely certifying equivalence.
-- **Gradcheck Tolerance & Step Bounds**: Central finite differences evaluate `(f(x + eps) - f(x - eps)) / (2 * eps)` strictly on finite inputs; `--autodiff` verification compares numeric weight gradients directly against Burn `Autodiff` `Gradients`.
-- **Budget Soundness**: [`quant.rs`](quant.rs) in `bound` mode must only select per-layer quantization schemes whose accumulated Lipschitz error upper bound stays within `tol`.
+- **Gradcheck Tolerance & Step Bounds**: Central finite differences evaluate `(f(x + eps) - f(x - eps)) / (2 * eps)` strictly on finite inputs (`eps > 0`, `tol > 0`); `--autodiff` verification compares numeric weight gradients directly against Burn `Autodiff` `Gradients`.
+- **Budget Soundness**: [`quant.rs`](quant.rs) requires finite `tol >= 0` and in `bound` mode must only select per-layer quantization schemes whose accumulated Lipschitz error upper bound stays within `tol`.
+- **Bundle Tamper & Replay Soundness**: [`bundle.rs`](bundle.rs) deduplicates parameter owners by unique first use in `spec.steps` order, keeps `program_identity` invariant to weights/inputs, and fails closed in `verify_bundle` on schema mismatches (`invalid_bundle_schema`), payload tampering (`bundle_integrity_failed`), binding drift (`parameter_binding_mismatch`), live replay drift (`execution_receipt_mismatch`), or attestation digest tampering (`attestation_mismatch`).
 
 ## Work Guidance
 
@@ -28,7 +30,8 @@ Provides formal, numerical, differential, and algebraic verification gates acros
 
 - `cargo test --locked --test integration batch2_gradcheck_quant_mutate_and_shard`
 - `cargo test --locked --test integration batch3_weight_lab_linear_equiv_cost_model_and_harness`
-- `./target/release/math-draw smoke` (checks #6, #16, #17, #20, #21, #22)
+- `cargo test --locked --test integration program_bundle_binding_replay_and_tamper_detection`
+- `./target/release/math-draw smoke` (checks #6, #16, #17, #20, #21, #22, #27)
 
 ## Child Graph Index
 

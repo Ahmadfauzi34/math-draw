@@ -433,6 +433,13 @@ pub fn equiv_linear(spec_a: &SpecV1, spec_b: &SpecV1, tol: f64) -> LinearEquivRe
         first_diff,
     };
 
+    if !(tol.is_finite() && tol >= 0.0) {
+        return reject(
+            format!("invalid tolerance: tol ({tol}) must be finite and >= 0"),
+            None,
+        );
+    }
+
     let a = match effective_affine(spec_a) {
         Ok(v) => v,
         Err(e) => return reject(format!("specA: {e}"), None),

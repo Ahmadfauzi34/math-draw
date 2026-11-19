@@ -24,13 +24,17 @@ pub(crate) fn collect_advanced_checks() -> Vec<SmokeCheck> {
             "0": [[1.0, 3.0], [2.0, 4.0]]
         });
         let rep = gradcheck_spec(&spec, Some(&analytic), 1e-3, 1e-2, true, true)?;
-        if !rep.ok || !rep.passed || !rep.autodiff_check.as_ref().map(|a| a.ok).unwrap_or(false) {
+        let autodiff = rep
+            .autodiff_check
+            .as_ref()
+            .ok_or_else(|| "missing autodiff_check in gradcheck report".to_string())?;
+        if !rep.ok || !rep.passed || !autodiff.ok {
             return Err(format!("gradcheck failed: max_abs={}", rep.max_abs_error));
         }
         Ok(format!(
             "max_abs={:.2e} autodiff_weights={}",
             rep.max_abs_error,
-            rep.autodiff_check.unwrap().checked_weights
+            autodiff.checked_weights
         ))
     }));
 
@@ -349,6 +353,107 @@ pub(crate) fn collect_advanced_checks() -> Vec<SmokeCheck> {
         Ok(format!(
             "13_ops_ternary_fma out={:.4} ternary_steps={ternary_count}",
             res.outputs.values[0]
+        ))
+    }));
+
+    // 26. ES strategies (OpenES + MuLambda), PRNGs (Mulberry32/PCG32/Philox4x32), & diagnostics
+    checks.push(run_check("es_strategies_rngs_and_diagnostics", || {
+        let base_raw = r#"{
+          "numSlots": 2,
+          "layers": [{ "constructor": "linear", "args": [0, 2, 2, false] }],
+          "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+          "outputSlot": 1,
+          "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+          "weights": { "0": [0.1, 0.0, 0.0, 0.1] },
+          "inputs": { "0": [1.0, 2.0] }
+        }"#;
+        let base = load_spec_str(base_raw, Path::new("."))?.spec;
+        let targets: crate::verify::TargetsFile = serde_json::from_value(json!({
+            "cases": [
+                { "inputs": { "0": [1.0, 0.0] }, "expected": [2.0, 0.0] },
+                { "inputs": { "0": [0.0, 1.0] }, "expected": [0.0, 3.0] }
+            ]
+        }))
+        .map_err(|e| e.to_string())?;
+        let cfg = crate::recurse::FitEsConfig {
+            generations: 20,
+            pop: 12,
+            mu: Some(3),
+            sigma: 0.25,
+            lr: 0.0,
+            seed: 19,
+            strategy: crate::recurse::EsStrategyKind::MuLambda,
+            rng: crate::recurse::RngKind::Philox4x32,
+            sensitivity_guided: false,
+            freeze_threshold: 1e-6,
+        };
+        let res = crate::recurse::fit_es_with_config(&base, &targets, &cfg)?;
+        if !res.ok
+            || res.final_loss >= res.start_loss
+            || res.strategy != "mu_lambda"
+            || res.rng != "philox4x32"
+            || res.mu != Some(3)
+            || !res.final_diversity.is_finite()
+        {
+            return Err(format!(
+                "mu-lambda/philox failed: start={} final={} div={}",
+                res.start_loss, res.final_loss, res.final_diversity
+            ));
+        }
+        Ok(format!(
+            "strategy={} rng={} loss={:.3}->{:.3} div={:.3}",
+            res.strategy, res.rng, res.start_loss, res.final_loss, res.final_diversity
+        ))
+    }));
+
+    // 27. Portable ProgramBundle, unique-first-use parameter binding, live replay & tamper gate
+    checks.push(run_check("program_bundle_binding_and_tamper_gate", || {
+        let raw = r#"{
+          "numSlots": 4,
+          "layers": [
+            { "constructor": "linear", "args": [7, 2, 2, true] },
+            { "constructor": "relu", "args": [8] }
+          ],
+          "steps": [
+            { "kind": "unary", "layer": 0, "slots": [0, 1] },
+            { "kind": "unary", "layer": 1, "slots": [1, 2] },
+            { "kind": "unary", "layer": 0, "slots": [2, 3] }
+          ],
+          "outputSlot": 3,
+          "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+          "weights": { "0": [1.0, 0.0, 0.0, 1.0, 0.5, -0.5] },
+          "inputs": { "0": [2.0, -1.0] }
+        }"#;
+        let spec = load_spec_str(raw, Path::new("."))?.spec;
+        let bundle = crate::bundle::export_bundle(&spec, true, &["smoke_v1".to_string()])?;
+        // Layer 0 is referenced twice (weight-tied), so owners.len() must be 1!
+        if bundle.parameter_binding.owners.len() != 1
+            || bundle.parameter_binding.total_params != 6
+            || bundle.attestations.len() != 3
+        {
+            return Err(format!(
+                "unexpected binding: owners={} params={} atts={}",
+                bundle.parameter_binding.owners.len(),
+                bundle.parameter_binding.total_params,
+                bundle.attestations.len()
+            ));
+        }
+        let ok_rep = crate::bundle::verify_bundle(&bundle);
+        if !ok_rep.ok || !ok_rep.replayed_execution {
+            return Err(format!("clean bundle verify failed: {:?}", ok_rep.code));
+        }
+        let mut tampered = bundle.clone();
+        tampered.spec.weights.insert("0".into(), vec![9.0, 0.0, 0.0, 1.0, 0.5, -0.5]);
+        let bad_rep = crate::bundle::verify_bundle(&tampered);
+        if bad_rep.ok || bad_rep.code.as_deref() != Some("bundle_integrity_failed") {
+            return Err(format!(
+                "expected tampered bundle to fail with bundle_integrity_failed, got {:?}",
+                bad_rep.code
+            ));
+        }
+        Ok(format!(
+            "owners=1 params={} atts={} tamper_blocked=true",
+            ok_rep.total_params, ok_rep.checked_attestations
         ))
     }));
 

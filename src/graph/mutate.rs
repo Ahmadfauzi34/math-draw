@@ -225,6 +225,16 @@ pub fn mutate_spec(
     abs_tol: f64,
     rel_tol: f64,
 ) -> Result<MutateReport, String> {
+    if !(abs_tol.is_finite() && abs_tol >= 0.0) {
+        return Err(format!(
+            "mutate_spec: abs_tol must be finite and >= 0, got {abs_tol}"
+        ));
+    }
+    if !(rel_tol.is_finite() && rel_tol >= 0.0) {
+        return Err(format!(
+            "mutate_spec: rel_tol must be finite and >= 0, got {rel_tol}"
+        ));
+    }
     let base_val = validate_spec(base, false);
     if !base_val.valid {
         return Err(

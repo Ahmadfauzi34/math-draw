@@ -1,9 +1,11 @@
+pub mod bundle;
 pub mod gradcheck;
 pub mod linear_equiv;
 pub mod quant;
 pub mod verify;
 pub mod weight_lab;
 
+pub use bundle::*;
 pub use gradcheck::*;
 pub use linear_equiv::*;
 pub use quant::*;

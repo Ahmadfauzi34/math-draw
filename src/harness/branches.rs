@@ -11,11 +11,10 @@ pub fn export_subagent_branches(spec: &SpecV1, workspace_dir: &Path) -> Result<V
     let ws = ensure_workspace_dir(workspace_dir)?;
     let baseline_sha = sha256_json(spec);
     let baseline_path = ws.branches_dir.join("baseline.spec.json");
-    std::fs::write(
-        &baseline_path,
-        format!("{}\n", serde_json::to_string_pretty(spec).unwrap()),
-    )
-    .map_err(|e| e.to_string())?;
+    let baseline_txt = serde_json::to_string_pretty(spec)
+        .map_err(|e| format!("failed serializing baseline spec: {e}"))?;
+    std::fs::write(&baseline_path, format!("{baseline_txt}\n"))
+        .map_err(|e| format!("failed writing '{}': {e}", baseline_path.display()))?;
 
     let default_branches = [
         (
@@ -42,11 +41,10 @@ pub fn export_subagent_branches(spec: &SpecV1, workspace_dir: &Path) -> Result<V
             "instructions": instr,
         });
         let pkt_path = ws.branches_dir.join(format!("{bid}.packet.json"));
-        std::fs::write(
-            &pkt_path,
-            format!("{}\n", serde_json::to_string_pretty(&pkt).unwrap()),
-        )
-        .map_err(|e| e.to_string())?;
+        let pkt_txt = serde_json::to_string_pretty(&pkt)
+            .map_err(|e| format!("failed serializing branch packet '{bid}': {e}"))?;
+        std::fs::write(&pkt_path, format!("{pkt_txt}\n"))
+            .map_err(|e| format!("failed writing '{}': {e}", pkt_path.display()))?;
         packets.push(pkt);
     }
 
@@ -63,6 +61,11 @@ pub fn merge_subagent_branches(
     candidate_files: &[String],
     tol: f64,
 ) -> Result<Value, String> {
+    if !(tol.is_finite() && tol >= 0.0) {
+        return Err(format!(
+            "merge_subagent_branches: tol must be finite and >= 0, got {tol}"
+        ));
+    }
     let base_graph = PreparedGraph::compile(baseline)?;
     let baseline_sha = sha256_json(baseline);
 

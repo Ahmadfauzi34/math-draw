@@ -5,6 +5,30 @@ All notable changes to `math-draw` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-11-19
+
+### Added
+- **Evolutionary Strategy (ES) Engine Parity (`src/es/rng.rs`, `src/es/diag.rs`, `src/es/optimizer.rs`)**:
+  - Ported 4 deterministic PRNG streams (`Xorshift64`, `Mulberry32`, `Pcg32`, and counter-based `Philox4x32-10` with random-access `seek(step)`), verified against published `pcg-c-basic` and Random123 test vectors.
+  - Added `(mu, lambda)` elitist selection (`EsStrategyKind::MuLambda`, `--strategy mu-lambda [--mu N]`) alongside antithetic `OpenEs` (`--strategy openes`).
+  - Added per-generation population diagnostics (`worst_loss`, `mean_loss`, `std_loss`, `improvement`, `stagnation`, population `diversity`, `mean_norm`, `best_norm`, and health `flags`: `stagnation`, `low_diversity`, `non_finite_loss`) to `recurse fit` and harness workflow `fit` stages.
+- **Portable Program Bundle & Canonical Parameter Binding (`src/evidence/bundle.rs`, `math-draw bundle`)**:
+  - `math-draw bundle binding <spec.json> [--out <binding.json>]`: computes unique-first-use parameter ownership (`burn-math.graph-parameter-binding.v1`) deduplicating weight-tied layers across `spec.steps`, plus weight/input-invariant `program_identity` (`sha256:...`), `read_bound_flat_weights`, and `apply_bound_flat_weights`.
+  - `math-draw bundle export <spec.json> [--no-run] [--attest <stage>]... [--out <bundle.json>]`: packages `SpecV1`, parameter binding, optional live `Device::flex()` execution receipt, and SHA-256 provenance attestations into a self-contained `burn-math.program-bundle.v1` artifact (`bundle_digest`).
+  - `math-draw bundle verify <bundle.json>`: performs 6-check cryptographic integrity and live replay verification (`schema_version`, `bundle_digest`, `static_validation`, `parameter_binding`, `execution_replay`, `attestation_provenance`), failing closed on weight, receipt, schema, or attestation tampering.
+- **Structured Error Taxonomy & JSON Error Envelopes (`src/error.rs`, `src/cli/`, `src/harness/workflow.rs`)**:
+  - Added [`math_draw::error`](src/error.rs) exposing 31 machine-readable `ErrorCode` variants (`snake_case`), `MathDrawError`, backward-compatible `ErrorEnvelope` (`ok: false`, `code`, `error`, optional `stage`, optional `hint`), and deterministic `classify_error`.
+  - Upgraded all CLI error exits and failed workflow stage reports (`stage_reports` + top-level workflow output) to emit structured `code`, `stage`, and `hint` fields.
+- **Expanded Smoke Suite (#26–#27) & Integration Test Suites (#11–#15) (`src/smoke/advanced_checks.rs`, `tests/integration.rs`)**:
+  - Added smoke check `#26` (`es_strategies_rngs_and_diagnostics`) and `#27` (`program_bundle_binding_and_verify`) (`27/27` passing).
+  - Added 5 integration test suites (`es_rng_vectors_mu_lambda_and_strict_validation`, `program_bundle_binding_replay_and_tamper_detection`, `error_handling_phase1_cli_and_library_fail_closed`, `error_handling_phase2_typed_codes_and_envelopes`, `error_handling_phase3_workflow_schema_and_domain_guards`; `15/15` passing).
+
+### Changed
+- **End-to-End Fail-Closed Error Handling (Phases 1–3)**:
+  - **Phase 1 (P0–P1)**: Replaced permissive CLI flag scanning with strict `ParsedArgs` allowlist validation across all subcommands (rejecting unknown flags, missing flag values, duplicate single-valued flags, unexpected extra positionals, and malformed/non-finite/out-of-domain numeric options) and eliminated 100% of production `.unwrap()`/`.expect()` calls across `src/**/*.rs`.
+  - **Phase 2 (P2)**: Standardized all CLI and workflow errors on `ErrorEnvelope` (`ok`, `code`, `error`, `stage`, `hint`) with exit code `2`.
+  - **Phase 3 (P3)**: Enforced strict root and per-stage JSON field allowlists, value type checks, and numeric domain bounds in `execute_harness_workflow`, plus uniform numeric domain boundary guards across public Rust library APIs (`solve_gd_autodiff`, `search_graph_tree`, `fit_es`, `verify_specs`, `zoom_fuzz_specs`, `quant_verify`, `equiv_linear`, `rollout_bisect`, `mutate_spec`, `merge_subagent_branches`, `spectral_radius`, `gate_sets`).
+
 ## [0.6.0] - 2026-11-18
 
 ### Added

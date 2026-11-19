@@ -14,9 +14,9 @@ Implements the Layer-4 agent-harness co-processor runtime: persistent `.burn-har
 ## Local Contracts
 
 - **Content-Addressed Integrity**: [`resolve_artifact_uri`](workspace.rs) must validate URI prefix (`burn://sha256:`), exact 64 lowercase hex characters, file presence, and live SHA-256 recomputation against the stored JSON payload (`artifact_integrity_failed` on tamper).
-- **Canonical Workspace State**: `workspace-state.json` adheres to schema `burn-math.harness-session.v1` and records artifact tables, proofs, and stage events without corrupting concurrent/re-entrant updates.
-- **Equivalence-Gated Branch Merge**: [`merge_subagent_branches`](branches.rs) evaluates candidate specs across derived test inputs (`baseline`, `zeros`, `ones`, `negated`, `scaled_x2`, `scaled_half`) and promotes only verified equivalent candidates with minimum step count (tie-broken by minimum error).
-- **Stage Error Isolation**: Failure in any stage of [`execute_harness_workflow`](workflow.rs) halts pipeline progression immediately, persists accumulated events/proofs, and returns structured `ok: false` with `failed_stage` diagnostics.
+- **Canonical Workspace State**: `workspace-state.json` adheres to schema `burn-math.harness-session.v1` and records artifact tables, proofs, and stage events. Corrupted, unreadable, or unwritable `workspace-state.json` MUST fail closed with explicit `Err(String)` diagnostics (never silently swallowed or panicking via `.unwrap()`).
+- **Equivalence-Gated Branch Merge**: [`merge_subagent_branches`](branches.rs) requires finite `tol >= 0`, evaluates candidate specs across derived test inputs (`baseline`, `zeros`, `ones`, `negated`, `scaled_x2`, `scaled_half`), and promotes only verified equivalent candidates with minimum step count (tie-broken by minimum error).
+- **Strict Workflow Schema & Stage Error Isolation**: [`execute_harness_workflow`](workflow.rs) enforces strict fail-closed JSON validation at both root (`schema`, `name`, `description`, `workspace`, `spec`, `pipeline`) and per-stage levels — rejecting unknown keys, non-string/empty stage names, wrong JSON value types, or out-of-domain numeric parameters without silent fallback defaults. Failure in any stage halts pipeline progression immediately, classifies the error via [`classify_error`](../error.rs), persists accumulated events/proofs (propagating workspace-state persistence errors), and returns structured `ok: false` with `code`, `error`, `hint`, `failed_stage`, and per-stage `code`/`hint` diagnostics in `stage_reports`.
 
 ## Work Guidance
 

@@ -68,6 +68,11 @@ pub struct GateReport {
 }
 
 pub fn gate_sets(cur: &WeightSet, cand: &WeightSet, jump_tol: f64) -> Result<GateReport, String> {
+    if !(jump_tol.is_finite() && jump_tol >= 0.0) {
+        return Err(format!(
+            "gate_sets: jump_tol must be finite and >= 0, got {jump_tol}"
+        ));
+    }
     let (_, in_cur) = cur.validate_dims()?;
     let (_, in_cand) = cand.validate_dims()?;
     if in_cur != in_cand || cur.w.len() != cand.w.len() {
@@ -371,7 +376,7 @@ pub fn evaluate_weight_expr(
             let ok = props.iter().all(|p| p.ok);
             Ok(ComposeReport {
                 ok,
-                name: ws.name.unwrap(),
+                name: ws.name.unwrap_or_else(|| "blend".to_string()),
                 kind: if ok { kind } else { "map".into() },
                 w,
                 b,
@@ -538,8 +543,10 @@ pub fn certify_weight_set(
 
     if let Some(rp) = repertoire_path {
         let mut rep_val: Value = if rp.exists() {
-            let raw = std::fs::read_to_string(rp).map_err(|e| e.to_string())?;
-            serde_json::from_str(&raw).unwrap_or_else(|_| json!({ "version": 1, "sets": [] }))
+            let raw = std::fs::read_to_string(rp)
+                .map_err(|e| format!("failed to read repertoire '{}': {e}", rp.display()))?;
+            serde_json::from_str(&raw)
+                .map_err(|e| format!("failed to parse repertoire '{}': {e}", rp.display()))?
         } else {
             json!({ "version": 1, "sets": [] })
         };
@@ -553,13 +560,17 @@ pub fn certify_weight_set(
         if let Some(parent) = rp.parent()
             && !parent.as_os_str().is_empty()
         {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "failed to create repertoire directory '{}': {e}",
+                    parent.display()
+                )
+            })?;
         }
-        std::fs::write(
-            rp,
-            format!("{}\n", serde_json::to_string_pretty(&rep_val).unwrap()),
-        )
-        .map_err(|e| e.to_string())?;
+        let serialized = serde_json::to_string_pretty(&rep_val)
+            .map_err(|e| format!("failed to serialize repertoire JSON: {e}"))?;
+        std::fs::write(rp, format!("{serialized}\n"))
+            .map_err(|e| format!("failed to write repertoire '{}': {e}", rp.display()))?;
         return Ok(json!({
             "ok": true,
             "verdict": "CERTIFIED",

@@ -16,7 +16,7 @@ Manages graph topology before execution: static validation and 4D shape/dtype da
 
 - **Static Safety Gate**: [`validate_spec`](validate.rs) is the single source of truth for static validity (`unknown_layer_constructor`, invalid arity/args, slot OOB, uninitialized slot reads, rank-4 shape mismatches, `i64`/`f32` dtype mismatches, output slot unpopulated).
 - **Exact Rewrite Semantics**: Every rule in [`rewrite.rs`](rewrite.rs) must preserve input/output tensor semantics over valid graphs; dead-step elimination must maintain slot/output reachability.
-- **Equivalence-Gated Mutation**: [`mutate_spec`](mutate.rs) commits a candidate branch only when post-mutation outputs pass `verify_specs` within `abs_tol`/`rel_tol` across evaluation cases.
+- **Equivalence-Gated Mutation**: [`mutate_spec`](mutate.rs) requires finite `abs_tol >= 0` and `rel_tol >= 0`, and commits a candidate branch only when post-mutation outputs pass `verify_specs` within `abs_tol`/`rel_tol` across evaluation cases.
 - **Exact Shard Reassembly**: [`shard_spec`](shard.rs) splits `linear` weights along output rows strictly bounded by `max_weights` and verifies assembled output against the unsharded baseline.
 
 ## Work Guidance

@@ -1,8 +1,12 @@
+pub mod diag;
 pub mod optimizer;
+pub mod rng;
 pub mod search;
 pub mod solve_gd;
 
+pub use diag::*;
 pub use optimizer::*;
+pub use rng::*;
 pub use search::*;
 pub use solve_gd::*;
 

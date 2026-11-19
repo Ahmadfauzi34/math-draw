@@ -16,7 +16,7 @@ Orchestrates validated graph compilation into `PreparedGraph`, step-by-step dete
 
 - **Validate-Before-Execute**: `PreparedGraph::compile` and `run_spec` must run `validate_spec` first and abort immediately on invalid graphs.
 - **No Unbounded Trace Allocation**: `trace_hash_spec` and `compare_trace_hashes` enforce `max_bytes` / `DEFAULT_MAX_TENSOR_BYTES` caps so trace inspection remains memory-bounded.
-- **Recurrent State-Port Resolution**: `rollout` operations must support both explicit port name (via `ExpansionReceipt`) and canonical slot index resolution, propagating updated state deterministically across ticks.
+- **Recurrent State-Port Resolution & Domain Guards**: `rollout` operations must support both explicit port name (via `ExpansionReceipt`) and canonical slot index resolution, propagating updated state deterministically across ticks while rejecting `steps == 0` (`scan`, `unroll`, `bisect`), `max_steps == 0` (`fixpoint`), and non-finite or negative tolerances (`fixpoint` `tol`, `bisect` `abs_tol`).
 - **Prefix Isolation Soundness**: `compare_trace_hashes(..., isolate=true)` must emit valid standalone `SpecV1` prefix subspecs stopping at the divergent step.
 
 ## Work Guidance

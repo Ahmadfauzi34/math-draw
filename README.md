@@ -29,14 +29,15 @@ cargo build --release
 - `math-draw mutate <spec.json> <mutation.json> [--cases <cases.json>] [--abs-tol 1e-6] [--rel-tol 1e-6] [--out <out.json>]` — Equivalence-gated single-transaction and multi-branch graph mutation (`setWeights`, `replaceStep`, `insertStep`, `removeStep`, `reconnectStep`, `setOutput`).
 - `math-draw shard <spec.json> [--max-weights 65535] [--out <out.json>]` — Output-row linear layer sharding with exact weight reassembly and equivalence verification.
 - `math-draw weight-lab <run|gate|certify|compose|eval|selftest>` — Manual-weighting workbench: engine probes, spectral radius / orthonormality / determinant property checks, adaptation jump gating, Frobenius norm-bound & orthonormal composition certificates, and recursive weight expression tree evaluation.
+- `math-draw bundle <binding|export|verify> ...` — Canonical unique-first-use graph parameter binding (`burn-math.graph-parameter-binding.v1`), self-contained portable program bundle export (`burn-math.program-bundle.v1`) with execution receipts & provenance attestations, and cryptographic tamper + live replay verification.
 - `math-draw harness <capabilities|digest|resolve-artifact|run-workflow|branch-export|branch-merge|workspace-status>` — Unified Layer-4 agent-harness co-processor interface, content-addressed tensor artifact store (`burn://sha256:...`), subagent branch coordinator, and multi-stage pipeline runner.
 - `math-draw find-op [--list | <constructor>]` — Inspect supported constructors and parameter schemas.
 - `math-draw rewrite list` / `math-draw rewrite apply <rule|all> <spec.json> [--out <out.json>]` — Pure graph rewrites (`linear-branch-fusion`, `linear-chain-fusion`, `relu-idempotent`, `transpose-involution`, `dead-step-elimination`, `add-commute`).
 - `math-draw recurse expand <spec.v2.json> [--out <out.v1.json>]` — Compile recursive `v2` graph specs (subgraphs, `repeat` with `tie_weights`/`weights_per_depth`, `residual`, `parallel_concat`, `$ref`, built-in macros) into canonical flat `v1`.
 - `math-draw recurse search <spec.json> [--out <best.json>] [--max-depth 3] [--cases <cases.json>]` — Recursive tree rewrite search verified against the baseline.
 - `math-draw recurse solve-gd <spec.json> [--targets <targets.json>] [--steps 20] [--lr 0.1] [--layer <idx|all>] [--precondition] [--out <out.json>]` — Burn `Device::flex().autodiff()` gradient descent with backtracking and optional second-order diagonal Hessian preconditioning.
-- `math-draw recurse fit <spec.json> --targets <targets.json> [--gens 40] [--pop 16] [--sigma 0.2] [--lr 0.2] [--seed 42] [--sensitivity-guided] [--freeze-threshold 1e-6] [--out <out.json>]` — Gradient-free Evolutionary Strategy optimizer with optional sensitivity-guided layer freezing.
-- `math-draw smoke` — Run the built-in end-to-end smoke suite.
+- `math-draw recurse fit <spec.json> --targets <targets.json> [--strategy openes|mu-lambda] [--rng xorshift64|mulberry32|pcg32|philox4x32] [--gens 40] [--pop 16] [--mu N] [--sigma 0.2] [--lr 0.2] [--seed 42] [--sensitivity-guided] [--freeze-threshold 1e-6] [--out <out.json>]` — Gradient-free Evolutionary Strategy optimizer supporting OpenES (antithetic) & `(mu, lambda)` elitist selection across 4 deterministic PRNGs, per-generation population diagnostics, and optional sensitivity-guided layer freezing.
+- `math-draw smoke` — Run the built-in end-to-end 27-check smoke suite.
 
 ## Quick Examples
 
@@ -52,6 +53,10 @@ cargo run -- cost-model examples/linear-relu.json --iters 11
 cargo run -- gradcheck examples/linear-relu.json --weights --autodiff
 cargo run -- quant verify examples/linear-relu.json --scheme q8-per-block
 cargo run -- weight-lab selftest
+cargo run -- bundle binding examples/linear-relu.json
+cargo run -- bundle export examples/linear-relu.json --attest demo_v1 --out /tmp/demo.bundle.json
+cargo run -- bundle verify /tmp/demo.bundle.json
 cargo run -- harness capabilities
 cargo run -- recurse solve-gd examples/linear-relu.json --targets examples/targets-linear.json --steps 20 --lr 0.05 --precondition
+cargo run -- recurse fit examples/linear-relu.json --targets examples/targets-linear.json --strategy mu-lambda --rng philox4x32 --pop 12 --mu 3 --gens 20
 ```

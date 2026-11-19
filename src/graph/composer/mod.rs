@@ -518,7 +518,9 @@ fn expand_step_list(
             .or_else(|| op.strip_prefix("macro:"))
             .unwrap_or(op);
 
-        if !op.starts_with("macro:") && state.subgraphs.contains_key(clean_name) {
+        if !op.starts_with("macro:")
+            && let Some(sg) = state.subgraphs.get(clean_name).cloned()
+        {
             let cycle_token = format!("subgraph:{clean_name}");
             if call_stack.contains(&cycle_token) {
                 return Err(format!(
@@ -526,7 +528,6 @@ fn expand_step_list(
                     call_stack.join(" -> ")
                 ));
             }
-            let sg = state.subgraphs.get(clean_name).unwrap().clone();
             let sg_in_names: Vec<String> = sg
                 .get("in")
                 .or_else(|| sg.get("inputs"))

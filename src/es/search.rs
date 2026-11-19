@@ -51,6 +51,16 @@ pub fn search_graph_tree(
     abs_tol: f64,
     rel_tol: f64,
 ) -> Result<SearchResult, String> {
+    if !(abs_tol.is_finite() && abs_tol >= 0.0) {
+        return Err(format!(
+            "search_graph_tree: abs_tol must be finite and >= 0, got {abs_tol}"
+        ));
+    }
+    if !(rel_tol.is_finite() && rel_tol >= 0.0) {
+        return Err(format!(
+            "search_graph_tree: rel_tol must be finite and >= 0, got {rel_tol}"
+        ));
+    }
     let v = validate_spec(base, false);
     if !v.valid {
         return Err(format!("baseline spec invalid: {:?}", v.code));

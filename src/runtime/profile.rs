@@ -92,7 +92,7 @@ pub fn profile_spec(spec: &SpecV1, warmup: usize, iters: usize) -> Result<Profil
     let p95_idx = (((n as f64) * 0.95).ceil() as usize).saturating_sub(1).min(n - 1);
     let p95_ms = samples_ms[p95_idx];
 
-    let out = last_out.expect("iters >= 1");
+    let out = last_out.ok_or_else(|| "profile_spec: no iterations executed".to_string())?;
     let outputs_sha256 = sha256_f32_slice(&out.values);
 
     Ok(ProfileReport {

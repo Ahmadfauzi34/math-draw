@@ -710,7 +710,10 @@ pub fn validate_spec(spec: &SpecV1, include_explain: bool) -> ValidateReport {
     let mut arg_issues = Vec::new();
     let mut seen_ids: HashMap<u64, usize> = HashMap::new();
     for (li, decl) in spec.layers.iter().enumerate() {
-        let meta = find_constructor(&decl.constructor).unwrap();
+        let Some(meta) = find_constructor(&decl.constructor) else {
+            arg_issues.push(format!("layer {li}: unknown constructor '{}'", decl.constructor));
+            continue;
+        };
         let required = meta.parameters.iter().filter(|p| !p.optional).count();
         if decl.args.len() < required || decl.args.len() > meta.parameters.len() {
             arg_issues.push(format!(
@@ -837,7 +840,14 @@ pub fn validate_spec(spec: &SpecV1, include_explain: bool) -> ValidateReport {
             });
             continue;
         };
-        let meta = find_constructor(&layer.constructor).unwrap();
+        let Some(meta) = find_constructor(&layer.constructor) else {
+            mismatches.push(ShapeMismatch {
+                step: si,
+                layer: layer.constructor.clone(),
+                message: format!("unknown constructor '{}'", layer.constructor),
+            });
+            continue;
+        };
         let Some(want_kind) = crate::spec::StepDecl::kind_for_arity(meta.arity) else {
             mismatches.push(ShapeMismatch {
                 step: si,
@@ -913,8 +923,7 @@ pub fn validate_spec(spec: &SpecV1, include_explain: bool) -> ValidateReport {
         let in_shapes: Vec<Option<[usize; 4]>> =
             in_slots.iter().map(|s| slot_shapes.get(s).copied()).collect();
         let mut out_shape = None;
-        if in_shapes.iter().all(|s| s.is_some()) {
-            let concrete: Vec<[usize; 4]> = in_shapes.iter().map(|s| s.unwrap()).collect();
+        if let Some(concrete) = in_shapes.iter().copied().collect::<Option<Vec<[usize; 4]>>>() {
             match infer_step_shape(&layer.constructor, &concrete, &layer.args) {
                 Ok(sh) => {
                     slot_shapes.insert(out_slot, sh);

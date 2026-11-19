@@ -4,25 +4,155 @@ use std::path::{Path, PathBuf};
 use super::workspace::{SemanticDigest, compute_semantic_digest, ensure_workspace_dir};
 use crate::engine::run_spec;
 use crate::quant::{BudgetMode, QuantScheme, quant_budget};
-use crate::recurse::{fit_es, search_graph_tree, solve_gd_autodiff};
+use crate::recurse::{search_graph_tree, solve_gd_autodiff};
 use crate::rollout::{rollout_fixpoint, rollout_scan, rollout_unroll};
 use crate::spec::{LoadedSpec, load_spec_file, load_spec_str};
 use crate::validate::validate_spec;
 use crate::verify::TargetsFile;
+
+fn ensure_allowed_keys(obj: &serde_json::Map<String, Value>, ctx: &str, allowed: &[&str]) -> Result<(), String> {
+    for k in obj.keys() {
+        if !allowed.contains(&k.as_str()) {
+            return Err(format!("workflow {ctx}: unknown field '{k}'"));
+        }
+    }
+    Ok(())
+}
+
+fn wf_opt_str<'a>(st: &'a Value, ctx: &str, key: &str) -> Result<Option<&'a str>, String> {
+    match st.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(other) => Err(format!(
+            "workflow {ctx}: field '{key}' must be a string, got {other}"
+        )),
+    }
+}
+
+fn wf_str<'a>(st: &'a Value, ctx: &str, key: &str, default: &'a str) -> Result<&'a str, String> {
+    Ok(wf_opt_str(st, ctx, key)?.unwrap_or(default))
+}
+
+fn wf_bool(st: &Value, ctx: &str, key: &str, default: bool) -> Result<bool, String> {
+    match st.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(other) => Err(format!(
+            "workflow {ctx}: field '{key}' must be a boolean, got {other}"
+        )),
+    }
+}
+
+fn wf_opt_u64(st: &Value, ctx: &str, key: &str) -> Result<Option<u64>, String> {
+    match st.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n.as_u64().ok_or_else(|| {
+            format!("workflow {ctx}: field '{key}' must be a non-negative integer, got {n}")
+        }).map(Some),
+        Some(other) => Err(format!(
+            "workflow {ctx}: field '{key}' must be a non-negative integer, got {other}"
+        )),
+    }
+}
+
+fn wf_u64(st: &Value, ctx: &str, key: &str, default: u64) -> Result<u64, String> {
+    Ok(wf_opt_u64(st, ctx, key)?.unwrap_or(default))
+}
+
+fn wf_opt_usize(st: &Value, ctx: &str, key: &str) -> Result<Option<usize>, String> {
+    match wf_opt_u64(st, ctx, key)? {
+        Some(v) => usize::try_from(v)
+            .map(Some)
+            .map_err(|_| format!("workflow {ctx}: field '{key}' overflows usize: {v}")),
+        None => Ok(None),
+    }
+}
+
+fn wf_usize(st: &Value, ctx: &str, key: &str, default: usize) -> Result<usize, String> {
+    Ok(wf_opt_usize(st, ctx, key)?.unwrap_or(default))
+}
+
+fn wf_usize_pos(st: &Value, ctx: &str, key: &str, default: usize) -> Result<usize, String> {
+    let v = wf_usize(st, ctx, key, default)?;
+    if v == 0 {
+        return Err(format!(
+            "workflow {ctx}: field '{key}' must be >= 1, got 0"
+        ));
+    }
+    Ok(v)
+}
+
+fn wf_f64(st: &Value, ctx: &str, key: &str, default: f64) -> Result<f64, String> {
+    match st.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Number(n)) => {
+            let v = n.as_f64().ok_or_else(|| {
+                format!("workflow {ctx}: field '{key}' must be a finite number, got {n}")
+            })?;
+            if !v.is_finite() {
+                return Err(format!(
+                    "workflow {ctx}: field '{key}' must be finite, got {v}"
+                ));
+            }
+            Ok(v)
+        }
+        Some(other) => Err(format!(
+            "workflow {ctx}: field '{key}' must be a finite number, got {other}"
+        )),
+    }
+}
+
+fn wf_f64_non_neg(st: &Value, ctx: &str, key: &str, default: f64) -> Result<f64, String> {
+    let v = wf_f64(st, ctx, key, default)?;
+    if v < 0.0 {
+        return Err(format!(
+            "workflow {ctx}: field '{key}' must be >= 0, got {v}"
+        ));
+    }
+    Ok(v)
+}
+
+fn wf_f64_pos(st: &Value, ctx: &str, key: &str, default: f64) -> Result<f64, String> {
+    let v = wf_f64(st, ctx, key, default)?;
+    if v <= 0.0 {
+        return Err(format!(
+            "workflow {ctx}: field '{key}' must be > 0, got {v}"
+        ));
+    }
+    Ok(v)
+}
 
 pub fn execute_harness_workflow(
     workflow: &Value,
     base_dir: &Path,
     workspace_override: Option<&Path>,
 ) -> Result<Value, String> {
+    let wf_obj = workflow
+        .as_object()
+        .ok_or_else(|| "workflow JSON root must be an object".to_string())?;
+    ensure_allowed_keys(
+        wf_obj,
+        "root",
+        &["schema", "name", "description", "workspace", "spec", "pipeline"],
+    )?;
+
+    let ws_from_wf = match workflow.get("workspace") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            if s.trim().is_empty() {
+                return Err("workflow field 'workspace' must be a non-empty string".into());
+            }
+            Some(PathBuf::from(s))
+        }
+        Some(other) => {
+            return Err(format!(
+                "workflow field 'workspace' must be a string path, got {other}"
+            ));
+        }
+    };
     let ws_rel = workspace_override
         .map(PathBuf::from)
-        .or_else(|| {
-            workflow
-                .get("workspace")
-                .and_then(|v| v.as_str())
-                .map(PathBuf::from)
-        })
+        .or(ws_from_wf)
         .unwrap_or_else(|| PathBuf::from(".burn-harness"));
     let ws_path = if ws_rel.is_absolute() {
         ws_rel
@@ -31,16 +161,24 @@ pub fn execute_harness_workflow(
     };
     let ws = ensure_workspace_dir(&ws_path)?;
 
-    let loaded_initial: LoadedSpec =
-        if let Some(s_path) = workflow.get("spec").and_then(|v| v.as_str()) {
+    let loaded_initial: LoadedSpec = match workflow.get("spec") {
+        Some(Value::String(s_path)) => {
             let resolved = base_dir.join(s_path);
             load_spec_file(&resolved)?
-        } else if let Some(s_obj) = workflow.get("spec") {
+        }
+        Some(s_obj @ Value::Object(_)) => {
             let raw_str = serde_json::to_string(s_obj).map_err(|e| e.to_string())?;
             load_spec_str(&raw_str, base_dir)?
-        } else {
+        }
+        Some(other) => {
+            return Err(format!(
+                "workflow field 'spec' must be a file path string or inline spec object, got {other}"
+            ));
+        }
+        None => {
             return Err("workflow must provide 'spec' (file path or inline spec object)".into());
-        };
+        }
+    };
 
     let mut active_spec = loaded_initial.spec;
     let active_expansion = loaded_initial.expansion;
@@ -49,46 +187,88 @@ pub fn execute_harness_workflow(
     let mut proofs = Vec::new();
     let mut last_run_digest: Option<SemanticDigest> = None;
 
-    let sync_state = |events: &[Value], proofs: &[Value]| {
-        if let Ok(raw_st) = std::fs::read_to_string(&ws.state_file)
-            && let Ok(mut st) = serde_json::from_str::<Value>(&raw_st)
-        {
-            if let Some(ev_arr) = st
-                .get_mut("tables")
-                .and_then(|t| t.get_mut("events"))
-                .and_then(|a| a.as_array_mut())
-            {
-                ev_arr.extend(events.iter().cloned());
-            }
-            if let Some(pr_arr) = st
-                .get_mut("tables")
-                .and_then(|t| t.get_mut("proofs"))
-                .and_then(|a| a.as_array_mut())
-            {
-                pr_arr.extend(proofs.iter().cloned());
-            }
-            let _ = std::fs::write(
-                &ws.state_file,
-                format!("{}\n", serde_json::to_string_pretty(&st).unwrap()),
-            );
+    let sync_state = |events: &[Value], proofs: &[Value]| -> Result<(), String> {
+        let raw_st = std::fs::read_to_string(&ws.state_file).map_err(|e| {
+            format!(
+                "failed to read workspace state '{}': {e}",
+                ws.state_file.display()
+            )
+        })?;
+        let mut st: Value = serde_json::from_str(&raw_st).map_err(|e| {
+            format!(
+                "corrupted workspace state '{}': {e}",
+                ws.state_file.display()
+            )
+        })?;
+        let ev_arr = st
+            .get_mut("tables")
+            .and_then(|t| t.get_mut("events"))
+            .and_then(|a| a.as_array_mut())
+            .ok_or_else(|| {
+                format!(
+                    "workspace state '{}' missing 'tables.events' array",
+                    ws.state_file.display()
+                )
+            })?;
+        ev_arr.extend(events.iter().cloned());
+        let pr_arr = st
+            .get_mut("tables")
+            .and_then(|t| t.get_mut("proofs"))
+            .and_then(|a| a.as_array_mut())
+            .ok_or_else(|| {
+                format!(
+                    "workspace state '{}' missing 'tables.proofs' array",
+                    ws.state_file.display()
+                )
+            })?;
+        pr_arr.extend(proofs.iter().cloned());
+        let serialized = serde_json::to_string_pretty(&st)
+            .map_err(|e| format!("failed to serialize workspace state JSON: {e}"))?;
+        std::fs::write(&ws.state_file, format!("{serialized}\n")).map_err(|e| {
+            format!(
+                "failed to write workspace state '{}': {e}",
+                ws.state_file.display()
+            )
+        })?;
+        Ok(())
+    };
+
+    let pipeline = match workflow.get("pipeline") {
+        Some(Value::Array(arr)) => arr.clone(),
+        Some(other) => {
+            return Err(format!(
+                "workflow field 'pipeline' must be an array of stage objects, got {other}"
+            ));
+        }
+        None => {
+            return Err("workflow must provide 'pipeline' array of stages".into());
         }
     };
 
-    let pipeline = workflow
-        .get("pipeline")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
     for (idx, st) in pipeline.iter().enumerate() {
-        let stage_name = st
-            .get("stage")
-            .or_else(|| st.get("op"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
+        let Some(st_obj) = st.as_object() else {
+            return Err(format!(
+                "workflow pipeline[{idx}] must be a JSON object, got {st}"
+            ));
+        };
+        let stage_val = st_obj.get("stage").or_else(|| st_obj.get("op"));
+        let stage_name = match stage_val {
+            Some(Value::String(s)) if !s.trim().is_empty() => s.as_str(),
+            Some(other) => {
+                return Err(format!(
+                    "workflow pipeline[{idx}] 'stage' must be a non-empty string, got {other}"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "workflow pipeline[{idx}] is missing required 'stage' (or 'op') string field"
+                ));
+            }
+        };
 
         let step_res: Result<Value, String> = (|| match stage_name {
             "compile" | "compile_v2" => {
+                ensure_allowed_keys(st_obj, stage_name, &["stage", "op"])?;
                 events.push(json!({
                     "stage": stage_name,
                     "index": idx,
@@ -103,7 +283,9 @@ pub fn execute_harness_workflow(
                 }))
             }
             "validate" => {
-                let rep = validate_spec(&active_spec, true);
+                ensure_allowed_keys(st_obj, stage_name, &["stage", "op", "explain"])?;
+                let explain = wf_bool(st, stage_name, "explain", true)?;
+                let rep = validate_spec(&active_spec, explain);
                 if !rep.valid {
                     return Err(format!("validate stage failed: {}", rep.code));
                 }
@@ -115,8 +297,9 @@ pub fn execute_harness_workflow(
                 }))
             }
             "rollout_unroll" | "unroll" => {
-                let steps = st.get("steps").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
-                let state_port = st.get("state_port").and_then(|v| v.as_str());
+                ensure_allowed_keys(st_obj, stage_name, &["stage", "op", "steps", "state_port"])?;
+                let steps = wf_usize_pos(st, stage_name, "steps", 3)?;
+                let state_port = wf_opt_str(st, stage_name, "state_port")?;
                 let ur = rollout_unroll(&active_spec, active_expansion.as_ref(), steps, state_port)?;
                 active_spec = ur.unrolled_spec;
                 Ok(json!({
@@ -129,9 +312,14 @@ pub fn execute_harness_workflow(
                 }))
             }
             "search_rewrites" | "recursive_rewrite" => {
-                let max_depth = st.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
-                let abs_tol = st.get("abs_tol").and_then(|v| v.as_f64()).unwrap_or(1e-5);
-                let rel_tol = st.get("rel_tol").and_then(|v| v.as_f64()).unwrap_or(1e-5);
+                ensure_allowed_keys(
+                    st_obj,
+                    stage_name,
+                    &["stage", "op", "max_depth", "abs_tol", "rel_tol"],
+                )?;
+                let max_depth = wf_usize(st, stage_name, "max_depth", 3)?;
+                let abs_tol = wf_f64_non_neg(st, stage_name, "abs_tol", 1e-5)?;
+                let rel_tol = wf_f64_non_neg(st, stage_name, "rel_tol", 1e-5)?;
                 let sr = search_graph_tree(&active_spec, max_depth, None, abs_tol, rel_tol)?;
                 let best_max_abs_diff = sr
                     .nodes
@@ -156,15 +344,14 @@ pub fn execute_harness_workflow(
                 }))
             }
             "quant_budget" => {
-                let tol = st.get("tol").and_then(|v| v.as_f64()).unwrap_or(0.05);
-                let scheme = QuantScheme::parse(
-                    st.get("scheme")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("q8-per-block"),
+                ensure_allowed_keys(
+                    st_obj,
+                    stage_name,
+                    &["stage", "op", "tol", "scheme", "mode"],
                 )?;
-                let mode = BudgetMode::parse(
-                    st.get("mode").and_then(|v| v.as_str()).unwrap_or("bound"),
-                )?;
+                let tol = wf_f64_non_neg(st, stage_name, "tol", 0.05)?;
+                let scheme = QuantScheme::parse(wf_str(st, stage_name, "scheme", "q8-per-block")?)?;
+                let mode = BudgetMode::parse(wf_str(st, stage_name, "mode", "bound")?)?;
                 let qb = quant_budget(&active_spec, None, tol, scheme, mode)?;
                 active_spec = qb.planned_spec;
                 Ok(json!({
@@ -176,6 +363,31 @@ pub fn execute_harness_workflow(
                 }))
             }
             "fit" | "fit_hybrid" => {
+                ensure_allowed_keys(
+                    st_obj,
+                    stage_name,
+                    &[
+                        "stage",
+                        "op",
+                        "targets",
+                        "generations",
+                        "gens",
+                        "pop",
+                        "mu",
+                        "sigma",
+                        "lr",
+                        "seed",
+                        "sensitivity_guided",
+                        "freeze_threshold",
+                        "strategy",
+                        "rng",
+                    ],
+                )?;
+                if st_obj.contains_key("generations") && st_obj.contains_key("gens") {
+                    return Err(format!(
+                        "workflow {stage_name}: specify either 'generations' or 'gens', not both"
+                    ));
+                }
                 let t_val = st
                     .get("targets")
                     .ok_or_else(|| "workflow fit stage requires 'targets'".to_string())?;
@@ -186,22 +398,63 @@ pub fn execute_harness_workflow(
                 } else {
                     serde_json::from_value(t_val.clone()).map_err(|e| e.to_string())?
                 };
-                let gens = st.get("generations").and_then(|v| v.as_u64()).unwrap_or(25) as usize;
-                let seed = st.get("seed").and_then(|v| v.as_u64()).unwrap_or(42);
-                let sens = st
-                    .get("sensitivity_guided")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                let fr = fit_es(&active_spec, &tf, gens, 12, 0.2, 0.2, seed, sens, 1e-6)?;
+                let gens = match wf_opt_usize(st, stage_name, "generations")? {
+                    Some(g) => g,
+                    None => wf_usize(st, stage_name, "gens", 25)?,
+                };
+                let pop = wf_usize(st, stage_name, "pop", 12)?;
+                let mu = wf_opt_usize(st, stage_name, "mu")?;
+                let sigma = wf_f64(st, stage_name, "sigma", 0.2)?;
+                let lr = wf_f64(st, stage_name, "lr", 0.2)?;
+                let seed = wf_u64(st, stage_name, "seed", 42)?;
+                let sens = wf_bool(st, stage_name, "sensitivity_guided", true)?;
+                let freeze_threshold = wf_f64_non_neg(st, stage_name, "freeze_threshold", 1e-6)?;
+                let strategy = match wf_opt_str(st, stage_name, "strategy")? {
+                    Some(s) => crate::recurse::EsStrategyKind::parse(s)?,
+                    None => crate::recurse::EsStrategyKind::OpenEs,
+                };
+                let rng = match wf_opt_str(st, stage_name, "rng")? {
+                    Some(r) => crate::recurse::RngKind::parse(r)?,
+                    None => crate::recurse::RngKind::Xorshift64,
+                };
+                let cfg = crate::recurse::FitEsConfig {
+                    generations: gens,
+                    pop,
+                    mu,
+                    sigma,
+                    lr,
+                    seed,
+                    strategy,
+                    rng,
+                    sensitivity_guided: sens,
+                    freeze_threshold,
+                };
+                let fr = crate::recurse::fit_es_with_config(&active_spec, &tf, &cfg)?;
                 active_spec = fr.optimized_spec;
                 Ok(json!({
                     "stage": stage_name,
                     "ok": fr.ok,
+                    "strategy": fr.strategy,
+                    "rng": fr.rng,
                     "start_loss": fr.start_loss,
                     "final_loss": fr.final_loss,
+                    "flags": fr.flags,
                 }))
             }
             "solve_gd" | "solve-gd" => {
+                ensure_allowed_keys(
+                    st_obj,
+                    stage_name,
+                    &[
+                        "stage",
+                        "op",
+                        "targets",
+                        "steps",
+                        "lr",
+                        "precondition",
+                        "layer",
+                    ],
+                )?;
                 let t_val = st.get("targets").ok_or_else(|| {
                     "workflow solve_gd stage requires explicit 'targets'".to_string()
                 })?;
@@ -212,13 +465,11 @@ pub fn execute_harness_workflow(
                 } else {
                     serde_json::from_value(t_val.clone()).map_err(|e| e.to_string())?
                 };
-                let steps = st.get("steps").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-                let lr = st.get("lr").and_then(|v| v.as_f64()).unwrap_or(0.1);
-                let pre = st
-                    .get("precondition")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let gd = solve_gd_autodiff(&active_spec, Some(&tf), None, steps, lr, pre)?;
+                let steps = wf_usize_pos(st, stage_name, "steps", 20)?;
+                let lr = wf_f64_pos(st, stage_name, "lr", 0.1)?;
+                let pre = wf_bool(st, stage_name, "precondition", false)?;
+                let layer = wf_opt_usize(st, stage_name, "layer")?;
+                let gd = solve_gd_autodiff(&active_spec, Some(&tf), layer, steps, lr, pre)?;
                 active_spec = gd.optimized_spec;
                 proofs.push(json!({
                     "stage": stage_name,
@@ -235,8 +486,13 @@ pub fn execute_harness_workflow(
                 }))
             }
             "rollout_scan" => {
-                let steps = st.get("steps").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
-                let state_port = st.get("state_port").and_then(|v| v.as_str());
+                ensure_allowed_keys(
+                    st_obj,
+                    stage_name,
+                    &["stage", "op", "steps", "state_port"],
+                )?;
+                let steps = wf_usize_pos(st, stage_name, "steps", 8)?;
+                let state_port = wf_opt_str(st, stage_name, "state_port")?;
                 let sc =
                     rollout_scan(&active_spec, active_expansion.as_ref(), steps, state_port, None)?;
                 let dig = compute_semantic_digest(
@@ -255,10 +511,14 @@ pub fn execute_harness_workflow(
                 }))
             }
             "rollout_fixpoint" => {
-                let tol = st.get("tol").and_then(|v| v.as_f64()).unwrap_or(1e-6);
-                let max_steps =
-                    st.get("max_steps").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
-                let state_port = st.get("state_port").and_then(|v| v.as_str());
+                ensure_allowed_keys(
+                    st_obj,
+                    stage_name,
+                    &["stage", "op", "tol", "max_steps", "state_port"],
+                )?;
+                let tol = wf_f64_non_neg(st, stage_name, "tol", 1e-6)?;
+                let max_steps = wf_usize_pos(st, stage_name, "max_steps", 100)?;
+                let state_port = wf_opt_str(st, stage_name, "state_port")?;
                 let fp = rollout_fixpoint(
                     &active_spec,
                     active_expansion.as_ref(),
@@ -295,6 +555,7 @@ pub fn execute_harness_workflow(
                 }))
             }
             "run" => {
+                ensure_allowed_keys(st_obj, stage_name, &["stage", "op"])?;
                 let out = run_spec(&active_spec)?;
                 let dig = compute_semantic_digest(
                     &out.outputs.values,
@@ -316,15 +577,20 @@ pub fn execute_harness_workflow(
         match step_res {
             Ok(rep) => stage_reports.push(rep),
             Err(err_msg) => {
+                let classified = crate::error::classify_error(&err_msg, Some(stage_name));
                 stage_reports.push(json!({
                     "stage": stage_name,
                     "ok": false,
+                    "code": classified.code,
                     "error": err_msg,
+                    "hint": classified.hint,
                 }));
-                sync_state(&events, &proofs);
+                sync_state(&events, &proofs)?;
                 return Ok(json!({
                     "ok": false,
+                    "code": classified.code,
                     "error": err_msg,
+                    "hint": classified.hint,
                     "failed_stage": stage_name,
                     "workspace": ws.root.display().to_string(),
                     "stages_completed": stage_reports.len(),
@@ -335,7 +601,7 @@ pub fn execute_harness_workflow(
         }
     }
 
-    sync_state(&events, &proofs);
+    sync_state(&events, &proofs)?;
     Ok(json!({
         "ok": true,
         "workspace": ws.root.display().to_string(),

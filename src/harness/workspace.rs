@@ -46,11 +46,10 @@ pub fn ensure_workspace_dir(workspace_dir: &Path) -> Result<WorkspacePaths, Stri
                 "events": []
             }
         });
-        std::fs::write(
-            &state_file,
-            format!("{}\n", serde_json::to_string_pretty(&initial).unwrap()),
-        )
-        .map_err(|e| e.to_string())?;
+        let initial_txt = serde_json::to_string_pretty(&initial)
+            .map_err(|e| format!("failed serializing workspace state: {e}"))?;
+        std::fs::write(&state_file, format!("{initial_txt}\n"))
+            .map_err(|e| format!("failed writing workspace state '{}': {e}", state_file.display()))?;
     }
     Ok(WorkspacePaths {
         root,
@@ -87,30 +86,30 @@ pub fn store_artifact(
     }
 
     let uri = format!("{ARTIFACT_URI_PREFIX}{digest}");
-    if let Ok(raw_st) = std::fs::read_to_string(&ws.state_file)
-        && let Ok(mut st) = serde_json::from_str::<Value>(&raw_st)
+    let raw_st = std::fs::read_to_string(&ws.state_file)
+        .map_err(|e| format!("failed reading workspace state '{}': {e}", ws.state_file.display()))?;
+    let mut st: Value = serde_json::from_str(&raw_st)
+        .map_err(|e| format!("corrupted workspace state '{}': {e}", ws.state_file.display()))?;
+    if let Some(arts) = st
+        .get_mut("tables")
+        .and_then(|t| t.get_mut("artifacts"))
+        .and_then(|a| a.as_object_mut())
     {
-        if let Some(arts) = st
-            .get_mut("tables")
-            .and_then(|t| t.get_mut("artifacts"))
-            .and_then(|a| a.as_object_mut())
-        {
-            arts.insert(
-                digest.clone(),
-                json!({
-                    "uri": uri,
-                    "kind": kind,
-                    "shape": shape,
-                    "numel": values.len(),
-                    "bytes": payload.len(),
-                }),
-            );
-        }
-        let _ = std::fs::write(
-            &ws.state_file,
-            format!("{}\n", serde_json::to_string_pretty(&st).unwrap()),
+        arts.insert(
+            digest.clone(),
+            json!({
+                "uri": uri,
+                "kind": kind,
+                "shape": shape,
+                "numel": values.len(),
+                "bytes": payload.len(),
+            }),
         );
     }
+    let state_txt = serde_json::to_string_pretty(&st)
+        .map_err(|e| format!("failed serializing workspace state: {e}"))?;
+    std::fs::write(&ws.state_file, format!("{state_txt}\n"))
+        .map_err(|e| format!("failed writing workspace state '{}': {e}", ws.state_file.display()))?;
 
     Ok((uri, format!("sha256:{digest}"), file))
 }
@@ -270,12 +269,13 @@ pub fn get_capability_catalog(domain: Option<&str>) -> Value {
             ]
         },
         "verify": {
-            "summary": "Validate plans, prove numerical and exact algebraic equivalence, zoom-fuzz worst cases, and localize step divergences.",
+            "summary": "Validate plans, prove numerical and exact algebraic equivalence, zoom-fuzz worst cases, localize step divergences, and verify portable program bundles.",
             "tools": [
                 { "cmd": "math-draw validate --explain", "role": "95-constructor static validation, 4D shape inference, and dtype dataflow trace" },
                 { "cmd": "math-draw verify [--fuzz] [--zoom]", "role": "Equivalence checker with domain-aware fuzzing and recursive adversarial interval narrowing (--zoom)" },
                 { "cmd": "math-draw linear-equiv", "role": "Exact symbolic affine equivalence prover over linear, add, sub, and concat(dim=1) graphs" },
                 { "cmd": "math-draw trace-hash [--isolate]", "role": "Per-step SHA-256 tensor fingerprinting, divergence step localization, and prefix subspec isolation" },
+                { "cmd": "math-draw bundle <binding|export|verify>", "role": "Canonical unique-first-use parameter binding, self-contained program bundle export, cryptographic tamper detection, and live replay verification" },
                 { "cmd": "math-draw smoke", "role": "End-to-end deterministic smoke test suite" }
             ]
         },
@@ -293,7 +293,7 @@ pub fn get_capability_catalog(domain: Option<&str>) -> Value {
                 { "cmd": "math-draw mutate", "role": "Transactional & multi-branch equivalence-gated graph mutations" },
                 { "cmd": "math-draw quant <verify|budget>", "role": "int8/q8-per-block/fp16 weight quantization verifier and analytical Lipschitz/measured budget planner" },
                 { "cmd": "math-draw recurse solve-gd [--precondition]", "role": "Burn autodiff gradient descent with backtracking and diagonal Hessian preconditioning" },
-                { "cmd": "math-draw recurse fit [--sensitivity-guided]", "role": "Evolutionary Strategy parameter optimizer with sensitivity-guided layer freezing" },
+                { "cmd": "math-draw recurse fit [--strategy openes|mu-lambda] [--rng xorshift64|mulberry32|pcg32|philox4x32] [--sensitivity-guided]", "role": "Evolutionary Strategy optimizer supporting OpenES & (mu, lambda), 4 deterministic PRNGs, population diagnostics, and sensitivity-guided freezing" },
                 { "cmd": "math-draw profile / compare / cost-model", "role": "Whole-graph latency benchmarking and isolated per-op microbenchmark cost modeling" }
             ]
         },
@@ -305,9 +305,10 @@ pub fn get_capability_catalog(domain: Option<&str>) -> Value {
             ]
         },
         "state": {
-            "summary": "Manage persistent .burn-harness workspaces, content-addressed tensor artifacts, multi-stage workflows, and subagent branch coordination.",
+            "summary": "Manage persistent .burn-harness workspaces, content-addressed tensor artifacts, portable program bundles, multi-stage workflows, and subagent branch coordination.",
             "tools": [
                 { "cmd": "math-draw harness <capabilities|digest|resolve-artifact|run-workflow|branch-export|branch-merge|workspace-status>", "role": "Unified agent-harness co-processor interface and pipeline runner" },
+                { "cmd": "math-draw bundle <binding|export|verify>", "role": "Self-contained portable program bundle export and provenance verification" },
                 { "cmd": "math-draw find-op", "role": "Query the 95-constructor catalog and parameter schemas" }
             ]
         }

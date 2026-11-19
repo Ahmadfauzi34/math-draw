@@ -25,19 +25,19 @@ This repository follows the graph (Documentation-as-Contract) hierarchical syste
 - **Deterministic Backend**: All tensor execution runs deterministically on `Device::flex()`. Runtime autodiff uses Burn's `AutodiffBackend` on `flex` without requiring CUDA/GPU toolchains.
 - **Zero-Warning & Locked Dependency Gate**: Every build and test gate MUST pass with `--locked` and zero compiler warnings in `cargo test --locked` and `cargo build --release --locked`.
 - **Fail-Closed Validation**: Untrusted or malformed graph specs must fail closed before execution (unknown constructors, arity/arg mismatches, shape/dtype errors, canonical registry ID uniqueness, division-by-zero, integer overflow, NaN/Inf inputs).
-- **Backward-Compatible Crate Facade**: [`src/lib.rs`](src/lib.rs) must preserve root facade module paths (`engine`, `trace`, `rollout`, `profile`, `cost_model`, `validate`, `composer`, `rewrite`, `mutate`, `shard`, `recurse`, `verify`, `linear_equiv`, `gradcheck`, `quant`, `weight_lab`) so integration tests and external library callers never break.
+- **Backward-Compatible Crate Facade**: [`src/lib.rs`](src/lib.rs) must preserve root facade module paths (`engine`, `error`, `trace`, `rollout`, `profile`, `cost_model`, `validate`, `composer`, `rewrite`, `mutate`, `shard`, `recurse`, `verify`, `linear_equiv`, `gradcheck`, `quant`, `weight_lab`, `bundle`) so integration tests and external library callers never break.
 - **95-Constructor Alignment**: Constructor inventory in [`src/catalog.rs`](src/catalog.rs), shape inference in [`src/graph/validate.rs`](src/graph/validate.rs), and Burn execution kernels in [`src/layers/`](src/layers/AGENTS.md) must always stay in strict 1-to-1 parity across all 95 constructors (covering `unary`, `binary`, and `ternary` step arities).
 
 ## Work Guidance
 
 - Trace `AGENTS.md` from repo root down to your target directory before editing any code.
 - Keep domain modules focused (~100–600 lines where practical) and avoid re-introducing monolithic multi-thousand-line files.
-- Keep JSON CLI output schemas stable and machine-parseable (`ok` boolean, structured diagnostics, exit code `0` on success / `2` on failure).
+- Keep JSON CLI output schemas stable and machine-parseable (`ok` boolean, structured `code`/`error`/`stage`/`hint` diagnostics, exit code `0` on success / `2` on failure).
 - Whenever adding a new subcommand, constructor, or workflow stage, update both the nearest `AGENTS.md` and [`smoke/`](src/smoke/AGENTS.md) / [`tests/`](tests/AGENTS.md).
 
 ## Verification
 
-- `cargo test --locked` (runs all 10 integration suites in [`tests/integration.rs`](tests/integration.rs), including the 25-check smoke suite)
+- `cargo test --locked` (runs all 15 integration suites in [`tests/integration.rs`](tests/integration.rs), including the 27-check smoke suite)
 - `cargo clippy --all-targets --locked`
 - `cargo build --release --locked`
 - `./target/release/math-draw smoke`

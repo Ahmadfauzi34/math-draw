@@ -209,6 +209,16 @@ pub fn quant_verify(
     abs_tol: f64,
     rel_tol: f64,
 ) -> Result<QuantVerifyReport, String> {
+    if !(abs_tol.is_finite() && abs_tol >= 0.0) {
+        return Err(format!(
+            "quant verify: abs_tol must be finite and >= 0, got {abs_tol}"
+        ));
+    }
+    if !(rel_tol.is_finite() && rel_tol >= 0.0) {
+        return Err(format!(
+            "quant verify: rel_tol must be finite and >= 0, got {rel_tol}"
+        ));
+    }
     let val = validate_spec(spec, false);
     if !val.valid {
         return Err(

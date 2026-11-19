@@ -6,22 +6,23 @@ Implements the single-binary command-line interface for `math-draw`, parsing CLI
 
 ## Ownership
 
-- Top-level dispatcher (`run_cli`), usage text (`print_usage`), argument helpers (`flag_val`, `has_flag`, `positional_args`), JSON & file I/O helpers: [`mod.rs`](mod.rs)
+- Top-level dispatcher (`run_cli`), usage text (`print_usage`), strict fail-closed argument parser (`ParsedArgs`), JSON & file I/O helpers: [`mod.rs`](mod.rs)
 - Core execution & inspection (`run`, `validate`, `verify`, `linear-equiv`, `find-op`, `smoke`): [`core_cmds.rs`](core_cmds.rs)
 - Runtime telemetry & temporal ops (`trace-hash`, `rollout`, `profile`, `compare`, `cost-model`): [`runtime_cmds.rs`](runtime_cmds.rs)
 - Structural graph transformations (`rewrite`, `recurse`, `mutate`, `shard`): [`graph_cmds.rs`](graph_cmds.rs)
-- Differential & numerical verification (`gradcheck`, `quant`, `weight-lab`): [`evidence_cmds.rs`](evidence_cmds.rs)
+- Differential, numerical & bundle verification (`gradcheck`, `quant`, `weight-lab`, `bundle`): [`evidence_cmds.rs`](evidence_cmds.rs)
 - Layer-4 agent-harness coordination (`harness`): [`harness_cmds.rs`](harness_cmds.rs)
 
 ## Local Contracts
 
-- **JSON-Only Stdout**: Every executed subcommand (success or error) prints valid pretty-printed JSON to stdout (`{"ok": false, "error": ...}` on errors). Human usage help (`--help` / `-h`) prints to stderr via `print_usage`.
+- **JSON-Only Stdout & Structured Error Envelope**: Every executed subcommand (success or error) prints valid pretty-printed JSON to stdout via panic-free `print_json_exit`, `err_exit_typed`, `err_exit_stage`, `err_exit_usage`, or `err_exit_code`. Error responses emit [`ErrorEnvelope`](../error.rs) (`{"ok": false, "code": "<snake_case>", "error": "...", "stage": "...", "hint": "..."}`), preserving backward-compatible `ok` and `error` keys (while `validate` / `run` static-validation failures preserve `ValidateReport` JSON directly). Human usage help (`--help` / `-h`) prints to stderr via `print_usage`.
+- **Fail-Closed Flag & Numeric Parsing**: All subcommand handlers MUST parse arguments through [`ParsedArgs`](mod.rs) (returning `Result<_, MathDrawError>` with exact `ErrorCode` and `"cli_parse"` stage) — rejecting unknown `--...`/`-<alpha>` flags, missing values on valued flags, duplicate single-valued flags, unexpected extra positionals, and malformed/non-finite/out-of-domain numeric flag values (`NaN`, `Inf`, negative tolerances, non-positive `--eps`/`--lr`/`--sigma`) without silent fallback defaults.
 - **Exit Code Contract**: Exit `0` (`ExitCode::SUCCESS`) exclusively when the primary result is `ok` / `valid` / `equivalent` / `converged`; exit `2` (`ExitCode::from(2)`) on CLI usage errors, parse failures, or verification rejections.
 - **No Business Logic in CLI Handlers**: Handlers parse flags/files, invoke library APIs in [`crate`](../AGENTS.md), optionally serialize `--out`, and format JSON. Graph algorithms belong in domain modules, never in `src/cli/`.
 
 ## Work Guidance
 
-- Keep `positional_args(rest, &valued_flags)` accurate by listing every flag taking a value in `valued_flags` so flag values are never mistaken for positional file paths.
+- Register every new subcommand flag in its handler's `ParsedArgs::parse` / `ParsedArgs::parse_full` allowlist (valued, optional-valued, multi-valued, or boolean) and check `ensure_max_positionals`.
 - Update `print_usage()` in [`mod.rs`](mod.rs) and [`README.md`](../../README.md) whenever adding or modifying subcommand flags.
 
 ## Verification

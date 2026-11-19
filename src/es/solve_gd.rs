@@ -160,7 +160,10 @@ pub(super) fn eval_loss_only(
     let mut total_loss = 0.0f64;
     for case in cases {
         let out = eval_spec_with_inputs(spec, Some(&case.inputs))?;
-        let exp = case.expected.as_ref().unwrap();
+        let exp = case
+            .expected
+            .as_ref()
+            .ok_or_else(|| "target case is missing 'expected' vector".to_string())?;
         if out.values.len() != exp.len() {
             return Err(format!(
                 "target length mismatch: output has {}, expected {}",
@@ -205,7 +208,10 @@ pub(super) fn eval_loss_and_grad_autodiff(
             SlotValue::F32(t) => t,
             SlotValue::I64(..) => return Err("solve-gd requires f32 differentiable output".into()),
         };
-        let exp = case.expected.as_ref().unwrap();
+        let exp = case
+            .expected
+            .as_ref()
+            .ok_or_else(|| "target case is missing 'expected' vector".to_string())?;
         let y_dims = y.dims();
         let y_len: usize = y_dims.iter().product();
         if y_len != exp.len() {
@@ -264,6 +270,14 @@ pub fn solve_gd_autodiff(
     lr: f64,
     precondition: bool,
 ) -> Result<SolveGdResult, String> {
+    if steps == 0 {
+        return Err("solve-gd: steps must be >= 1".into());
+    }
+    if !(lr.is_finite() && lr > 0.0) {
+        return Err(format!(
+            "solve-gd: lr must be finite and > 0, got {lr}"
+        ));
+    }
     let v = validate_spec(spec, false);
     if !v.valid {
         return Err(format!("invalid spec: {:?}", v.code));

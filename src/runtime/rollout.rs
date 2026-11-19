@@ -199,7 +199,10 @@ pub fn rollout_scan(
         return Err("rollout scan requires steps >= 1".into());
     }
     let state_port = resolve_state_port_slot(spec, expansion, state_port_req)?;
-    let state_shape = spec.port_by_slot(state_port).unwrap().shape;
+    let state_shape = spec
+        .port_by_slot(state_port)
+        .ok_or_else(|| format!("state port slot {state_port} not found in spec.ports"))?
+        .shape;
     let graph = PreparedGraph::compile(spec)?;
 
     let state_key = state_port.to_string();
@@ -276,7 +279,10 @@ pub fn rollout_fixpoint(
         return Err(format!("invalid fixpoint tol: {tol}"));
     }
     let state_port = resolve_state_port_slot(spec, expansion, state_port_req)?;
-    let state_shape = spec.port_by_slot(state_port).unwrap().shape;
+    let state_shape = spec
+        .port_by_slot(state_port)
+        .ok_or_else(|| format!("state port slot {state_port} not found in spec.ports"))?
+        .shape;
     let graph = PreparedGraph::compile(spec)?;
 
     let state_key = state_port.to_string();
@@ -440,6 +446,11 @@ pub fn rollout_bisect(
 ) -> Result<RolloutBisectReport, String> {
     if steps == 0 {
         return Err("rollout bisect requires steps >= 1".into());
+    }
+    if !(abs_tol.is_finite() && abs_tol >= 0.0) {
+        return Err(format!(
+            "rollout bisect: abs_tol must be finite and >= 0, got {abs_tol}"
+        ));
     }
     let state_port = resolve_state_port_slot(base, base_expansion, state_port_req)?;
     let cand_port = resolve_state_port_slot(cand, None, Some(&state_port.to_string()))?;

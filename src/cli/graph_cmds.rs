@@ -3,11 +3,14 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use super::{
-    err_exit, flag_val, has_flag, positional_args, print_json_exit, read_cases_file,
-    read_targets_file, write_pretty_json,
+    ParsedArgs, err_exit_code, err_exit_stage, err_exit_typed, err_exit_usage, print_json_exit,
+    read_cases_file, read_targets_file, write_pretty_json,
 };
+use crate::error::ErrorCode;
 use crate::mutate::{MutationRequest, mutate_spec};
-use crate::recurse::{fit_es, search_graph_tree, solve_gd_autodiff};
+use crate::recurse::{
+    EsStrategyKind, FitEsConfig, RngKind, fit_es_with_config, search_graph_tree, solve_gd_autodiff,
+};
 use crate::rewrite::{REWRITE_RULES, apply_rewrite, apply_rewrites_recursive};
 use crate::shard::shard_spec;
 use crate::spec::{load_spec_file, sha256_json};
@@ -15,37 +18,57 @@ use crate::validate::validate_spec;
 
 pub(super) fn handle_rewrite(rest: &[String]) -> ExitCode {
     let Some(sub) = rest.first().map(|s| s.as_str()) else {
-        return err_exit("usage: math-draw rewrite <list|apply> ...");
+        return err_exit_usage("rewrite", "usage: math-draw rewrite <list|apply> ...");
     };
     let sub_rest = &rest[1..];
     match sub {
-        "list" => print_json_exit(&json!({ "ok": true, "rules": REWRITE_RULES }), true),
-        "apply" => {
-            let pos = positional_args(sub_rest, &["--out"]);
-            if pos.len() < 2 {
-                return err_exit("usage: math-draw rewrite apply <rule|all> <spec.json> [--out <out.json>]");
+        "list" => {
+            let parsed = match ParsedArgs::parse(sub_rest, &[], &[]) {
+                Ok(p) => p,
+                Err(e) => return err_exit_typed(&e),
+            };
+            if let Err(e) = parsed.ensure_max_positionals(0, "usage: math-draw rewrite list") {
+                return err_exit_typed(&e);
             }
-            let rule = &pos[0];
-            let loaded = match load_spec_file(Path::new(&pos[1])) {
+            print_json_exit(&json!({ "ok": true, "rules": REWRITE_RULES }), true)
+        }
+        "apply" => {
+            let usage = "usage: math-draw rewrite apply <rule|all> <spec.json> [--out <out.json>]";
+            let parsed = match ParsedArgs::parse(sub_rest, &["--out"], &[]) {
+                Ok(p) => p,
+                Err(e) => return err_exit_typed(&e),
+            };
+            if let Err(e) = parsed.ensure_max_positionals(2, usage) {
+                return err_exit_typed(&e);
+            }
+            if parsed.positionals.len() < 2 {
+                return err_exit_usage("rewrite.apply", usage);
+            }
+            let rule = &parsed.positionals[0];
+            let loaded = match load_spec_file(Path::new(&parsed.positionals[1])) {
                 Ok(l) => l,
-                Err(e) => return err_exit(&e),
+                Err(e) => return err_exit_stage("load_spec", &e),
             };
             let (rewritten, applied) = if rule == "all" || rule == "fixpoint" {
                 let (s, app) = apply_rewrites_recursive(&loaded.spec, 32);
                 if app.is_empty() {
-                    return err_exit("fixpoint: no rewrite patterns matched");
+                    return err_exit_code(
+                        ErrorCode::RewriteFailed,
+                        "rewrite.apply",
+                        "fixpoint: no rewrite patterns matched",
+                    );
                 }
                 (s, app)
             } else {
                 match apply_rewrite(rule, &loaded.spec) {
                     Ok(s) => (s, vec![rule.clone()]),
-                    Err(e) => return err_exit(&e),
+                    Err(e) => return err_exit_stage("rewrite.apply", &e),
                 }
             };
-            if let Some(out_path) = flag_val(sub_rest, "--out")
+            if let Some(out_path) = parsed.str_opt("--out")
                 && let Err(e) = write_pretty_json(out_path, &rewritten)
             {
-                return err_exit(&e);
+                return err_exit_typed(&e);
             }
             print_json_exit(
                 &json!({
@@ -59,30 +82,44 @@ pub(super) fn handle_rewrite(rest: &[String]) -> ExitCode {
                 true,
             )
         }
-        _ => err_exit(&format!("unknown rewrite subcommand '{sub}'")),
+        _ => err_exit_code(
+            ErrorCode::CliUnknownCommand,
+            "rewrite",
+            &format!("unknown rewrite subcommand '{sub}'"),
+        ),
     }
 }
 
 pub(super) fn handle_recurse(rest: &[String]) -> ExitCode {
     let Some(sub) = rest.first().map(|s| s.as_str()) else {
-        return err_exit("usage: math-draw recurse <expand|search|solve-gd|fit> ...");
+        return err_exit_usage(
+            "recurse",
+            "usage: math-draw recurse <expand|search|solve-gd|fit> ...",
+        );
     };
     let sub_rest = &rest[1..];
     match sub {
         "expand" => {
-            let pos = positional_args(sub_rest, &["--out"]);
-            let Some(file) = pos.first() else {
-                return err_exit("usage: math-draw recurse expand <spec.v2.json> [--out <out.v1.json>]");
+            let usage = "usage: math-draw recurse expand <spec.v2.json> [--out <out.v1.json>]";
+            let parsed = match ParsedArgs::parse(sub_rest, &["--out"], &[]) {
+                Ok(p) => p,
+                Err(e) => return err_exit_typed(&e),
+            };
+            if let Err(e) = parsed.ensure_max_positionals(1, usage) {
+                return err_exit_typed(&e);
+            }
+            let Some(file) = parsed.positionals.first() else {
+                return err_exit_usage("recurse.expand", usage);
             };
             let loaded = match load_spec_file(Path::new(file)) {
                 Ok(l) => l,
-                Err(e) => return err_exit(&e),
+                Err(e) => return err_exit_stage("load_spec", &e),
             };
             let val_rep = validate_spec(&loaded.spec, false);
-            if let Some(out_path) = flag_val(sub_rest, "--out")
+            if let Some(out_path) = parsed.str_opt("--out")
                 && let Err(e) = write_pretty_json(out_path, &loaded.spec)
             {
-                return err_exit(&e);
+                return err_exit_typed(&e);
             }
             print_json_exit(
                 &json!({
@@ -96,237 +133,365 @@ pub(super) fn handle_recurse(rest: &[String]) -> ExitCode {
             )
         }
         "search" => {
-            let valued = ["--out", "--max-depth", "--cases", "--abs-tol", "--rel-tol"];
-            let pos = positional_args(sub_rest, &valued);
-            let Some(file) = pos.first() else {
-                return err_exit("usage: math-draw recurse search <spec.json> [--out <best.json>] [--max-depth 3]");
+            let usage = "usage: math-draw recurse search <spec.json> [--out <best.json>] [--max-depth 3] [--cases <cases.json>] [--abs-tol 1e-5] [--rel-tol 1e-5]";
+            let parsed = match ParsedArgs::parse(
+                sub_rest,
+                &["--out", "--max-depth", "--cases", "--abs-tol", "--rel-tol"],
+                &[],
+            ) {
+                Ok(p) => p,
+                Err(e) => return err_exit_typed(&e),
+            };
+            if let Err(e) = parsed.ensure_max_positionals(2, usage) {
+                return err_exit_typed(&e);
+            }
+            let Some(file) = parsed.positionals.first() else {
+                return err_exit_usage("recurse.search", usage);
             };
             let loaded = match load_spec_file(Path::new(file)) {
                 Ok(l) => l,
-                Err(e) => return err_exit(&e),
+                Err(e) => return err_exit_stage("load_spec", &e),
             };
-            let max_depth = flag_val(sub_rest, "--max-depth")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(3usize);
-            let abs_tol = flag_val(sub_rest, "--abs-tol")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1e-5f64);
-            let rel_tol = flag_val(sub_rest, "--rel-tol")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1e-5f64);
-            let cases = if let Some(cf) = flag_val(sub_rest, "--cases") {
+            let max_depth = match parsed.parse_usize("--max-depth", 3) {
+                Ok(v) => v,
+                Err(e) => return err_exit_typed(&e),
+            };
+            let abs_tol = match parsed.parse_f64_non_neg("--abs-tol", 1e-5) {
+                Ok(v) => v,
+                Err(e) => return err_exit_typed(&e),
+            };
+            let rel_tol = match parsed.parse_f64_non_neg("--rel-tol", 1e-5) {
+                Ok(v) => v,
+                Err(e) => return err_exit_typed(&e),
+            };
+            let cases = if let Some(cf) = parsed.str_opt("--cases") {
                 match read_cases_file(cf) {
                     Ok(c) => Some(c),
-                    Err(e) => return err_exit(&e),
+                    Err(e) => return err_exit_typed(&e),
                 }
             } else {
                 None
+            };
+            let out_file = match (parsed.str_opt("--out"), parsed.positionals.get(1)) {
+                (Some(_), Some(_)) => {
+                    return err_exit_code(
+                        ErrorCode::CliUsage,
+                        "cli_parse",
+                        "specify output path either via --out or positional [out.json], not both",
+                    );
+                }
+                (Some(op), None) => Some(op.to_string()),
+                (None, Some(op)) => Some(op.clone()),
+                (None, None) => None,
             };
             match search_graph_tree(&loaded.spec, max_depth, cases.as_deref(), abs_tol, rel_tol) {
                 Ok(res) => {
-                    let out_file = flag_val(sub_rest, "--out")
-                        .map(String::from)
-                        .or_else(|| pos.get(1).cloned());
                     if let Some(op) = out_file
                         && let Err(e) = write_pretty_json(&op, &res.best_spec)
                     {
-                        return err_exit(&e);
+                        return err_exit_typed(&e);
                     }
                     print_json_exit(&res, res.ok)
                 }
-                Err(e) => err_exit(&e),
+                Err(e) => err_exit_stage("recurse.search", &e),
             }
         }
         "solve-gd" => {
-            let valued = ["--targets", "--steps", "--lr", "--layer", "--out"];
-            let pos = positional_args(sub_rest, &valued);
-            let Some(file) = pos.first() else {
-                return err_exit("usage: math-draw recurse solve-gd <spec.json> [--targets <targets.json>] [--steps 20] [--lr 0.1] [--layer <idx|all>] [--precondition] [--out <out.json>]");
+            let usage = "usage: math-draw recurse solve-gd <spec.json> [--targets <targets.json>] [--steps 20] [--lr 0.1] [--layer <idx|all>] [--precondition] [--out <out.json>]";
+            let parsed = match ParsedArgs::parse(
+                sub_rest,
+                &["--targets", "--steps", "--lr", "--layer", "--out"],
+                &["--precondition"],
+            ) {
+                Ok(p) => p,
+                Err(e) => return err_exit_typed(&e),
+            };
+            if let Err(e) = parsed.ensure_max_positionals(2, usage) {
+                return err_exit_typed(&e);
+            }
+            let Some(file) = parsed.positionals.first() else {
+                return err_exit_usage("recurse.solve_gd", usage);
             };
             let loaded = match load_spec_file(Path::new(file)) {
                 Ok(l) => l,
-                Err(e) => return err_exit(&e),
+                Err(e) => return err_exit_stage("load_spec", &e),
             };
-            let targets = if let Some(tf) = flag_val(sub_rest, "--targets")
-                .or_else(|| pos.get(1).map(|s| s.as_str()))
-            {
+            let target_path = match (parsed.str_opt("--targets"), parsed.positionals.get(1)) {
+                (Some(_), Some(_)) => {
+                    return err_exit_code(
+                        ErrorCode::CliUsage,
+                        "cli_parse",
+                        "specify targets either via --targets or positional [targets.json], not both",
+                    );
+                }
+                (Some(tf), None) => Some(tf),
+                (None, Some(tf)) => Some(tf.as_str()),
+                (None, None) => None,
+            };
+            let targets = if let Some(tf) = target_path {
                 match read_targets_file(tf) {
                     Ok(t) => Some(t),
-                    Err(e) => return err_exit(&e),
+                    Err(e) => return err_exit_typed(&e),
                 }
             } else {
                 None
             };
-            let steps = flag_val(sub_rest, "--steps")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(20usize);
-            let lr = flag_val(sub_rest, "--lr")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.1f64);
-            let layer_filter = match flag_val(sub_rest, "--layer") {
+            let steps = match parsed.parse_usize("--steps", 20) {
+                Ok(v) => v,
+                Err(e) => return err_exit_typed(&e),
+            };
+            let lr = match parsed.parse_f64_pos("--lr", 0.1) {
+                Ok(v) => v,
+                Err(e) => return err_exit_typed(&e),
+            };
+            let layer_filter = match parsed.str_opt("--layer") {
                 None | Some("all") => None,
                 Some(s) => match s.parse::<usize>() {
                     Ok(idx) => Some(idx),
-                    Err(_) => return err_exit(&format!("invalid --layer value '{s}'")),
+                    Err(_) => {
+                        return err_exit_code(
+                            ErrorCode::CliInvalidNumber,
+                            "cli_parse",
+                            &format!("invalid --layer value '{s}'"),
+                        );
+                    }
                 },
             };
-            let precondition = has_flag(sub_rest, "--precondition");
+            let precondition = parsed.has("--precondition");
             match solve_gd_autodiff(&loaded.spec, targets.as_ref(), layer_filter, steps, lr, precondition) {
                 Ok(res) => {
-                    if let Some(op) = flag_val(sub_rest, "--out")
+                    if let Some(op) = parsed.str_opt("--out")
                         && let Err(e) = write_pretty_json(op, &res.optimized_spec)
                     {
-                        return err_exit(&e);
+                        return err_exit_typed(&e);
                     }
                     print_json_exit(&res, res.ok)
                 }
-                Err(e) => err_exit(&e),
+                Err(e) => err_exit_stage("recurse.solve_gd", &e),
             }
         }
         "fit" => {
+            let usage = "usage: math-draw recurse fit <spec.json> --targets <targets.json> [--strategy openes|mu-lambda] [--rng xorshift64|mulberry32|pcg32|philox4x32] [--gens 40] [--pop 16] [--mu N] [--sigma 0.2] [--lr 0.2] [--seed 42] [--sensitivity-guided] [--freeze-threshold 1e-6] [--out <out.json>]";
             let valued = [
                 "--targets",
                 "--gens",
                 "--pop",
+                "--mu",
                 "--sigma",
                 "--lr",
                 "--seed",
+                "--strategy",
+                "--rng",
                 "--freeze-threshold",
                 "--out",
             ];
-            let pos = positional_args(sub_rest, &valued);
-            let Some(file) = pos.first() else {
-                return err_exit("usage: math-draw recurse fit <spec.json> --targets <targets.json> [--gens 40] [--pop 16] [--sigma 0.2] [--lr 0.2] [--seed 42] [--sensitivity-guided] [--freeze-threshold 1e-6] [--out <out.json>]");
+            let parsed = match ParsedArgs::parse(sub_rest, &valued, &["--sensitivity-guided"]) {
+                Ok(p) => p,
+                Err(e) => return err_exit_typed(&e),
             };
-            let Some(tf_path) = flag_val(sub_rest, "--targets")
-                .or_else(|| pos.get(1).map(|s| s.as_str()))
-            else {
-                return err_exit("fit requires --targets <targets.json>");
+            if let Err(e) = parsed.ensure_max_positionals(2, usage) {
+                return err_exit_typed(&e);
+            }
+            let Some(file) = parsed.positionals.first() else {
+                return err_exit_usage("recurse.fit", usage);
+            };
+            let tf_path = match (parsed.str_opt("--targets"), parsed.positionals.get(1)) {
+                (Some(_), Some(_)) => {
+                    return err_exit_code(
+                        ErrorCode::CliUsage,
+                        "cli_parse",
+                        "specify targets either via --targets or positional [targets.json], not both",
+                    );
+                }
+                (Some(tf), None) => tf,
+                (None, Some(tf)) => tf.as_str(),
+                (None, None) => {
+                    return err_exit_usage("recurse.fit", "fit requires --targets <targets.json>");
+                }
             };
             let loaded = match load_spec_file(Path::new(file)) {
                 Ok(l) => l,
-                Err(e) => return err_exit(&e),
+                Err(e) => return err_exit_stage("load_spec", &e),
             };
             let targets = match read_targets_file(tf_path) {
                 Ok(t) => t,
-                Err(e) => return err_exit(&e),
+                Err(e) => return err_exit_typed(&e),
             };
-            let gens = flag_val(sub_rest, "--gens")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(40usize);
-            let pop = flag_val(sub_rest, "--pop")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(16usize);
-            let sigma = flag_val(sub_rest, "--sigma")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.2f64);
-            let lr = flag_val(sub_rest, "--lr")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.2f64);
-            let seed = flag_val(sub_rest, "--seed")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(42u64);
-            let sensitivity_guided = has_flag(sub_rest, "--sensitivity-guided");
-            let freeze_threshold = flag_val(sub_rest, "--freeze-threshold")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1e-6f64);
-            match fit_es(
-                &loaded.spec,
-                &targets,
-                gens,
+            let strategy = match parsed.str_opt("--strategy") {
+                Some(raw) => match EsStrategyKind::parse(raw) {
+                    Ok(s) => s,
+                    Err(e) => return err_exit_code(ErrorCode::EsConfigInvalid, "recurse.fit", &e),
+                },
+                None => EsStrategyKind::OpenEs,
+            };
+            let rng = match parsed.str_opt("--rng") {
+                Some(raw) => match RngKind::parse(raw) {
+                    Ok(r) => r,
+                    Err(e) => return err_exit_code(ErrorCode::EsConfigInvalid, "recurse.fit", &e),
+                },
+                None => RngKind::Xorshift64,
+            };
+            let gens = match parsed.parse_usize("--gens", 40) {
+                Ok(v) => v,
+                Err(e) => return err_exit_typed(&e),
+            };
+            let pop = match parsed.parse_usize("--pop", 16) {
+                Ok(v) => v,
+                Err(e) => return err_exit_typed(&e),
+            };
+            let mu = match parsed.parse_usize_opt("--mu") {
+                Ok(v) => v,
+                Err(e) => return err_exit_typed(&e),
+            };
+            let sigma = match parsed.parse_f64_pos("--sigma", 0.2) {
+                Ok(v) => v,
+                Err(e) => return err_exit_typed(&e),
+            };
+            let lr = match parsed.parse_f64_pos("--lr", 0.2) {
+                Ok(v) => v,
+                Err(e) => return err_exit_typed(&e),
+            };
+            let seed = match parsed.parse_u64("--seed", 42) {
+                Ok(v) => v,
+                Err(e) => return err_exit_typed(&e),
+            };
+            let sensitivity_guided = parsed.has("--sensitivity-guided");
+            let freeze_threshold = match parsed.parse_f64_non_neg("--freeze-threshold", 1e-6) {
+                Ok(v) => v,
+                Err(e) => return err_exit_typed(&e),
+            };
+            let cfg = FitEsConfig {
+                generations: gens,
                 pop,
+                mu,
                 sigma,
                 lr,
                 seed,
+                strategy,
+                rng,
                 sensitivity_guided,
                 freeze_threshold,
-            ) {
+            };
+            match fit_es_with_config(&loaded.spec, &targets, &cfg) {
                 Ok(res) => {
-                    if let Some(op) = flag_val(sub_rest, "--out")
+                    if let Some(op) = parsed.str_opt("--out")
                         && let Err(e) = write_pretty_json(op, &res.optimized_spec)
                     {
-                        return err_exit(&e);
+                        return err_exit_typed(&e);
                     }
                     print_json_exit(&res, res.ok)
                 }
-                Err(e) => err_exit(&e),
+                Err(e) => err_exit_stage("recurse.fit", &e),
             }
         }
-        _ => err_exit(&format!(
-            "unknown recurse command '{sub}' (use: expand | search | solve-gd | fit)"
-        )),
+        _ => err_exit_code(
+            ErrorCode::CliUnknownCommand,
+            "recurse",
+            &format!("unknown recurse command '{sub}' (use: expand | search | solve-gd | fit)"),
+        ),
     }
 }
 
 pub(super) fn handle_mutate(rest: &[String]) -> ExitCode {
-    let valued = ["--cases", "--abs-tol", "--rel-tol", "--out"];
-    let pos = positional_args(rest, &valued);
-    if pos.len() < 2 {
-        return err_exit("usage: math-draw mutate <spec.json> <mutation.json> [--cases <cases.json>] [--abs-tol 1e-6] [--rel-tol 1e-6] [--out <out.json>]");
-    }
-    let base = match load_spec_file(Path::new(&pos[0])) {
-        Ok(l) => l.spec,
-        Err(e) => return err_exit(&e),
+    let usage = "usage: math-draw mutate <spec.json> <mutation.json> [--cases <cases.json>] [--abs-tol 1e-6] [--rel-tol 1e-6] [--out <out.json>]";
+    let parsed = match ParsedArgs::parse(
+        rest,
+        &["--cases", "--abs-tol", "--rel-tol", "--out"],
+        &[],
+    ) {
+        Ok(p) => p,
+        Err(e) => return err_exit_typed(&e),
     };
-    let mut_raw = match std::fs::read_to_string(&pos[1]) {
+    if let Err(e) = parsed.ensure_max_positionals(2, usage) {
+        return err_exit_typed(&e);
+    }
+    if parsed.positionals.len() < 2 {
+        return err_exit_usage("mutate", usage);
+    }
+    let base = match load_spec_file(Path::new(&parsed.positionals[0])) {
+        Ok(l) => l.spec,
+        Err(e) => return err_exit_stage("load_spec", &e),
+    };
+    let mut_raw = match std::fs::read_to_string(&parsed.positionals[1]) {
         Ok(r) => r,
-        Err(e) => return err_exit(&format!("cannot read mutation JSON '{}': {e}", pos[1])),
+        Err(e) => {
+            return err_exit_code(
+                ErrorCode::IoReadFailed,
+                "mutate",
+                &format!("cannot read mutation JSON '{}': {e}", parsed.positionals[1]),
+            );
+        }
     };
     let req: MutationRequest = match serde_json::from_str(&mut_raw) {
         Ok(r) => r,
-        Err(e) => return err_exit(&format!("invalid mutation JSON '{}': {e}", pos[1])),
+        Err(e) => {
+            return err_exit_code(
+                ErrorCode::JsonParseFailed,
+                "mutate",
+                &format!("invalid mutation JSON '{}': {e}", parsed.positionals[1]),
+            );
+        }
     };
-    let abs_tol = flag_val(rest, "--abs-tol")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1e-6f64);
-    let rel_tol = flag_val(rest, "--rel-tol")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1e-6f64);
-    let cases = if let Some(cf) = flag_val(rest, "--cases") {
+    let abs_tol = match parsed.parse_f64_non_neg("--abs-tol", 1e-6) {
+        Ok(v) => v,
+        Err(e) => return err_exit_typed(&e),
+    };
+    let rel_tol = match parsed.parse_f64_non_neg("--rel-tol", 1e-6) {
+        Ok(v) => v,
+        Err(e) => return err_exit_typed(&e),
+    };
+    let cases = if let Some(cf) = parsed.str_opt("--cases") {
         match read_cases_file(cf) {
             Ok(c) => Some(c),
-            Err(e) => return err_exit(&e),
+            Err(e) => return err_exit_typed(&e),
         }
     } else {
         None
     };
     match mutate_spec(&base, &req, cases.as_deref(), abs_tol, rel_tol) {
         Ok(rep) => {
-            if let Some(op) = flag_val(rest, "--out")
+            if let Some(op) = parsed.str_opt("--out")
                 && let Some(ref sp) = rep.resulting_spec
                 && rep.ok
                 && let Err(e) = write_pretty_json(op, sp)
             {
-                return err_exit(&e);
+                return err_exit_typed(&e);
             }
             print_json_exit(&rep, rep.ok)
         }
-        Err(e) => err_exit(&e),
+        Err(e) => err_exit_stage("mutate", &e),
     }
 }
 
 pub(super) fn handle_shard(rest: &[String]) -> ExitCode {
-    let valued = ["--max-weights", "--out"];
-    let pos = positional_args(rest, &valued);
-    let Some(file) = pos.first() else {
-        return err_exit("usage: math-draw shard <spec.json> [--max-weights 65535] [--out <out.json>]");
+    let usage = "usage: math-draw shard <spec.json> [--max-weights 65535] [--out <out.json>]";
+    let parsed = match ParsedArgs::parse(rest, &["--max-weights", "--out"], &[]) {
+        Ok(p) => p,
+        Err(e) => return err_exit_typed(&e),
+    };
+    if let Err(e) = parsed.ensure_max_positionals(1, usage) {
+        return err_exit_typed(&e);
+    }
+    let Some(file) = parsed.positionals.first() else {
+        return err_exit_usage("shard", usage);
     };
     let loaded = match load_spec_file(Path::new(file)) {
         Ok(l) => l,
-        Err(e) => return err_exit(&e),
+        Err(e) => return err_exit_stage("load_spec", &e),
     };
-    let max_weights = flag_val(rest, "--max-weights")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(65535usize);
+    let max_weights = match parsed.parse_usize("--max-weights", 65535) {
+        Ok(v) => v,
+        Err(e) => return err_exit_typed(&e),
+    };
     match shard_spec(&loaded.spec, max_weights) {
         Ok(rep) => {
-            if let Some(op) = flag_val(rest, "--out")
+            if let Some(op) = parsed.str_opt("--out")
                 && let Err(e) = write_pretty_json(op, &rep.spec)
             {
-                return err_exit(&e);
+                return err_exit_typed(&e);
             }
             print_json_exit(&rep, rep.ok)
         }
-        Err(e) => err_exit(&e),
+        Err(e) => err_exit_stage("shard", &e),
     }
 }

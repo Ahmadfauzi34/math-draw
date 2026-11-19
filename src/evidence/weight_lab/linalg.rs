@@ -163,6 +163,9 @@ pub fn engine_probe(w: &[Vec<f64>], b: &[f64], inputs: &[Vec<f64>]) -> Result<Ve
 
 /// Dominant eigenvalue magnitude via power iteration + 2-step geometric norm sqrt(||W^2 v||_2).
 pub fn spectral_radius(w: &[Vec<f64>], iters: usize) -> Result<(f64, usize), String> {
+    if iters == 0 {
+        return Err("spectral_radius: iters must be >= 1".into());
+    }
     let n = w.len();
     if n == 0 || !w.iter().all(|r| r.len() == n) {
         return Err("spectral_radius: W must be a non-empty square matrix".into());

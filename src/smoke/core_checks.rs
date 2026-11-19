@@ -112,13 +112,16 @@ pub(crate) fn collect_core_checks() -> Vec<SmokeCheck> {
         let good = r#"{"inputs":{"0":[1,-2]},"layers":[{"args":[0,2,2,false],"constructor":"linear"}],"numSlots":2,"outputSlot":1,"ports":[{"shape":[1,2,1,1],"slot":0}],"steps":[{"kind":"unary","layer":0,"slots":[0,1]}]}"#;
         let s_good = load_spec_str(good, Path::new("."))?.spec;
         let rep_good = validate_spec(&s_good, true);
-        if !rep_good.valid || rep_good.explain.is_none() {
+        if !rep_good.valid {
             return Err("expected valid + explain".into());
         }
+        let explain = rep_good
+            .explain
+            .ok_or_else(|| "expected explain report on valid spec".to_string())?;
         Ok(format!(
             "bad_code={} explain_params={}",
             rep_bad.code,
-            rep_good.explain.unwrap().total_params
+            explain.total_params
         ))
     }));
 
@@ -295,7 +298,10 @@ pub(crate) fn collect_core_checks() -> Vec<SmokeCheck> {
         if cmp.first_divergent_step != Some(2) || cmp.left_prefix_subspec.is_none() {
             return Err(format!("expected divergence at step 2 with isolate subspec, got {:?}", cmp.first_divergent_step));
         }
-        Ok(format!("first_divergent_step=2 reason={}", cmp.divergent_step_detail.unwrap().reason))
+        let detail = cmp
+            .divergent_step_detail
+            .ok_or_else(|| "missing divergent_step_detail on divergent trace comparison".to_string())?;
+        Ok(format!("first_divergent_step=2 reason={}", detail.reason))
     }));
 
     // 12. rollout fixpoint contraction + unroll parity

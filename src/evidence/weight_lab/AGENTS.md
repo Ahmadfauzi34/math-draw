@@ -15,7 +15,8 @@ Provides high-precision `f64` matrix/spectral verification, Burn engine numerica
 
 - **Fail-Closed Composition Bounds**: `norm_bound` composition must refuse sets when `||W_B||_F * ||W_A||_F >= rho_bound` (`refused: true`), never promoting unverified contractions.
 - **Orthonormal Invariants**: `orthonormal` composition must verify factor and product orthogonality (`||W W^T - I||_inf <= tol`) and determinant conservation (`det(W_B W_A) ≈ det(W_B) det(W_A)`).
-- **Dimension Integrity**: [`WeightSet::validate_dims`](mod.rs) must verify rectangular matrix row consistency and exact bias length matching before any algebra or Burn probe runs.
+- **Dimension & Parameter Domain Integrity**: [`WeightSet::validate_dims`](mod.rs) must verify rectangular matrix row consistency and exact bias length matching before any algebra or Burn probe runs; [`spectral_radius`](linalg.rs) requires `iters >= 1` and [`gate_sets`](certify.rs) requires finite `jump_tol >= 0`.
+- **Repertoire Persistence Integrity**: [`certify_weight_set`](certify.rs) must fail closed on unreadable/corrupted existing repertoire JSON, directory creation errors, or serialization errors rather than silently resetting or overwriting the repertoire file.
 
 ## Work Guidance
 
