@@ -15,8 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **3D Geometry Domain Pack (`src/evidence/geom3/`, `src/cli/geom_cmds.rs`, `math-draw geom`)**:
   - Added pure `f64` row-major 4×4 and 3×3 geometry math (`math.rs`): `rot_x4`/`rot_y4`/`rot_z4`, Rodrigues `rot_axis_angle4`, `euler4`, `quat_from_euler`, `quat_to_mat4`, `translate4`, `scale4`, recursive `repeat` (`depth <= 1024`), `normal_mat3` (inverse-transpose), `look_at4`, `perspective4`, and Sutherland–Hodgman near-plane triangle clipping (`clip_triangle_near`).
   - Added `math-draw geom build <chain.json> [--compose] [--out <spec.json>]`, `scene-tree <tree.json> [--out <spec.json>]` (with cycle/duplicate/unknown-parent rejection), `solve-ik <ik.json> [--out <spec.json>]` (Polyak-stepped backtracking GD with joint limits and Burn `Device::flex()` end-effector verification), `project <model.json>` (single-vertex `linear(4,4)`), `batch <model.json>` (block-diagonal `linear(4N,4N)` chunked at `BATCH_MAX = 63`), and `selftest` (17/17 checks).
-- **Expanded Smoke Suite (#32–#33) & Integration Tests (#20–#21)**:
-  - Expanded in-binary smoke suite from 31 to 33 checks (`33/33`) and crate integration tests from 19 to 21 suites (`21/21`, including differential verification across all 87 `f32` constructors and full `geom` CLI/workflow coverage).
+- **Expanded Smoke Suite (#32–#33) & Integration Tests (#20–#22)**:
+  - Expanded in-binary smoke suite from 31 to 33 checks (`33/33`) and crate integration tests from 19 to 22 suites (`22/22`, including differential verification across all 87 `f32` constructors, full `geom` CLI/workflow coverage, and `muse_audit_edge_case_regressions`).
+
+### Fixed
+- **Audit & Fail-Closed Hardening**:
+  - Replaced `div(gelu(x), x)` in symbolic `grad-spec` with a smooth Padé `[3/2]` `Φ(x)` approximation exact at `x = 0`, preserved compacted output/port metadata and SSA-final `--wrt` slots across `--order 2` HVP, and validated weight lengths / undefined `--wrt` slots before slicing.
+  - Hardened `geom3` (`check_mat4_finite`, `mat4_to_col_major_f32_checked`, `compose_chain_checked`, order-independent `MAX_SCENE_TREE_DEPTH = 512`, finite projection/dehomogenize/perspective/normal-matrix checks, strict explicit field parsing, and `engine_ok` gating in `solve_ik`).
+  - Hardened `diff-ref` (aligned `cosineSimilarity` default `eps = 1e-12`, pre-validated NN weight counts/finiteness, per-element pass rule consistent with `first_diff_index`), `direct-math` (strict per-op batch allowlists, 1D/2D `$prev` chaining, and `int --batch` flag guards), `liveness` (`auto_repair_spec` final re-validation), and `harness` workflow (`ok`-gated active spec promotion, non-empty `pipeline`, `null`/zero-bound rejection, and `CliUsage` error classification).
 
 ## [0.8.0] - 2026-11-25
 
