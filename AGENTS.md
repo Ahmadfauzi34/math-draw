@@ -23,6 +23,7 @@ This repository follows the graph (Documentation-as-Contract) hierarchical syste
 ## Local Contracts
 
 - **Deterministic Backend**: All tensor execution runs deterministically on `Device::flex()`. Runtime autodiff uses Burn's `AutodiffBackend` on `flex` without requiring CUDA/GPU toolchains.
+- **Portable Static Linux Release**: Official Linux `x86_64` CI and release binaries build as fully static `x86_64-unknown-linux-musl` executables (no `INTERP` / no `NEEDED` `glibc` shared libraries) so binaries run across all Linux distros and containers without `GLIBC_*` version mismatches.
 - **Zero-Warning & Locked Dependency Gate**: Every build and test gate MUST pass with `--locked` and zero compiler warnings in `cargo test --locked` and `cargo build --release --locked`.
 - **Fail-Closed Validation**: Untrusted or malformed graph specs must fail closed before execution (unknown constructors, arity/arg mismatches, shape/dtype errors, canonical registry ID uniqueness, division-by-zero, integer overflow, NaN/Inf inputs).
 - **Backward-Compatible Crate Facade**: [`src/lib.rs`](src/lib.rs) must preserve root facade module paths (`engine`, `direct_math`, `error`, `trace`, `rollout`, `profile`, `cost_model`, `validate`, `composer`, `liveness`, `grad_spec`, `rewrite`, `mutate`, `shard`, `recurse`, `verify`, `diff_ref`, `geom3`, `linear_equiv`, `gradcheck`, `quant`, `soak`, `weight_lab`, `bundle`) so integration tests and external library callers never break.
