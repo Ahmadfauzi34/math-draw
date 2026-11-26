@@ -5,6 +5,13 @@ All notable changes to `math-draw` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-11-26
+
+### Fixed
+- **Fully Static Linux x86_64 Release Binary (`x86_64-unknown-linux-musl`)**:
+  - Switched [`.github/workflows/release.yml`](.github/workflows/release.yml) and [`.github/workflows/ci.yml`](.github/workflows/ci.yml) from dynamically linked `x86_64-unknown-linux-gnu` (which required runner-specific `GLIBC_2.43` from `ubuntu-latest`) to a fully static-pie `x86_64-unknown-linux-musl` binary with zero `glibc`/shared-library runtime dependencies.
+  - Added fail-closed ELF static-linkage checks (`readelf -l`/`INTERP` and `readelf -d`/`NEEDED`) plus `weight-lab selftest` and `geom selftest` gates to CI and release builds so release binaries remain portable across Ubuntu, Debian, Alpine, RHEL, NixOS, and minimal containers.
+
 ## [0.9.0] - 2026-11-26
 
 ### Added

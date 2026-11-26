@@ -19,7 +19,7 @@ env:
 
 jobs:
   release-linux-x86_64:
-    name: Build & Release (x86_64-unknown-linux-gnu)
+    name: Build & Release (x86_64-unknown-linux-musl)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -28,19 +28,38 @@ jobs:
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: x86_64-unknown-linux-musl
 
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
 
-      - name: Run test suite
-        run: cargo test --locked
+      - name: Run test suite (musl target)
+        run: cargo test --locked --target x86_64-unknown-linux-musl
 
-      - name: Build release binary (Linux x86_64)
-        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+      - name: Build static release binary (Linux x86_64 musl)
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
 
-      - name: Smoke check release binary
-        run: ./target/x86_64-unknown-linux-gnu/release/math-draw smoke
+      - name: Verify static linkage (no glibc/shared deps)
+        shell: bash
+        run: |
+          BIN="target/x86_64-unknown-linux-musl/release/math-draw"
+          file "$BIN"
+          if readelf -l "$BIN" | grep -q 'INTERP'; then
+            echo "ERROR: release binary unexpectedly has a dynamic linker INTERP segment" >&2
+            exit 1
+          fi
+          if readelf -d "$BIN" 2>/dev/null | grep -q 'NEEDED'; then
+            echo "ERROR: release binary unexpectedly links against shared libraries" >&2
+            readelf -d "$BIN" | grep 'NEEDED' >&2
+            exit 1
+          fi
+
+      - name: Smoke & selftest static release binary
+        run: |
+          BIN="./target/x86_64-unknown-linux-musl/release/math-draw"
+          "$BIN" smoke
+          "$BIN" weight-lab selftest
+          "$BIN" geom selftest
 
       - name: Package release archive & checksum
         id: pkg
@@ -52,7 +71,7 @@ jobs:
           fi
           ASSET_BASE="math-draw-${TAG}-linux-x86_64"
           mkdir -p "dist/${ASSET_BASE}"
-          cp target/x86_64-unknown-linux-gnu/release/math-draw "dist/${ASSET_BASE}/math-draw"
+          cp target/x86_64-unknown-linux-musl/release/math-draw "dist/${ASSET_BASE}/math-draw"
           cp README.md CHANGELOG.md "dist/${ASSET_BASE}/"
           cp -r examples "dist/${ASSET_BASE}/examples"
           tar -C dist -czf "dist/${ASSET_BASE}.tar.gz" "${ASSET_BASE}"
@@ -75,6 +94,6 @@ jobs:
             gh release create "$TAG" \
               "${{ steps.pkg.outputs.archive }}" \
               "${{ steps.pkg.outputs.checksum }}" \
-              --title "math-draw ${TAG} (Linux x86_64)" \
+              --title "math-draw ${TAG} (Linux x86_64 static musl)" \
               --notes-file CHANGELOG.md
           fi

@@ -19,6 +19,8 @@ jobs:
 
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
@@ -26,14 +28,30 @@ jobs:
       - name: Run cargo test
         run: cargo test --locked
 
-      - name: Build release binary
-        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+      - name: Build static release binary (musl)
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Verify static linkage (no glibc/shared deps)
+        shell: bash
+        run: |
+          BIN="target/x86_64-unknown-linux-musl/release/math-draw"
+          file "$BIN"
+          if readelf -l "$BIN" | grep -q 'INTERP'; then
+            echo "ERROR: release binary unexpectedly has a dynamic linker INTERP segment" >&2
+            exit 1
+          fi
+          if readelf -d "$BIN" 2>/dev/null | grep -q 'NEEDED'; then
+            echo "ERROR: release binary unexpectedly links against shared libraries" >&2
+            readelf -d "$BIN" | grep 'NEEDED' >&2
+            exit 1
+          fi
 
       - name: Run release smoke suite
-        run: ./target/x86_64-unknown-linux-gnu/release/math-draw smoke
+        run: ./target/x86_64-unknown-linux-musl/release/math-draw smoke
 
       - name: Verify example specs
         run: |
-          ./target/x86_64-unknown-linux-gnu/release/math-draw validate examples/linear-relu.json --explain
-          ./target/x86_64-unknown-linux-gnu/release/math-draw run examples/linear-relu.json
-          ./target/x86_64-unknown-linux-gnu/release/math-draw run examples/recursive-gated-residual.v2.json
+          BIN="./target/x86_64-unknown-linux-musl/release/math-draw"
+          "$BIN" validate examples/linear-relu.json --explain
+          "$BIN" run examples/linear-relu.json
+          "$BIN" run examples/recursive-gated-residual.v2.json
