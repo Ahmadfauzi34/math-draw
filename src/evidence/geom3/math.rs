@@ -226,6 +226,13 @@ pub fn scale4(sx: f64, sy: f64, sz: f64) -> Result<Mat4, String> {
     ])
 }
 
+pub fn check_mat4_finite(m: &Mat4, ctx: &str) -> Result<Mat4, String> {
+    if !m.iter().all(|v| v.is_finite()) {
+        return Err(format!("geom3: non-finite 4x4 matrix produced in {ctx}"));
+    }
+    Ok(*m)
+}
+
 /// Convert row-major 4x4 to column-major `f32` weights for Burn `linear(4, 4, false)`.
 pub fn mat4_to_col_major_f32(m: &Mat4) -> Vec<f32> {
     let mut w = vec![0.0f32; 16];
@@ -237,15 +244,32 @@ pub fn mat4_to_col_major_f32(m: &Mat4) -> Vec<f32> {
     w
 }
 
+/// Checked conversion from row-major `f64` 4x4 matrix to column-major `f32` weights;
+/// fails closed if any entry is non-finite in `f64` or overflows `f32`.
+pub fn mat4_to_col_major_f32_checked(m: &Mat4, ctx: &str) -> Result<Vec<f32>, String> {
+    check_mat4_finite(m, ctx)?;
+    let w = mat4_to_col_major_f32(m);
+    if !w.iter().all(|v| v.is_finite()) {
+        return Err(format!(
+            "geom3: 4x4 matrix in {ctx} overflowed f32 weight range"
+        ));
+    }
+    Ok(w)
+}
+
 pub fn homogenize(v: Vec3) -> Vec4 {
     [v[0], v[1], v[2], 1.0]
 }
 
 pub fn dehomogenize(v: Vec4) -> Result<Vec3, String> {
-    if !v[3].is_finite() || v[3] == 0.0 {
-        return Err("geom3: dehomogenize division by zero or non-finite w".into());
+    if !v.iter().all(|x| x.is_finite()) || v[3] == 0.0 {
+        return Err("geom3: dehomogenize division by zero or non-finite coordinate".into());
     }
-    Ok([v[0] / v[3], v[1] / v[3], v[2] / v[3]])
+    let out = [v[0] / v[3], v[1] / v[3], v[2] / v[3]];
+    if !out.iter().all(|x| x.is_finite()) {
+        return Err("geom3: dehomogenize overflowed to non-finite coordinates".into());
+    }
+    Ok(out)
 }
 
 pub fn apply_mat4_clip(m: &Mat4, v: Vec3) -> Vec4 {
@@ -270,6 +294,16 @@ pub fn compose_chain(mats: &[Mat4]) -> Mat4 {
     acc
 }
 
+/// Finite-checked chain composition: fails closed on any intermediate or final overflow.
+pub fn compose_chain_checked(mats: &[Mat4], ctx: &str) -> Result<Mat4, String> {
+    let mut acc = mat4_identity();
+    for m in mats {
+        acc = mat4_mul(m, &acc);
+        check_mat4_finite(&acc, ctx)?;
+    }
+    Ok(acc)
+}
+
 fn mat3_inverse(m: &Mat3) -> Result<Mat3, String> {
     let [a, b, c, d, e, f, g, h, i] = *m;
     let ca = e * i - f * h;
@@ -279,11 +313,15 @@ fn mat3_inverse(m: &Mat3) -> Result<Mat3, String> {
     if !det.is_finite() || det.abs() <= 1e-18 {
         return Err("geom3: normal_mat3 singular upper-3x3 matrix".into());
     }
-    Ok([
+    let inv = [
         ca / det, (c * h - b * i) / det, (b * f - c * e) / det,
         cb / det, (a * i - c * g) / det, (c * d - a * f) / det,
         cc / det, (b * g - a * h) / det, (a * e - b * d) / det,
-    ])
+    ];
+    if !inv.iter().all(|v| v.is_finite()) {
+        return Err("geom3: normal_mat3 overflowed to non-finite entries (near-singular matrix)".into());
+    }
+    Ok(inv)
 }
 
 /// Inverse-transpose of the upper 3x3 of a row-major 4x4 model matrix.
@@ -371,12 +409,13 @@ pub fn perspective4(fov_deg: f64, aspect: f64, near: f64, far: f64) -> Result<Ma
         ));
     }
     let f = 1.0 / (deg2rad(fov_deg) * 0.5).tan();
-    Ok([
+    let m = [
         f / aspect, 0.0, 0.0, 0.0,
         0.0, f, 0.0, 0.0,
         0.0, 0.0, (far + near) / (near - far), (2.0 * far * near) / (near - far),
         0.0, 0.0, -1.0, 0.0,
-    ])
+    ];
+    check_mat4_finite(&m, "perspective4")
 }
 
 #[derive(Debug, Clone)]
@@ -582,10 +621,11 @@ fn op_to_mat4_inner(val: &Value, nest: usize) -> Result<Mat4, String> {
             } else {
                 Vec::new()
             };
-            let step_m = compose_chain(&sub_mats);
+            let step_m = compose_chain_checked(&sub_mats, "repeat.chain")?;
             let mut acc = mat4_identity();
             for _ in 0..depth {
                 acc = mat4_mul(&step_m, &acc);
+                check_mat4_finite(&acc, "repeat")?;
             }
             Ok(acc)
         }

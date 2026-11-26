@@ -346,7 +346,7 @@ pub(super) fn try_eval_math_op(
             }
         }
         "cosineSimilarity" => {
-            let eps = arg_opt_f64(args, 1).unwrap_or(1e-8);
+            let eps = arg_opt_f64(args, 1).unwrap_or(1e-12);
             let [b, f, _, _] = ins[0].shape;
             let mut out = vec![0.0f64; b];
             for bi in 0..b {

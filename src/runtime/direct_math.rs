@@ -636,13 +636,18 @@ pub fn eval_kernel_op(
     }
 }
 
-fn value_to_csv_arg(val: &Value, prev_results: &[Value], ctx: &str) -> Result<String, String> {
+fn value_to_csv_arg(
+    val: &Value,
+    prev_results: &[Value],
+    expect_matrix: bool,
+    ctx: &str,
+) -> Result<String, String> {
     match val {
         Value::String(s) if s == "$prev" => {
             let last = prev_results
                 .last()
                 .ok_or_else(|| format!("{ctx}: '$prev' used on first batch entry"))?;
-            result_to_csv(last, ctx)
+            result_to_csv(last, expect_matrix, ctx)
         }
         Value::String(s) if s.starts_with('$') => {
             let idx: usize = s[1..]
@@ -650,8 +655,13 @@ fn value_to_csv_arg(val: &Value, prev_results: &[Value], ctx: &str) -> Result<St
                 .map_err(|_| format!("{ctx}: invalid register reference '{s}'"))?;
             let r = prev_results
                 .get(idx)
-                .ok_or_else(|| format!("{ctx}: register '{s}' out of range (only {} prior results)", prev_results.len()))?;
-            result_to_csv(r, ctx)
+                .ok_or_else(|| {
+                    format!(
+                        "{ctx}: register '{s}' out of range (only {} prior results)",
+                        prev_results.len()
+                    )
+                })?;
+            result_to_csv(r, expect_matrix, ctx)
         }
         Value::String(s) => Ok(s.clone()),
         Value::Number(n) => Ok(n.to_string()),
@@ -692,14 +702,15 @@ fn scalar_to_str(v: &Value, ctx: &str) -> Result<String, String> {
     }
 }
 
-fn result_to_csv(res: &Value, ctx: &str) -> Result<String, String> {
+fn result_to_csv(res: &Value, expect_matrix: bool, ctx: &str) -> Result<String, String> {
     let vals = res
         .get("values")
         .and_then(|v| v.as_array())
         .ok_or_else(|| format!("{ctx}: referenced result missing 'values' array"))?;
     let cells: Result<Vec<String>, String> = vals.iter().map(|v| scalar_to_str(v, ctx)).collect();
     let cells = cells?;
-    if let Some(shape) = res.get("shape").and_then(|v| v.as_array())
+    if expect_matrix
+        && let Some(shape) = res.get("shape").and_then(|v| v.as_array())
         && shape.len() == 2
         && let (Some(r), Some(c)) = (shape[0].as_u64(), shape[1].as_u64())
         && (r as usize) * (c as usize) == cells.len()
@@ -713,6 +724,34 @@ fn result_to_csv(res: &Value, ctx: &str) -> Result<String, String> {
         return Ok(rows.join(";"));
     }
     Ok(cells.join(","))
+}
+
+fn is_axis_arith_op(op: &str) -> bool {
+    matches!(op, "sum_axis" | "mean_axis" | "min_axis" | "max_axis")
+}
+
+fn op_expects_matrix_a(kind: DirectBatchKind, op: &str) -> bool {
+    match kind {
+        DirectBatchKind::Arith => op == "matmul" || is_axis_arith_op(op),
+        DirectBatchKind::Int => op == "matmul",
+        DirectBatchKind::Kernel => false,
+    }
+}
+
+fn op_expects_matrix_b(kind: DirectBatchKind, op: &str) -> bool {
+    matches!(kind, DirectBatchKind::Arith | DirectBatchKind::Int) && op == "matmul"
+}
+
+fn parse_batch_opt_bool(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    ctx: &str,
+) -> Result<bool, String> {
+    match obj.get(key) {
+        None => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(other) => Err(format!("{ctx}: field '{key}' must be a boolean, got {other}")),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -743,40 +782,92 @@ pub fn eval_direct_batch(kind: DirectBatchKind, doc: &Value) -> Result<Value, St
             .get("op")
             .and_then(|v| v.as_str())
             .ok_or_else(|| format!("{ctx}: missing 'op' string"))?;
+
+        // Strict per-kind and per-op field allowlist (H5)
+        for key in obj.keys() {
+            let allowed = match kind {
+                DirectBatchKind::Arith => match key.as_str() {
+                    "op" | "a" | "b" => true,
+                    "min" | "max" => op == "clamp",
+                    "axis" => is_axis_arith_op(op),
+                    _ => false,
+                },
+                DirectBatchKind::Int => {
+                    matches!(key.as_str(), "op" | "a" | "b" | "wrap" | "allow_inexact")
+                }
+                DirectBatchKind::Kernel => match key.as_str() {
+                    "op" | "a" | "b" => true,
+                    "c" => op == "fma",
+                    _ => false,
+                },
+            };
+            if !allowed {
+                return Err(format!(
+                    "{ctx} ({op}): unknown or unsupported batch field '{key}'"
+                ));
+            }
+        }
+
         let a_val = obj
             .get("a")
             .ok_or_else(|| format!("{ctx} ({op}): missing 'a' operand"))?;
-        let a_csv = value_to_csv_arg(a_val, &results, &format!("{ctx}.a"))?;
+        let a_csv = value_to_csv_arg(a_val, &results, op_expects_matrix_a(kind, op), &format!("{ctx}.a"))?;
 
-        let b_csv = if let Some(bv) = obj.get("b") {
-            Some(value_to_csv_arg(bv, &results, &format!("{ctx}.b"))?)
-        } else if op == "clamp"
-            && let (Some(mn), Some(mx)) = (obj.get("min"), obj.get("max"))
-        {
-            Some(format!(
-                "{},{}",
-                scalar_to_str(mn, &format!("{ctx}.min"))?,
-                scalar_to_str(mx, &format!("{ctx}.max"))?
-            ))
-        } else if let Some(ax) = obj.get("axis") {
-            Some(scalar_to_str(ax, &format!("{ctx}.axis"))?)
+        let b_csv = if kind == DirectBatchKind::Arith && op == "clamp" {
+            let has_b = obj.contains_key("b");
+            let has_min = obj.contains_key("min");
+            let has_max = obj.contains_key("max");
+            if has_b && (has_min || has_max) {
+                return Err(format!(
+                    "{ctx} (clamp): specify either 'b' or ('min' and 'max'), not both"
+                ));
+            }
+            if has_b {
+                Some(value_to_csv_arg(&obj["b"], &results, false, &format!("{ctx}.b"))?)
+            } else if has_min || has_max {
+                let mn = obj
+                    .get("min")
+                    .ok_or_else(|| format!("{ctx} (clamp): 'min' is required when 'max' is provided"))?;
+                let mx = obj
+                    .get("max")
+                    .ok_or_else(|| format!("{ctx} (clamp): 'max' is required when 'min' is provided"))?;
+                Some(format!(
+                    "{},{}",
+                    scalar_to_str(mn, &format!("{ctx}.min"))?,
+                    scalar_to_str(mx, &format!("{ctx}.max"))?
+                ))
+            } else {
+                None
+            }
+        } else if kind == DirectBatchKind::Arith && is_axis_arith_op(op) {
+            if obj.contains_key("b") && obj.contains_key("axis") {
+                return Err(format!(
+                    "{ctx} ({op}): specify either 'axis' or 'b', not both"
+                ));
+            }
+            if let Some(ax) = obj.get("axis") {
+                Some(scalar_to_str(ax, &format!("{ctx}.axis"))?)
+            } else if let Some(bv) = obj.get("b") {
+                Some(value_to_csv_arg(bv, &results, false, &format!("{ctx}.b"))?)
+            } else {
+                None
+            }
+        } else if let Some(bv) = obj.get("b") {
+            Some(value_to_csv_arg(bv, &results, op_expects_matrix_b(kind, op), &format!("{ctx}.b"))?)
         } else {
             None
         };
 
         let c_csv = match obj.get("c") {
-            Some(cv) => Some(value_to_csv_arg(cv, &results, &format!("{ctx}.c"))?),
+            Some(cv) => Some(value_to_csv_arg(cv, &results, false, &format!("{ctx}.c"))?),
             None => None,
         };
 
         let res = match kind {
             DirectBatchKind::Arith => eval_arith_op(op, &a_csv, b_csv.as_deref())?,
             DirectBatchKind::Int => {
-                let wrap = obj.get("wrap").and_then(|v| v.as_bool()).unwrap_or(false);
-                let allow_inexact = obj
-                    .get("allow_inexact")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let wrap = parse_batch_opt_bool(obj, "wrap", &ctx)?;
+                let allow_inexact = parse_batch_opt_bool(obj, "allow_inexact", &ctx)?;
                 eval_int_op(op, &a_csv, b_csv.as_deref(), wrap, allow_inexact)?
             }
             DirectBatchKind::Kernel => {

@@ -61,7 +61,7 @@ pub fn build_chain_spec(doc: &Value, compose: bool) -> Result<GeomBuildReport, S
         .iter()
         .map(op_to_mat4)
         .collect::<Result<Vec<_>, _>>()?;
-    let composed_mat = compose_chain(&mats);
+    let composed_mat = compose_chain_checked(&mats, "geom build")?;
     let built: Vec<Mat4> = if compose { vec![composed_mat] } else { mats };
 
     let mut layers = Vec::with_capacity(built.len() + 1);
@@ -73,7 +73,10 @@ pub fn build_chain_spec(doc: &Value, compose: bool) -> Result<GeomBuildReport, S
             constructor: "linear".to_string(),
             args: vec![json!(100 + i), json!(4), json!(4), json!(false)],
         });
-        weights.insert(i.to_string(), mat4_to_col_major_f32(m));
+        weights.insert(
+            i.to_string(),
+            mat4_to_col_major_f32_checked(m, "geom build")?,
+        );
     }
 
     let mut prev = 0usize;
@@ -151,15 +154,23 @@ struct ParsedTreeNode {
     point: Vec3,
 }
 
+const MAX_SCENE_TREE_DEPTH: usize = 512;
+
 fn resolve_world_mat(
     id: &str,
     by_id: &BTreeMap<String, usize>,
     parsed: &[ParsedTreeNode],
-    world_mats: &mut BTreeMap<String, Mat4>,
+    world_mats: &mut BTreeMap<String, (Mat4, usize)>,
     visiting: &mut BTreeSet<String>,
-) -> Result<Mat4, String> {
-    if let Some(&m) = world_mats.get(id) {
-        return Ok(m);
+    rec_depth: usize,
+) -> Result<(Mat4, usize), String> {
+    if rec_depth > MAX_SCENE_TREE_DEPTH {
+        return Err(format!(
+            "geom scene-tree: hierarchy depth exceeded maximum ({MAX_SCENE_TREE_DEPTH}) at node '{id}'"
+        ));
+    }
+    if let Some(&cached) = world_mats.get(id) {
+        return Ok(cached);
     }
     if visiting.contains(id) {
         return Err(format!(
@@ -171,16 +182,26 @@ fn resolve_world_mat(
         .ok_or_else(|| format!("geom scene-tree: unknown parent node '{id}'"))?;
     visiting.insert(id.to_string());
     let node = &parsed[idx];
-    let world_m = match &node.parent {
+    let (world_m, tree_depth) = match &node.parent {
         Some(p) => {
-            let pm = resolve_world_mat(p, by_id, parsed, world_mats, visiting)?;
-            mat4_mul(&pm, &node.local_mat)
+            let (pm, pd) =
+                resolve_world_mat(p, by_id, parsed, world_mats, visiting, rec_depth + 1)?;
+            let d = pd + 1;
+            if d > MAX_SCENE_TREE_DEPTH {
+                return Err(format!(
+                    "geom scene-tree: hierarchy depth exceeded maximum ({MAX_SCENE_TREE_DEPTH}) at node '{id}'"
+                ));
+            }
+            (
+                check_mat4_finite(&mat4_mul(&pm, &node.local_mat), "geom scene-tree")?,
+                d,
+            )
         }
-        None => node.local_mat,
+        None => (check_mat4_finite(&node.local_mat, "geom scene-tree")?, 0),
     };
     visiting.remove(id);
-    world_mats.insert(id.to_string(), world_m);
-    Ok(world_m)
+    world_mats.insert(id.to_string(), (world_m, tree_depth));
+    Ok((world_m, tree_depth))
 }
 
 /// Compile a hierarchical kinematic scene tree `{"nodes": [{id, parent?, chain?, point?}]}`.
@@ -233,19 +254,20 @@ pub fn compile_scene_tree(doc: &Value) -> Result<SceneTreeReport, String> {
             None | Some(Value::Null) => [0.0, 0.0, 0.0],
             Some(v) => parse_vec3_value(v, &format!("node '{id}'.point"))?,
         };
+        let local_mat = compose_chain_checked(&chain_mats, &format!("node '{id}'"))?;
         by_id.insert(id.clone(), idx);
         parsed.push(ParsedTreeNode {
             id,
             parent,
-            local_mat: compose_chain(&chain_mats),
+            local_mat,
             point,
         });
     }
 
-    let mut world_mats: BTreeMap<String, Mat4> = BTreeMap::new();
+    let mut world_mats: BTreeMap<String, (Mat4, usize)> = BTreeMap::new();
     let mut visiting: BTreeSet<String> = BTreeSet::new();
     for node in &parsed {
-        resolve_world_mat(&node.id, &by_id, &parsed, &mut world_mats, &mut visiting)?;
+        resolve_world_mat(&node.id, &by_id, &parsed, &mut world_mats, &mut visiting, 0)?;
     }
 
     let mut layers = Vec::new();
@@ -267,14 +289,17 @@ pub fn compile_scene_tree(doc: &Value) -> Result<SceneTreeReport, String> {
 
     let mut out_slots = Vec::with_capacity(parsed.len());
     for (idx, node) in parsed.iter().enumerate() {
-        let w_mat = world_mats[&node.id];
+        let w_mat = world_mats[&node.id].0;
         let lin_idx = layers.len();
         layers.push(LayerDecl {
             constructor: "linear".to_string(),
             args: vec![json!(next_reg_id), json!(4), json!(4), json!(false)],
         });
         next_reg_id += 1;
-        weights.insert(lin_idx.to_string(), mat4_to_col_major_f32(&w_mat));
+        weights.insert(
+            lin_idx.to_string(),
+            mat4_to_col_major_f32_checked(&w_mat, &format!("scene node '{}'", node.id))?,
+        );
         let out_slot = next_slot;
         next_slot += 1;
         steps.push(StepDecl {
@@ -320,7 +345,7 @@ pub fn compile_scene_tree(doc: &Value) -> Result<SceneTreeReport, String> {
 
     let mut summaries = Vec::with_capacity(parsed.len());
     for node in &parsed {
-        let w_mat = world_mats[&node.id];
+        let w_mat = world_mats[&node.id].0;
         summaries.push(SceneNodeSummary {
             id: node.id.clone(),
             parent: node.parent.clone(),
@@ -647,8 +672,10 @@ pub fn solve_ik(doc: &Value) -> Result<IkSolveReport, String> {
         .fold(0.0f64, f64::max);
 
     let converged = cur_err <= tol;
+    let engine_tol = tol.max(1e-3) * (1.0 + cur_pos.iter().map(|v| v.abs()).fold(0.0f64, f64::max));
+    let engine_ok = eng_diff.is_finite() && eng_diff <= engine_tol;
     Ok(IkSolveReport {
-        ok: converged,
+        ok: converged && engine_ok,
         converged,
         iterations: iters_run,
         start_error: start_err,
@@ -903,7 +930,7 @@ fn build_mvp_from_doc(obj: &serde_json::Map<String, Value>) -> Result<(Mat4, f64
                 .collect::<Result<Vec<_>, _>>()?
         }
     };
-    let m_mat = compose_chain(&model_mats);
+    let m_mat = compose_chain_checked(&model_mats, "geom project.model")?;
 
     let cam = obj
         .get("camera")
@@ -963,7 +990,9 @@ fn build_mvp_from_doc(obj: &serde_json::Map<String, Value>) -> Result<(Mat4, f64
 
     let v_mat = look_at4(eye, target, up)?;
     let p_mat = perspective4(fov_deg, aspect, near, far)?;
-    let mvp = mat4_mul(&p_mat, &mat4_mul(&v_mat, &m_mat));
+    let vm = check_mat4_finite(&mat4_mul(&v_mat, &m_mat), "geom project.vm")?;
+    let mvp = check_mat4_finite(&mat4_mul(&p_mat, &vm), "geom project.mvp")?;
+    let _ = mat4_to_col_major_f32_checked(&mvp, "geom project.mvp")?;
     Ok((mvp, vp_w, vp_h))
 }
 

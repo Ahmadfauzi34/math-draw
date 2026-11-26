@@ -258,6 +258,24 @@ pub fn run_reference_f64(
             .ok_or_else(|| format!("diff-ref: step {si}: missing output slot"))?;
         let w_key = st.layer.to_string();
         let weights = spec.weights.get(&w_key).map(|v| v.as_slice());
+        if let Some(ws) = weights {
+            if let Some(exp) = crate::catalog::expected_weight_count(&layer.constructor, &layer.args)
+                && ws.len() != exp
+            {
+                return Err(format!(
+                    "diff-ref: weights[{}] ({}): expected {exp} floats, got {}",
+                    st.layer,
+                    layer.constructor,
+                    ws.len()
+                ));
+            }
+            if !ws.iter().all(|v| v.is_finite()) {
+                return Err(format!(
+                    "diff-ref: weights[{}] ({}) contains non-finite values",
+                    st.layer, layer.constructor
+                ));
+            }
+        }
 
         let res = if let Some(t) =
             nn_ops::try_eval_nn_op(&layer.constructor, &ins, &layer.args, weights)?
@@ -392,7 +410,7 @@ pub fn diff_ref_spec(
             }
         }
 
-        let passed = c_abs <= tol || c_rel <= tol;
+        let passed = first_diff.is_none();
         if !passed {
             all_pass = false;
         }

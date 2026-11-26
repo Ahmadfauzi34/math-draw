@@ -3252,6 +3252,333 @@ fn geom3_builders_scene_tree_ik_projection_batch_and_cli() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
+#[test]
+fn muse_audit_edge_case_regressions() {
+    use math_draw::diff_ref::{diff_ref_spec, run_reference_f64};
+    use math_draw::direct_math::{DirectBatchKind, eval_direct_batch};
+    use math_draw::geom3::{
+        build_chain_spec, compile_scene_tree, dehomogenize, normal_mat3, perspective4,
+    };
+    use math_draw::grad_spec::{GradSpecOptions, compile_grad_spec};
+    use math_draw::harness::execute_harness_workflow;
+    use math_draw::liveness::auto_repair_spec;
+    use std::process::Command;
+
+    // 1. H1 + M-r2: short weights in linear / swiGlu return Err (never panic) in both grad_spec and diff_ref
+    let short_lin = load_spec_str(
+        r#"{
+          "numSlots": 2,
+          "layers": [{ "constructor": "linear", "args": [0, 2, 2, false] }],
+          "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+          "outputSlot": 1,
+          "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+          "weights": { "0": [0.5, 0.5] },
+          "inputs": { "0": [1.0, 2.0] }
+        }"#,
+        Path::new("."),
+    )
+    .unwrap()
+    .spec;
+    assert!(compile_grad_spec(&short_lin, None, &GradSpecOptions::default()).is_err());
+    assert!(run_reference_f64(&short_lin, None).is_err());
+
+    let short_swiglu = load_spec_str(
+        r#"{
+          "numSlots": 2,
+          "layers": [{ "constructor": "swiGlu", "args": [0, 2, 2, true] }],
+          "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+          "outputSlot": 1,
+          "ports": [{ "slot": 0, "shape": [1, 1, 1, 2], "layout": "feature_last" }],
+          "weights": { "0": [0.5] },
+          "inputs": { "0": [0.8, -0.6] }
+        }"#,
+        Path::new("."),
+    )
+    .unwrap()
+    .spec;
+    assert!(compile_grad_spec(&short_swiglu, None, &GradSpecOptions::default()).is_err());
+    assert!(run_reference_f64(&short_swiglu, None).is_err());
+
+    // 2. H2: order=2 HVP on overwritten intermediate slot differentiates the exact same SSA-final variable
+    let overwrite_spec = load_spec_str(
+        r#"{
+          "numSlots": 3,
+          "layers": [
+            { "constructor": "linear", "args": [0, 1, 1, false] },
+            { "constructor": "sigmoid", "args": [1] },
+            { "constructor": "exp", "args": [2] }
+          ],
+          "steps": [
+            { "kind": "unary", "layer": 0, "slots": [0, 1] },
+            { "kind": "unary", "layer": 1, "slots": [1, 1] },
+            { "kind": "unary", "layer": 2, "slots": [1, 2] }
+          ],
+          "outputSlot": 2,
+          "ports": [{ "slot": 0, "shape": [1, 1, 1, 1] }],
+          "weights": { "0": [1.0] },
+          "inputs": { "0": [0.5] }
+        }"#,
+        Path::new("."),
+    )
+    .unwrap()
+    .spec;
+    let s_val = 1.0f32 / (1.0f32 + (-0.5f32).exp());
+    let expected_exp_s = s_val.exp(); // d/ds exp(s) == d^2/ds^2 exp(s) == exp(s) ~= 1.8635
+    let vjp_mid = compile_grad_spec(
+        &overwrite_spec,
+        None,
+        &GradSpecOptions {
+            wrt: "1".into(),
+            order: 1,
+            dout: Some(vec![1.0]),
+            hvp_vec: None,
+            compact_slots: false,
+        },
+    )
+    .unwrap();
+    let hvp_mid = compile_grad_spec(
+        &overwrite_spec,
+        None,
+        &GradSpecOptions {
+            wrt: "1".into(),
+            order: 2,
+            dout: Some(vec![1.0]),
+            hvp_vec: Some(vec![1.0]),
+            compact_slots: false,
+        },
+    )
+    .unwrap();
+    let vjp_out = run_spec(&vjp_mid.spec).unwrap().outputs.values[0];
+    let hvp_out = run_spec(&hvp_mid.spec).unwrap().outputs.values[0];
+    assert!((vjp_out - expected_exp_s).abs() < 1e-4, "vjp={vjp_out} vs {expected_exp_s}");
+    assert!((hvp_out - expected_exp_s).abs() < 1e-4, "hvp={hvp_out} vs {expected_exp_s}");
+
+    // 3. M-l3: undefined wrt slot fails closed with unresolved_wrt_slot
+    let undef_slot_spec = load_spec_str(
+        r#"{
+          "numSlots": 4,
+          "layers": [{ "constructor": "exp", "args": [0] }],
+          "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+          "outputSlot": 1,
+          "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+          "inputs": { "0": [0.5, -0.5] }
+        }"#,
+        Path::new("."),
+    )
+    .unwrap()
+    .spec;
+    let err_undef = compile_grad_spec(
+        &undef_slot_spec,
+        None,
+        &GradSpecOptions {
+            wrt: "3".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(err_undef.contains("unresolved_wrt_slot"), "got: {err_undef}");
+
+    // 4. M-l5: auto_repair_spec fails closed if spec remains invalid after repair
+    let bad_spec = load_spec_str(
+        r#"{
+          "numSlots": 2,
+          "layers": [{ "constructor": "nonexistentOp", "args": [0] }],
+          "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+          "outputSlot": 1,
+          "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+          "inputs": { "0": [1.0, 2.0] }
+        }"#,
+        Path::new("."),
+    )
+    .unwrap()
+    .spec;
+    assert!(auto_repair_spec(&bad_spec, 65535).is_err());
+
+    // 5. H6 + M-r1: cosineSimilarity default eps=1e-12 matches engine; mixed-magnitude per-element pass rule
+    let cos_default = load_spec_str(
+        r#"{
+          "numSlots": 3,
+          "layers": [{ "constructor": "cosineSimilarity", "args": [0] }],
+          "steps": [{ "kind": "binary", "layer": 0, "slots": [0, 1, 2] }],
+          "outputSlot": 2,
+          "ports": [
+            { "slot": 0, "shape": [1, 4, 1, 1] },
+            { "slot": 1, "shape": [1, 4, 1, 1] }
+          ],
+          "inputs": {
+            "0": [1e-5, 1e-5, 1e-5, 1e-5],
+            "1": [1e-5, 1e-5, 1e-5, 1e-5]
+          }
+        }"#,
+        Path::new("."),
+    )
+    .unwrap()
+    .spec;
+    let cos_rep = diff_ref_spec(&cos_default, None, None, 1e-5).unwrap();
+    assert!(cos_rep.ok && cos_rep.verdict == "PASS", "false SIGNAL on default cosineSimilarity: {cos_rep:?}");
+
+    // Mixed magnitude [1e-8, 1e6]: abs diff at idx 1 is 0.5 (rel=5e-7 <= 1e-5), rel diff at idx 0 is 0.1 (abs=1e-9 <= 1e-5)
+    let id_spec = load_spec_str(
+        r#"{
+          "numSlots": 2,
+          "layers": [{ "constructor": "relu", "args": [0] }],
+          "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+          "outputSlot": 1,
+          "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+          "inputs": { "0": [1e-8, 1e6] }
+        }"#,
+        Path::new("."),
+    )
+    .unwrap()
+    .spec;
+    let mixed_rep = diff_ref_spec(&id_spec, None, Some(&[vec![1.1e-8, 1_000_000.5]]), 1e-5).unwrap();
+    assert!(mixed_rep.ok && mixed_rep.cases[0].first_diff_index.is_none());
+
+    // 6. H4 + M-g1 + M-g2 + M-g4 + M-g5: geom3 overflow & deep-tree guards
+    assert!(
+        build_chain_spec(
+            &json!({
+                "input": [1.0, 1.0, 1.0],
+                "chain": [
+                    { "op": "scale", "by": [1e308, 1e308, 1e308] },
+                    { "op": "scale", "by": [10.0, 10.0, 10.0] }
+                ]
+            }),
+            true
+        )
+        .is_err()
+    );
+    assert!(
+        build_chain_spec(
+            &json!({
+                "input": [1.0, 1.0, 1.0],
+                "chain": [{ "op": "repeat", "depth": 1024, "chain": [{ "op": "scale", "by": [2.0, 2.0, 2.0] }] }]
+            }),
+            true
+        )
+        .is_err()
+    );
+    let near_sing = [
+        1e-320, 0.0, 0.0, 0.0,
+        0.0, 1e154, 0.0, 0.0,
+        0.0, 0.0, 1e154, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    assert!(normal_mat3(&near_sing).is_err());
+    assert!(perspective4(1e-320, 1.0, 0.1, 100.0).is_err());
+    assert!(perspective4(60.0, 1.0, 8e307, 1.7e308).is_err());
+    assert!(dehomogenize([1e308, 0.0, 0.0, 1e-10]).is_err());
+
+    let deep_nodes: Vec<serde_json::Value> = (0..520)
+        .map(|i| {
+            json!({
+                "id": format!("n{i}"),
+                "parent": if i == 0 { serde_json::Value::Null } else { json!(format!("n{}", i - 1)) },
+                "point": [0.0, 0.0, 0.0]
+            })
+        })
+        .collect();
+    assert!(compile_scene_tree(&json!({ "nodes": deep_nodes })).is_err());
+
+    // 7. H5 + M-d1 + M-d3: direct_math batch strict field allowlist, 2D->1D chaining, CLI --batch + --wrap rejection
+    assert!(
+        eval_direct_batch(
+            DirectBatchKind::Arith,
+            &json!([{ "op": "add", "a": "1,2", "axis": 5 }])
+        )
+        .is_err()
+    );
+    assert!(
+        eval_direct_batch(
+            DirectBatchKind::Arith,
+            &json!([{ "op": "clamp", "a": "-5,0.5,9", "b": "0,1", "min": 0, "max": 1 }])
+        )
+        .is_err()
+    );
+    let mat_chain = eval_direct_batch(
+        DirectBatchKind::Arith,
+        &json!([
+            { "op": "matmul", "a": "1,2;3,4", "b": "5,6;7,8" },
+            { "op": "add", "a": "$prev", "b": [1, 1, 1, 1] }
+        ]),
+    )
+    .unwrap();
+    assert_eq!(mat_chain["results"][1]["values"], json!([20.0, 23.0, 44.0, 51.0]));
+
+    // 8. H3 + M-w1 + M-w2 + M-w4 + M-w6: harness workflow strictness & error codes
+    let tmp_dir = std::env::temp_dir().join(format!("math_draw_muse_audit_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let ws = tmp_dir.join("ws");
+
+    // Empty pipeline rejected (M-w2)
+    assert!(
+        execute_harness_workflow(
+            &json!({ "spec": "examples/linear-relu.json", "pipeline": [] }),
+            Path::new("."),
+            Some(&ws),
+        )
+        .is_err()
+    );
+    // Explicit null param rejected (M-w4) & compile.max_weights=0 rejected (M-w6)
+    let null_rep = execute_harness_workflow(
+        &json!({
+            "spec": "examples/linear-relu.json",
+            "pipeline": [{ "stage": "soak", "runs": null }]
+        }),
+        Path::new("."),
+        Some(&ws),
+    )
+    .unwrap();
+    assert_eq!(null_rep["ok"], json!(false));
+    assert_ne!(null_rep["code"], json!("internal_error"));
+
+    let mw0_rep = execute_harness_workflow(
+        &json!({
+            "spec": "examples/linear-relu.json",
+            "pipeline": [{ "stage": "compile", "auto_repair": true, "max_weights": 0 }]
+        }),
+        Path::new("."),
+        Some(&ws),
+    )
+    .unwrap();
+    assert_eq!(mw0_rep["ok"], json!(false));
+    assert_ne!(mw0_rep["code"], json!("internal_error"));
+
+    // Stage error codes are never internal_error (M-w1)
+    for stage_obj in [
+        json!({ "stage": "quant_budget", "scheme": "bogus" }),
+        json!({ "stage": "grad_spec", "order": 3 }),
+        json!({ "stage": "gradcheck", "tol": 0.0 }),
+        json!({ "stage": "fit", "targets": "does-not-exist-targets.json" }),
+    ] {
+        let rep = execute_harness_workflow(
+            &json!({ "spec": "examples/linear-relu.json", "pipeline": [stage_obj] }),
+            Path::new("."),
+            Some(&ws),
+        )
+        .unwrap();
+        assert_eq!(rep["ok"], json!(false));
+        assert_ne!(rep["code"], json!("internal_error"), "stage returned internal_error: {rep}");
+        assert!(rep["hint"].as_str().is_some_and(|h| !h.is_empty()), "missing hint: {rep}");
+    }
+
+    // M-d3 CLI test: `int --batch <file> --wrap` rejected with exit 2
+    let batch_p = tmp_dir.join("int_batch.json");
+    std::fs::write(&batch_p, r#"[{"op":"add","a":"1","b":"2"}]"#).unwrap();
+    let bin = env!("CARGO_BIN_EXE_math-draw");
+    let out = Command::new(bin)
+        .args(["int", "--batch", batch_p.to_str().unwrap(), "--wrap"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["code"], json!("cli_usage"));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+
 
 
 

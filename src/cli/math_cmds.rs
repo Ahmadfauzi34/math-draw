@@ -77,6 +77,13 @@ pub(super) fn handle_int(rest: &[String]) -> ExitCode {
         if let Err(e) = parsed.ensure_max_positionals(0, usage) {
             return err_exit_typed(&e);
         }
+        if parsed.has("--wrap") || parsed.has("--allow-inexact") {
+            return err_exit_code(
+                ErrorCode::CliUsage,
+                "int.batch",
+                "--wrap and --allow-inexact cannot be combined with --batch (set per-op 'wrap'/'allow_inexact' booleans inside batch JSON)",
+            );
+        }
         return run_batch_file(DirectBatchKind::Int, "int.batch", bf);
     }
     if let Err(e) = parsed.ensure_max_positionals(3, usage) {

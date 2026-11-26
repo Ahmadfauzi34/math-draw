@@ -13,8 +13,8 @@ Provides an independent, Burn-free `f64` interpreter covering all 87 `f32` const
 ## Local Contracts
 
 - **Zero Burn Dependency**: `nn_ops.rs` and `math_ops.rs` must execute strictly in pure Rust `f64` with zero calls into `burn` or `src/layers/`.
-- **Exact Kernel Parity**: Semantics must match `math-draw` layers (e.g., `featureNorm` divides by `sqrt(sum(x^2)).max(eps)`, `rmsNorm` defaults to `eps = 1e-6`, `round` uses IEEE-754 ties-to-even `round_ties_even`, `linear` uses column-major `[in_dim, out_dim]` + optional `[out_dim]` bias, `convTranspose2d` uses `[in_ch, out_ch, kh, kw]` + `[out_ch]` bias).
-- **Fail-Closed Verification**: `diff_ref_spec` must reject non-finite or `<= 0` `tol`, invalid specs, empty case lists, length/count mismatches in external `--ref` vectors, non-finite engine/reference values, and unsupported (`int*`) constructors when no external `--ref` is provided. A case passes iff `max_abs_error <= tol || max_rel_error <= tol`; any mismatch returns `ok: false, verdict: "SIGNAL"`.
+- **Exact Kernel Parity**: Semantics must match `math-draw` layers (e.g., `featureNorm` divides by `sqrt(sum(x^2)).max(eps)`, `rmsNorm` defaults to `eps = 1e-6`, `cosineSimilarity` defaults to `eps = 1e-12`, `round` uses IEEE-754 ties-to-even `round_ties_even`, `linear` uses column-major `[in_dim, out_dim]` + optional `[out_dim]` bias, `convTranspose2d` uses `[in_ch, out_ch, kh, kw]` + `[out_ch]` bias).
+- **Fail-Closed Verification**: `run_reference_f64` and `diff_ref_spec` must reject non-finite or `<= 0` `tol`, invalid specs, wrong/non-finite layer weight lengths, empty case lists, length/count mismatches in external `--ref` vectors, non-finite engine/reference values, and unsupported (`int*`) constructors when no external `--ref` is provided. A case passes iff every element satisfies `abs_err <= tol || rel_err <= tol` (`first_diff_index.is_none()`); any mismatch returns `ok: false, verdict: "SIGNAL"` with `first_diff_index: Some(i)`.
 
 ## Work Guidance
 

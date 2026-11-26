@@ -272,7 +272,14 @@ pub fn classify_error(msg: &str, stage: Option<&str>) -> MathDrawError {
                 || low.contains("geom op")))
     {
         ErrorCode::CliUnknownCommand
-    } else if low.starts_with("usage:") {
+    } else if low.starts_with("usage:")
+        || low.contains("unknown quant scheme")
+        || low.contains("unknown budget mode")
+        || low.contains("grad-spec: order must be")
+        || low.contains("grad-spec: --hvp-vec")
+        || low.contains("unknown or unsupported batch field")
+        || (low.starts_with("batch[") && low.contains("specify either "))
+    {
         ErrorCode::CliUsage
     } else if low.contains("cannot read") || low.contains("failed to read") {
         ErrorCode::IoReadFailed

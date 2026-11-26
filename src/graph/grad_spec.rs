@@ -45,14 +45,28 @@ pub struct GradSpecReport {
     pub spec: SpecV1,
 }
 
-fn transpose_col_major(weights: &[f32], in_dim: usize, out_dim: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; in_dim * out_dim];
+fn transpose_col_major(
+    weights: &[f32],
+    in_dim: usize,
+    out_dim: usize,
+    layer_idx: usize,
+) -> Result<Vec<f32>, String> {
+    let needed = in_dim
+        .checked_mul(out_dim)
+        .ok_or_else(|| format!("weights[{layer_idx}] (linear): dimension overflow"))?;
+    if weights.len() < needed {
+        return Err(format!(
+            "weights[{layer_idx}] (linear): expected at least {needed} floats, got {}",
+            weights.len()
+        ));
+    }
+    let mut out = vec![0.0f32; needed];
     for j in 0..in_dim {
         for i in 0..out_dim {
             out[i * in_dim + j] = weights[j * out_dim + i];
         }
     }
-    out
+    Ok(out)
 }
 
 fn one_minus_weights(dim: usize) -> Vec<f32> {
@@ -401,12 +415,20 @@ pub fn compile_backward_spec(
                 let out_dim = decl.args[2].as_u64().unwrap_or(0) as usize;
                 let bias = decl.args[3].as_bool().unwrap_or(false);
                 let exp_len = in_dim * out_dim + if bias { out_dim } else { 0 };
-                let w = s
-                    .weights
-                    .get(&st.layer.to_string())
-                    .cloned()
-                    .unwrap_or_else(|| vec![0.0f32; exp_len]);
-                let w_t = transpose_col_major(&w, in_dim, out_dim);
+                let w = match s.weights.get(&st.layer.to_string()) {
+                    Some(ws) => {
+                        if ws.len() != exp_len {
+                            return Err(format!(
+                                "weights[{}] (linear): expected {exp_len} floats, got {}",
+                                st.layer,
+                                ws.len()
+                            ));
+                        }
+                        ws.clone()
+                    }
+                    None => vec![0.0f32; exp_len],
+                };
+                let w_t = transpose_col_major(&w, in_dim, out_dim, st.layer)?;
                 let lin_t_idx = push_layer(
                     &mut layers,
                     &mut next_reg_id,
@@ -1111,13 +1133,22 @@ pub fn compile_backward_spec(
                     ));
                 }
                 let inner_len = d_in * d_out + if bias { d_out } else { 0 };
-                let w = s
-                    .weights
-                    .get(&st.layer.to_string())
-                    .cloned()
-                    .unwrap_or_else(|| vec![0.0f32; 2 * inner_len]);
+                let exp_w = 2 * inner_len;
+                let w = match s.weights.get(&st.layer.to_string()) {
+                    Some(ws) => {
+                        if ws.len() != exp_w {
+                            return Err(format!(
+                                "weights[{}] (swiGlu): expected {exp_w} floats, got {}",
+                                st.layer,
+                                ws.len()
+                            ));
+                        }
+                        ws.clone()
+                    }
+                    None => vec![0.0f32; exp_w],
+                };
                 let inner_seg = w[..inner_len].to_vec();
-                let outer_seg = w[inner_len..2 * inner_len].to_vec();
+                let outer_seg = w[inner_len..exp_w].to_vec();
 
                 let tr_idx = push_layer(
                     &mut layers,
@@ -1242,7 +1273,7 @@ pub fn compile_backward_spec(
                 );
                 weights.insert(
                     lin_ti.to_string(),
-                    transpose_col_major(&inner_seg, d_in, d_out),
+                    transpose_col_major(&inner_seg, d_in, d_out, st.layer)?,
                 );
                 let dx1_t = next_slot;
                 next_slot += 1;
@@ -1260,7 +1291,7 @@ pub fn compile_backward_spec(
                 );
                 weights.insert(
                     lin_to.to_string(),
-                    transpose_col_major(&outer_seg, d_in, d_out),
+                    transpose_col_major(&outer_seg, d_in, d_out, st.layer)?,
                 );
                 let dx2_t = next_slot;
                 next_slot += 1;
@@ -1493,11 +1524,20 @@ pub fn compile_backward_spec(
     let ssa_wrt = if is_port {
         resolved_wrt
     } else {
-        final_slot_map
-            .get(&resolved_wrt)
-            .copied()
-            .unwrap_or(resolved_wrt)
+        match final_slot_map.get(&resolved_wrt).copied() {
+            Some(slot) => slot,
+            None => {
+                return Err(format!(
+                    "unresolved_wrt_slot: slot {resolved_wrt} is never defined as a port or step output"
+                ));
+            }
+        }
     };
+    if !slot_shapes.contains_key(&ssa_wrt) {
+        return Err(format!(
+            "unresolved_wrt_slot: slot {resolved_wrt} has no inferred tensor shape"
+        ));
+    }
     let target_grad_slot = if is_port {
         grad_slot_of
             .get(&resolved_wrt)
@@ -1517,20 +1557,13 @@ pub fn compile_backward_spec(
     let output_slot = match target_grad_slot {
         Some(slot) => slot,
         None => {
-            let zero_ref = if slot_shapes.contains_key(&resolved_wrt) {
-                resolved_wrt
-            } else if slot_shapes.contains_key(&ssa_wrt) {
-                ssa_wrt
-            } else {
-                0
-            };
             let sub_idx = push_layer(&mut layers, &mut next_reg_id, "sub", vec![]);
             let z_slot = next_slot;
             next_slot += 1;
             steps.push(StepDecl {
                 kind: "binary".to_string(),
                 layer: sub_idx,
-                slots: vec![zero_ref, zero_ref, z_slot],
+                slots: vec![ssa_wrt, ssa_wrt, z_slot],
             });
             z_slot
         }
@@ -1558,7 +1591,7 @@ pub fn compile_backward_spec(
         ok: true,
         kind: "symbolic_backward_spec",
         order: 1,
-        wrt_slot: resolved_wrt,
+        wrt_slot: ssa_wrt,
         dout_slot,
         hvp_slot: None,
         forward_output_slot: s.output_slot,

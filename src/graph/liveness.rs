@@ -605,6 +605,27 @@ pub fn auto_repair_spec(
         }
     }
 
+    let post = validate_spec(&current, false);
+    if !post.valid {
+        let detail = if !post.issues.is_empty() {
+            post.issues.join("; ")
+        } else if !post.mismatches.is_empty() {
+            post.mismatches
+                .iter()
+                .map(|m| m.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        } else if !post.dataflow.issues.is_empty() {
+            post.dataflow.issues.join("; ")
+        } else {
+            post.code.to_string()
+        };
+        return Err(format!(
+            "auto_repair_spec: spec remains invalid after repair ({}): {detail}",
+            post.code
+        ));
+    }
+
     Ok(AutoRepairReport {
         spec: current,
         repaired: !receipts.is_empty(),
