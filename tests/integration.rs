@@ -3578,6 +3578,205 @@ fn muse_audit_edge_case_regressions() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
+#[test]
+fn adversarial_verify_zoom_tol_and_bundle_unknown_fields() {
+    use math_draw::bundle::{ProgramBundle, export_bundle, verify_bundle_json};
+    use math_draw::spec::SpecV1;
+    use math_draw::verify::{FuzzConfig, zoom_fuzz_specs_with_tol};
+    use serde_json::json;
+    use std::process::Command;
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "math_draw_adv_hardening_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    let base_val = json!({
+        "numSlots": 2,
+        "layers": [{ "constructor": "linear", "args": [0, 2, 2, true] }],
+        "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+        "outputSlot": 1,
+        "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+        "weights": { "0": [1.0, 0.0, 0.0, 1.0, 0.0, 0.0] },
+        "inputs": { "0": [1.0, 2.0] }
+    });
+    let mut pert_val = base_val.clone();
+    pert_val["weights"]["0"] = json!([1.05, 0.0, 0.0, 1.0, 0.0, 0.0]);
+
+    let base_spec: SpecV1 = serde_json::from_value(base_val.clone()).unwrap();
+    let pert_spec: SpecV1 = serde_json::from_value(pert_val.clone()).unwrap();
+
+    let base_path = tmp_dir.join("base.json");
+    let pert_path = tmp_dir.join("pert.json");
+    std::fs::write(&base_path, serde_json::to_string_pretty(&base_val).unwrap()).unwrap();
+    std::fs::write(&pert_path, serde_json::to_string_pretty(&pert_val).unwrap()).unwrap();
+
+    // 1. Library API: zoom_fuzz_specs_with_tol rejects invalid tolerances and gates violations
+    let cfg = FuzzConfig {
+        count: 10,
+        seed: 42,
+        lo: -5.0,
+        hi: 5.0,
+    };
+    assert!(zoom_fuzz_specs_with_tol(&base_spec, &pert_spec, &cfg, 3, Some(-1e-4), None).is_err());
+    assert!(zoom_fuzz_specs_with_tol(&base_spec, &pert_spec, &cfg, 3, None, Some(f64::NAN)).is_err());
+
+    let rep_rej =
+        zoom_fuzz_specs_with_tol(&base_spec, &pert_spec, &cfg, 4, Some(1e-4), None).unwrap();
+    assert!(!rep_rej.ok);
+    assert_eq!(rep_rej.verdict, Some("REJECT"));
+    assert!(rep_rej.zoomed_max_abs_error > 1e-4);
+
+    let rep_acc =
+        zoom_fuzz_specs_with_tol(&base_spec, &base_spec, &cfg, 4, Some(1e-4), None).unwrap();
+    assert!(rep_acc.ok);
+    assert_eq!(rep_acc.verdict, Some("ACCEPT"));
+    assert_eq!(rep_acc.zoomed_max_abs_error, 0.0);
+
+    // 2. CLI verify --zoom with --abs-tol / --rel-tol fails closed with exit 2 on violation
+    let bin = env!("CARGO_BIN_EXE_math-draw");
+    let out_rej = Command::new(bin)
+        .args([
+            "verify",
+            base_path.to_str().unwrap(),
+            pert_path.to_str().unwrap(),
+            "--fuzz",
+            "10",
+            "--zoom",
+            "--abs-tol",
+            "1e-4",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out_rej.status.code(), Some(2));
+    let v_rej: serde_json::Value = serde_json::from_slice(&out_rej.stdout).unwrap();
+    assert_eq!(v_rej["ok"], json!(false));
+    assert_eq!(v_rej["verdict"], json!("REJECT"));
+    assert!(v_rej["zoomed_max_abs_error"].as_f64().unwrap() > 1e-4);
+
+    let out_rel_rej = Command::new(bin)
+        .args([
+            "verify",
+            base_path.to_str().unwrap(),
+            pert_path.to_str().unwrap(),
+            "--fuzz",
+            "10",
+            "--zoom",
+            "--rel-tol",
+            "1e-4",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out_rel_rej.status.code(), Some(2));
+    let v_rel_rej: serde_json::Value = serde_json::from_slice(&out_rel_rej.stdout).unwrap();
+    assert_eq!(v_rel_rej["ok"], json!(false));
+    assert_eq!(v_rel_rej["verdict"], json!("REJECT"));
+
+    let out_acc = Command::new(bin)
+        .args([
+            "verify",
+            base_path.to_str().unwrap(),
+            base_path.to_str().unwrap(),
+            "--fuzz",
+            "10",
+            "--zoom",
+            "--abs-tol",
+            "1e-4",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out_acc.status.code(), Some(0));
+    let v_acc: serde_json::Value = serde_json::from_slice(&out_acc.stdout).unwrap();
+    assert_eq!(v_acc["ok"], json!(true));
+    assert_eq!(v_acc["verdict"], json!("ACCEPT"));
+
+    // Exploratory mode without tolerance flags remains backward-compatible (ok: true, exit 0)
+    let out_exp = Command::new(bin)
+        .args([
+            "verify",
+            base_path.to_str().unwrap(),
+            pert_path.to_str().unwrap(),
+            "--fuzz",
+            "10",
+            "--zoom",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out_exp.status.code(), Some(0));
+    let v_exp: serde_json::Value = serde_json::from_slice(&out_exp.stdout).unwrap();
+    assert_eq!(v_exp["ok"], json!(true));
+    assert!(v_exp.get("verdict").is_none());
+
+    // --zoom combined with --cases fails closed with cli_usage
+    let cases_path = tmp_dir.join("cases.json");
+    std::fs::write(&cases_path, r#"{"cases":[{"inputs":{"0":[1.0,2.0]}}]}"#).unwrap();
+    let out_cases = Command::new(bin)
+        .args([
+            "verify",
+            base_path.to_str().unwrap(),
+            pert_path.to_str().unwrap(),
+            "--zoom",
+            "--cases",
+            cases_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out_cases.status.code(), Some(2));
+    let v_cases: serde_json::Value = serde_json::from_slice(&out_cases.stdout).unwrap();
+    assert_eq!(v_cases["code"], json!("cli_usage"));
+
+    // 3. Bundle verify rejects injected unknown JSON keys anywhere in ProgramBundle or nested SpecV1
+    let bundle = export_bundle(&base_spec, true, &[]).unwrap();
+    let clean_raw = serde_json::to_string_pretty(&bundle).unwrap();
+    let (_, clean_rep) = verify_bundle_json(&clean_raw).unwrap();
+    assert!(clean_rep.ok);
+
+    // Inject unknown key inside spec.layers[0].weights
+    let mut injected_layer: serde_json::Value = serde_json::to_value(&bundle).unwrap();
+    injected_layer["spec"]["layers"][0]["weights"] = json!([99.0, 99.0]);
+    let injected_layer_raw = serde_json::to_string_pretty(&injected_layer).unwrap();
+
+    // Direct serde deserialization of ProgramBundle also fails closed (deny_unknown_fields)
+    assert!(serde_json::from_str::<ProgramBundle>(&injected_layer_raw).is_err());
+
+    let (_, rep_layer) = verify_bundle_json(&injected_layer_raw).unwrap();
+    assert!(!rep_layer.ok);
+    assert_eq!(rep_layer.code.as_deref(), Some("bundle_integrity_failed"));
+    assert!(
+        rep_layer
+            .checks
+            .iter()
+            .any(|c| c.name == "bundle_integrity" && !c.passed && c.detail.contains("spec.layers[0].weights")),
+        "expected spec.layers[0].weights in detail: {:?}",
+        rep_layer.checks
+    );
+
+    let tampered_bundle_path = tmp_dir.join("tampered_layer_key.bundle.json");
+    std::fs::write(&tampered_bundle_path, &injected_layer_raw).unwrap();
+    let out_bundle = Command::new(bin)
+        .args(["bundle", "verify", tampered_bundle_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(out_bundle.status.code(), Some(2));
+    let v_bundle: serde_json::Value = serde_json::from_slice(&out_bundle.stdout).unwrap();
+    assert_eq!(v_bundle["ok"], json!(false));
+    assert_eq!(v_bundle["code"], json!("bundle_integrity_failed"));
+
+    // Inject unknown key at root level and inside spec.steps[0]
+    let mut injected_root: serde_json::Value = serde_json::to_value(&bundle).unwrap();
+    injected_root["smuggled_meta"] = json!("evil");
+    injected_root["spec"]["steps"][0]["note"] = json!("hidden");
+    let injected_root_raw = serde_json::to_string_pretty(&injected_root).unwrap();
+    assert!(serde_json::from_str::<ProgramBundle>(&injected_root_raw).is_err());
+    let (_, rep_root) = verify_bundle_json(&injected_root_raw).unwrap();
+    assert!(!rep_root.ok);
+    assert_eq!(rep_root.code.as_deref(), Some("bundle_integrity_failed"));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
 
 
 
