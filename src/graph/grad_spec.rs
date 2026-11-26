@@ -76,6 +76,17 @@ fn scaled_identity_weights(dim: usize, scale: f32) -> Vec<f32> {
     w
 }
 
+fn affine_identity_weights(dim: usize, scale: f32, bias: f32) -> Vec<f32> {
+    let mut w = Vec::with_capacity(dim * dim + dim);
+    for j in 0..dim {
+        for i in 0..dim {
+            w.push(if i == j { scale } else { 0.0 });
+        }
+    }
+    w.extend(std::iter::repeat_n(bias, dim));
+    w
+}
+
 fn resolve_wrt_slot(
     spec: &SpecV1,
     expansion: Option<&ExpansionReceipt>,
@@ -328,6 +339,40 @@ pub fn compile_backward_spec(
             vec![Value::from(dim), Value::from(dim), Value::from(false)],
         );
         weights.insert(lin_idx.to_string(), scaled_identity_weights(dim, scale));
+        let res_slot = *next_slot;
+        *next_slot += 1;
+        steps.push(StepDecl {
+            kind: "unary".to_string(),
+            layer: lin_idx,
+            slots: vec![in_slot, res_slot],
+        });
+        Ok(res_slot)
+    };
+
+    let emit_affine = |in_slot: usize,
+                       sh: [usize; 4],
+                       scale: f32,
+                       bias: f32,
+                       op_name: &str,
+                       layers: &mut Vec<LayerDecl>,
+                       steps: &mut Vec<StepDecl>,
+                       weights: &mut BTreeMap<String, Vec<f32>>,
+                       next_reg_id: &mut usize,
+                       next_slot: &mut usize|
+     -> Result<usize, String> {
+        if sh[2] != 1 || sh[3] != 1 {
+            return Err(format!(
+                "unsupported_shape_for_polynomial_vjp: in-graph {op_name} VJP requires [B, D, 1, 1], got {sh:?}"
+            ));
+        }
+        let dim = sh[1];
+        let lin_idx = push_layer(
+            layers,
+            next_reg_id,
+            "linear",
+            vec![Value::from(dim), Value::from(dim), Value::from(true)],
+        );
+        weights.insert(lin_idx.to_string(), affine_identity_weights(dim, scale, bias));
         let res_slot = *next_slot;
         *next_slot += 1;
         steps.push(StepDecl {
@@ -887,7 +932,12 @@ pub fn compile_backward_spec(
             }
             "gelu" => {
                 // y = x * Phi(x); dy/dx = Phi(x) + x * phi(x)
-                // phi(x) = (1/sqrt(2*pi)) * exp(-0.5 * x^2); Phi(x) = gelu(x) / x
+                // phi(x) = (1/sqrt(2*pi)) * exp(-0.5 * x^2)
+                // Compute Phi(x) smoothly without gelu(x)/x (which divides by zero at x = 0):
+                //   Phi(x) ~= 0.5 * (1 + tanh((c0 * x + p3 * x^3) / (1 + q2 * x^2)))
+                // where c0 = sqrt(2/pi), p3 = 0.04305, q2 = 0.00806.
+                // Denominator 1 + q2*x^2 >= 1 everywhere; exact at x = 0 (Phi(0) = 0.5,
+                // gelu'(0) = 0.5, gelu''(0) = sqrt(2/pi)) with max |err| < 3.4e-5 on R.
                 let sh = *slot_shapes
                     .get(&out_slot)
                     .ok_or_else(|| format!("missing inferred shape for slot {out_slot}"))?;
@@ -895,14 +945,95 @@ pub fn compile_backward_spec(
                 let mul_idx = push_layer(&mut layers, &mut next_reg_id, "mul", vec![]);
                 let div_idx = push_layer(&mut layers, &mut next_reg_id, "div", vec![]);
                 let exp_idx = push_layer(&mut layers, &mut next_reg_id, "exp", vec![]);
+                let tanh_idx = push_layer(&mut layers, &mut next_reg_id, "tanh", vec![]);
                 let add_idx = push_layer(&mut layers, &mut next_reg_id, "add", vec![]);
+
                 let x2_slot = next_slot;
+                next_slot += 1;
+                let x3_slot = next_slot;
                 next_slot += 1;
                 steps.push(StepDecl {
                     kind: "binary".to_string(),
                     layer: mul_idx,
                     slots: vec![x_slot, x_slot, x2_slot],
                 });
+                steps.push(StepDecl {
+                    kind: "binary".to_string(),
+                    layer: mul_idx,
+                    slots: vec![x2_slot, x_slot, x3_slot],
+                });
+
+                // Smooth Phi(x) via Padé [3/2] inside tanh
+                let c0 = (2.0 / std::f64::consts::PI).sqrt() as f32;
+                let c0_x = emit_scale(
+                    x_slot,
+                    sh,
+                    c0,
+                    "gelu",
+                    &mut layers,
+                    &mut steps,
+                    &mut weights,
+                    &mut next_reg_id,
+                    &mut next_slot,
+                )?;
+                let p3_x3 = emit_scale(
+                    x3_slot,
+                    sh,
+                    0.04305,
+                    "gelu",
+                    &mut layers,
+                    &mut steps,
+                    &mut weights,
+                    &mut next_reg_id,
+                    &mut next_slot,
+                )?;
+                let pade_num = next_slot;
+                next_slot += 1;
+                steps.push(StepDecl {
+                    kind: "binary".to_string(),
+                    layer: add_idx,
+                    slots: vec![c0_x, p3_x3, pade_num],
+                });
+                let pade_den = emit_affine(
+                    x2_slot,
+                    sh,
+                    0.00806,
+                    1.0,
+                    "gelu",
+                    &mut layers,
+                    &mut steps,
+                    &mut weights,
+                    &mut next_reg_id,
+                    &mut next_slot,
+                )?;
+                let pade_u = next_slot;
+                next_slot += 1;
+                let th_u = next_slot;
+                next_slot += 1;
+                steps.push(StepDecl {
+                    kind: "binary".to_string(),
+                    layer: div_idx,
+                    slots: vec![pade_num, pade_den, pade_u],
+                });
+                steps.push(StepDecl {
+                    kind: "unary".to_string(),
+                    layer: tanh_idx,
+                    slots: vec![pade_u, th_u],
+                });
+                let big_phi = emit_affine(
+                    th_u,
+                    sh,
+                    0.5,
+                    0.5,
+                    "gelu",
+                    &mut layers,
+                    &mut steps,
+                    &mut weights,
+                    &mut next_reg_id,
+                    &mut next_slot,
+                )?;
+
+                // Exact x * phi(x) term
                 let neg_half_x2 = emit_scale(
                     x2_slot,
                     sh,
@@ -935,8 +1066,6 @@ pub fn compile_backward_spec(
                 )?;
                 let x_phi = next_slot;
                 next_slot += 1;
-                let big_phi = next_slot;
-                next_slot += 1;
                 let dydx = next_slot;
                 next_slot += 1;
                 let dx_slot = next_slot;
@@ -945,11 +1074,6 @@ pub fn compile_backward_spec(
                     kind: "binary".to_string(),
                     layer: mul_idx,
                     slots: vec![x_slot, phi_slot, x_phi],
-                });
-                steps.push(StepDecl {
-                    kind: "binary".to_string(),
-                    layer: div_idx,
-                    slots: vec![out_slot, x_slot, big_phi],
                 });
                 steps.push(StepDecl {
                     kind: "binary".to_string(),

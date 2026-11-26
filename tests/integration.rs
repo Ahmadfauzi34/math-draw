@@ -2367,6 +2367,66 @@ fn symbolic_grad_spec_vjp_hvp_and_finite_diff_parity() {
         }
     }
 
+    // 3b. GELU VJP (order=1) & HVP (order=2) at exact origin x = 0.0 (must not divide by zero)
+    {
+        let gelu_zero = load_spec_str(
+            r#"{
+              "numSlots": 2,
+              "layers": [{ "constructor": "gelu", "args": [0] }],
+              "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+              "outputSlot": 1,
+              "ports": [{ "slot": 0, "shape": [1, 4, 1, 1] }],
+              "inputs": { "0": [0.0, 1e-7, 0.8, -0.6] }
+            }"#,
+            Path::new("."),
+        )
+        .unwrap()
+        .spec;
+        let vjp_zero = compile_grad_spec(
+            &gelu_zero,
+            None,
+            &GradSpecOptions {
+                wrt: "0".into(),
+                order: 1,
+                dout: Some(vec![1.0, 1.0, 1.0, 1.0]),
+                hvp_vec: None,
+                compact_slots: true,
+            },
+        )
+        .unwrap();
+        let vjp_z_vals = run_spec(&vjp_zero.spec).unwrap().outputs.values;
+        assert!(
+            (vjp_z_vals[0] - 0.5).abs() < 1e-6,
+            "gelu'(0) expected 0.5, got {}",
+            vjp_z_vals[0]
+        );
+        assert!(
+            (vjp_z_vals[1] - 0.5).abs() < 1e-5,
+            "gelu'(1e-7) expected ~0.5, got {}",
+            vjp_z_vals[1]
+        );
+
+        let hvp_zero = compile_grad_spec(
+            &gelu_zero,
+            None,
+            &GradSpecOptions {
+                wrt: "0".into(),
+                order: 2,
+                dout: Some(vec![1.0, 1.0, 1.0, 1.0]),
+                hvp_vec: Some(vec![1.0, 1.0, 1.0, 1.0]),
+                compact_slots: false,
+            },
+        )
+        .unwrap();
+        let hvp_z_vals = run_spec(&hvp_zero.spec).unwrap().outputs.values;
+        let expected_d2_0 = (2.0 / std::f64::consts::PI).sqrt() as f32;
+        assert!(
+            (hvp_z_vals[0] - expected_d2_0).abs() < 1e-4,
+            "gelu''(0) expected {expected_d2_0}, got {}",
+            hvp_z_vals[0]
+        );
+    }
+
     // 4. Fail-closed errors
     assert!(
         compile_grad_spec(
