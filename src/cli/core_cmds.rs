@@ -87,6 +87,13 @@ pub(super) fn handle_verify(rest: &[String]) -> ExitCode {
     if parsed.positionals.len() < 2 {
         return err_exit_usage("verify", usage);
     }
+    if parsed.has("--zoom") && parsed.has("--cases") {
+        return err_exit_code(
+            ErrorCode::CliUsage,
+            "cli_parse",
+            "verify --zoom cannot be combined with --cases",
+        );
+    }
     let base = match load_spec_file(Path::new(&parsed.positionals[0])) {
         Ok(l) => l.spec,
         Err(e) => return err_exit_stage("load_spec", &e),
@@ -105,13 +112,6 @@ pub(super) fn handle_verify(rest: &[String]) -> ExitCode {
     };
 
     if parsed.has("--zoom") {
-        if parsed.has("--cases") {
-            return err_exit_code(
-                ErrorCode::CliUsage,
-                "cli_parse",
-                "verify --zoom cannot be combined with --cases",
-            );
-        }
         let count = match parsed.parse_usize("--fuzz", 12) {
             Ok(v) => v,
             Err(e) => return err_exit_typed(&e),

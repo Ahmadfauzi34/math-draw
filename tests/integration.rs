@@ -3774,6 +3774,247 @@ fn adversarial_verify_zoom_tol_and_bundle_unknown_fields() {
     assert!(!rep_root.ok);
     assert_eq!(rep_root.code.as_deref(), Some("bundle_integrity_failed"));
 
+    // 4. All remaining unknown-field strip locations + null-valued unknown fields (M-t1)
+    type MutateBundle = fn(&mut serde_json::Value);
+    let remaining_cases: [(&str, MutateBundle); 8] = [
+        ("spec.extra_spec", |v| { v["spec"]["extra_spec"] = json!(123); }),
+        ("spec.ports[0].extra_port", |v| { v["spec"]["ports"][0]["extra_port"] = json!("x"); }),
+        ("parameter_binding.extra_pb", |v| { v["parameter_binding"]["extra_pb"] = json!(1); }),
+        ("parameter_binding.owners[0].extra_owner", |v| { v["parameter_binding"]["owners"][0]["extra_owner"] = json!(true); }),
+        ("reference_execution.extra_exec", |v| { v["reference_execution"]["extra_exec"] = json!(0); }),
+        ("attestations[0].extra_att", |v| { v["attestations"][0]["extra_att"] = json!("y"); }),
+        ("null_root", |v| { v["null_root"] = serde_json::Value::Null; }),
+        ("spec.null_spec", |v| { v["spec"]["null_spec"] = serde_json::Value::Null; }),
+    ];
+    for (expected_path, mutate_fn) in remaining_cases {
+        let mut tampered: serde_json::Value = serde_json::to_value(&bundle).unwrap();
+        mutate_fn(&mut tampered);
+        let raw = serde_json::to_string_pretty(&tampered).unwrap();
+        assert!(
+            serde_json::from_str::<ProgramBundle>(&raw).is_err(),
+            "serde failed to reject {expected_path}"
+        );
+        let (_, rep) = verify_bundle_json(&raw).unwrap();
+        assert!(!rep.ok, "verify_bundle_json passed for {expected_path}");
+        assert_eq!(rep.code.as_deref(), Some("bundle_integrity_failed"));
+        assert!(
+            rep.checks
+                .iter()
+                .any(|c| c.name == "bundle_integrity" && !c.passed && c.detail.contains(expected_path)),
+            "expected {expected_path} in bundle_integrity detail: {:?}",
+            rep.checks
+        );
+    }
+
+    // verify_bundle_json Err path -> CLI bundle_invalid exit 2
+    for (name, bad_payload) in [
+        ("malformed.bundle.json", "{not valid json"),
+        ("missing_fields.bundle.json", r#"{"schema":"burn-math.program-bundle.v1"}"#),
+    ] {
+        let p = tmp_dir.join(name);
+        std::fs::write(&p, bad_payload).unwrap();
+        let out_bad = Command::new(bin)
+            .args(["bundle", "verify", p.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_eq!(out_bad.status.code(), Some(2));
+        let v_bad: serde_json::Value = serde_json::from_slice(&out_bad.stdout).unwrap();
+        assert_eq!(v_bad["ok"], json!(false));
+        assert_eq!(v_bad["code"], json!("bundle_invalid"));
+    }
+
+    // 5. Tolerance boundaries: --abs-tol 0, combined --abs-tol + --rel-tol OR semantics,
+    // --fuzz 0, --zoom-depth 0 / > MAX_ZOOM_DEPTH, and --zoom --cases before load_spec (M-t1/L-z1/L-z2)
+    let out_zero_acc = Command::new(bin)
+        .args([
+            "verify",
+            base_path.to_str().unwrap(),
+            base_path.to_str().unwrap(),
+            "--fuzz",
+            "6",
+            "--zoom",
+            "--abs-tol",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out_zero_acc.status.code(), Some(0));
+    let v_zero_acc: serde_json::Value = serde_json::from_slice(&out_zero_acc.stdout).unwrap();
+    assert_eq!(v_zero_acc["verdict"], json!("ACCEPT"));
+
+    let out_zero_rej = Command::new(bin)
+        .args([
+            "verify",
+            base_path.to_str().unwrap(),
+            pert_path.to_str().unwrap(),
+            "--fuzz",
+            "6",
+            "--zoom",
+            "--abs-tol",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out_zero_rej.status.code(), Some(2));
+    let v_zero_rej: serde_json::Value = serde_json::from_slice(&out_zero_rej.stdout).unwrap();
+    assert_eq!(v_zero_rej["verdict"], json!("REJECT"));
+
+    // Combined OR semantics: large magnitude where abs > 1e-4 but rel <= 1e-4
+    let mut big_base = base_val.clone();
+    big_base["weights"]["0"] = json!([1000.0, 0.0, 0.0, 1000.0, 0.0, 0.0]);
+    let mut big_pert = base_val.clone();
+    big_pert["weights"]["0"] = json!([1000.01, 0.0, 0.0, 1000.0, 0.0, 0.0]);
+    let big_base_p = tmp_dir.join("big_base.json");
+    let big_pert_p = tmp_dir.join("big_pert.json");
+    std::fs::write(&big_base_p, serde_json::to_string_pretty(&big_base).unwrap()).unwrap();
+    std::fs::write(&big_pert_p, serde_json::to_string_pretty(&big_pert).unwrap()).unwrap();
+
+    let out_or_acc = Command::new(bin)
+        .args([
+            "verify",
+            big_base_p.to_str().unwrap(),
+            big_pert_p.to_str().unwrap(),
+            "--fuzz",
+            "6",
+            "--zoom",
+            "--abs-tol",
+            "1e-4",
+            "--rel-tol",
+            "1e-4",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out_or_acc.status.code(), Some(0));
+    let v_or_acc: serde_json::Value = serde_json::from_slice(&out_or_acc.stdout).unwrap();
+    assert_eq!(v_or_acc["verdict"], json!("ACCEPT"));
+    assert!(v_or_acc["zoomed_max_abs_error"].as_f64().unwrap() > 1e-4);
+
+    let out_or_rej = Command::new(bin)
+        .args([
+            "verify",
+            big_base_p.to_str().unwrap(),
+            big_pert_p.to_str().unwrap(),
+            "--fuzz",
+            "6",
+            "--zoom",
+            "--abs-tol",
+            "1e-4",
+            "--rel-tol",
+            "1e-7",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out_or_rej.status.code(), Some(2));
+    let v_or_rej: serde_json::Value = serde_json::from_slice(&out_or_rej.stdout).unwrap();
+    assert_eq!(v_or_rej["verdict"], json!("REJECT"));
+
+    // --fuzz 0 rejected, --zoom-depth 0 accepted, --zoom-depth 65 rejected
+    let out_fuzz0 = Command::new(bin)
+        .args(["verify", base_path.to_str().unwrap(), pert_path.to_str().unwrap(), "--zoom", "--fuzz", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(out_fuzz0.status.code(), Some(2));
+
+    let out_depth0 = Command::new(bin)
+        .args(["verify", base_path.to_str().unwrap(), base_path.to_str().unwrap(), "--zoom", "--zoom-depth", "0", "--abs-tol", "1e-4"])
+        .output()
+        .unwrap();
+    assert_eq!(out_depth0.status.code(), Some(0));
+
+    let out_depth65 = Command::new(bin)
+        .args(["verify", base_path.to_str().unwrap(), base_path.to_str().unwrap(), "--zoom", "--zoom-depth", "65"])
+        .output()
+        .unwrap();
+    assert_eq!(out_depth65.status.code(), Some(2));
+
+    // --zoom --cases returns cli_usage BEFORE load_spec even when spec files do not exist (L-z1)
+    let out_conflict_missing = Command::new(bin)
+        .args(["verify", "no_such_a.json", "no_such_b.json", "--zoom", "--cases", "no_such_cases.json"])
+        .output()
+        .unwrap();
+    assert_eq!(out_conflict_missing.status.code(), Some(2));
+    let v_conflict_missing: serde_json::Value = serde_json::from_slice(&out_conflict_missing.stdout).unwrap();
+    assert_eq!(v_conflict_missing["code"], json!("cli_usage"));
+
+    // 6. Codex P2 / @muse M-z1: refined zoom trial runtime error fails closed instead of being silently skipped
+    // base = log(x), cand = 0*x; initial samples in (0, 1] are finite, zoom chases x -> 0+ and crosses <= 0
+    let log_base_val = json!({
+        "numSlots": 2,
+        "layers": [{ "constructor": "log", "args": [0] }],
+        "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+        "outputSlot": 1,
+        "ports": [{ "slot": 0, "shape": [1, 1, 1, 1] }],
+        "weights": {},
+        "inputs": { "0": [0.05] }
+    });
+    let zero_cand_val = json!({
+        "numSlots": 2,
+        "layers": [{ "constructor": "linear", "args": [0, 1, 1, false] }],
+        "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+        "outputSlot": 1,
+        "ports": [{ "slot": 0, "shape": [1, 1, 1, 1] }],
+        "weights": { "0": [0.0] },
+        "inputs": { "0": [0.05] }
+    });
+    let log_base_spec: SpecV1 = serde_json::from_value(log_base_val.clone()).unwrap();
+    let zero_cand_spec: SpecV1 = serde_json::from_value(zero_cand_val.clone()).unwrap();
+    let log_base_p = tmp_dir.join("log_base.json");
+    let zero_cand_p = tmp_dir.join("zero_cand.json");
+    std::fs::write(&log_base_p, serde_json::to_string_pretty(&log_base_val).unwrap()).unwrap();
+    std::fs::write(&zero_cand_p, serde_json::to_string_pretty(&zero_cand_val).unwrap()).unwrap();
+
+    // Prove initial sweep (depth 0) is clean (0 errors) while refined zoom (depth 5) crosses <= 0
+    let err_cfg = FuzzConfig {
+        count: 4,
+        seed: FuzzConfig::default().seed,
+        lo: -0.02,
+        hi: 2.0,
+    };
+    let rep_d0 =
+        zoom_fuzz_specs_with_tol(&log_base_spec, &zero_cand_spec, &err_cfg, 0, Some(1e9), None)
+            .unwrap();
+    assert!(rep_d0.ok && rep_d0.error_trials == 0, "expected initial sweep to be clean: {rep_d0:?}");
+
+    // Even with huge abs_tol = 1e9, a domain error on a refined zoom trial must REJECT
+    let rep_err =
+        zoom_fuzz_specs_with_tol(&log_base_spec, &zero_cand_spec, &err_cfg, 5, Some(1e9), None)
+            .unwrap();
+    assert!(!rep_err.ok, "zoom gate falsely accepted despite refined runtime error trial");
+    assert_eq!(rep_err.verdict, Some("REJECT"));
+    assert!(rep_err.error_trials >= 1);
+    assert!(rep_err.first_error.is_some());
+
+    // Exploratory mode also propagates the refined runtime error rather than silently skipping it
+    assert!(
+        zoom_fuzz_specs_with_tol(&log_base_spec, &zero_cand_spec, &err_cfg, 5, None, None).is_err()
+    );
+
+    // CLI verify --zoom --abs-tol 1e9 fails closed with exit 2 and verdict REJECT
+    let out_err_cli = Command::new(bin)
+        .args([
+            "verify",
+            log_base_p.to_str().unwrap(),
+            zero_cand_p.to_str().unwrap(),
+            "--zoom",
+            "--fuzz",
+            "4",
+            "--lo",
+            "-0.02",
+            "--hi",
+            "2.0",
+            "--zoom-depth",
+            "5",
+            "--abs-tol",
+            "1e9",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out_err_cli.status.code(), Some(2));
+    let v_err_cli: serde_json::Value = serde_json::from_slice(&out_err_cli.stdout).unwrap();
+    assert_eq!(v_err_cli["ok"], json!(false));
+    assert_eq!(v_err_cli["verdict"], json!("REJECT"));
+    assert!(v_err_cli["error_trials"].as_u64().unwrap() >= 1);
+
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
