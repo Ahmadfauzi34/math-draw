@@ -8,9 +8,11 @@ Implements the single-binary command-line interface for `math-draw`, parsing CLI
 
 - Top-level dispatcher (`run_cli`), usage text (`print_usage`), strict fail-closed argument parser (`ParsedArgs`), JSON & file I/O helpers: [`mod.rs`](mod.rs)
 - Core execution & inspection (`run`, `validate`, `verify`, `linear-equiv`, `find-op`, `smoke`): [`core_cmds.rs`](core_cmds.rs)
+- Spec-free direct math & determinism probes (`arith`, `int`, `kernel`, `soak`, `prng-check`): [`math_cmds.rs`](math_cmds.rs)
 - Runtime telemetry & temporal ops (`trace-hash`, `rollout`, `profile`, `compare`, `cost-model`): [`runtime_cmds.rs`](runtime_cmds.rs)
 - Structural graph transformations (`rewrite`, `recurse`, `mutate`, `shard`): [`graph_cmds.rs`](graph_cmds.rs)
-- Differential, numerical & bundle verification (`gradcheck`, `quant`, `weight-lab`, `bundle`): [`evidence_cmds.rs`](evidence_cmds.rs)
+- Differential, numerical & bundle verification (`gradcheck`, `diff-ref`, `quant`, `weight-lab`, `bundle`): [`evidence_cmds.rs`](evidence_cmds.rs)
+- 3D geometry domain pack (`geom <build|scene-tree|solve-ik|project|batch|selftest>`): [`geom_cmds.rs`](geom_cmds.rs)
 - Layer-4 agent-harness coordination (`harness`): [`harness_cmds.rs`](harness_cmds.rs)
 
 ## Local Contracts
@@ -31,7 +33,9 @@ Implements the single-binary command-line interface for `math-draw`, parsing CLI
 - `./target/release/math-draw smoke`
 - `./target/release/math-draw harness capabilities`
 - `./target/release/math-draw weight-lab selftest`
+- `./target/release/math-draw geom selftest`
+- `./target/release/math-draw diff-ref examples/linear-relu.json`
 
 ## Child Graph Index
 
-- Leaf domain directory; submodules listed under Ownership (`mod.rs`, `core_cmds.rs`, `runtime_cmds.rs`, `graph_cmds.rs`, `evidence_cmds.rs`, `harness_cmds.rs`).
+- Leaf domain directory; submodules listed under Ownership (`mod.rs`, `core_cmds.rs`, `math_cmds.rs`, `runtime_cmds.rs`, `graph_cmds.rs`, `evidence_cmds.rs`, `geom_cmds.rs`, `harness_cmds.rs`).

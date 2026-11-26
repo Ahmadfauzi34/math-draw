@@ -8,7 +8,12 @@ use super::{CompileState, ExpansionEvent};
 pub(super) fn is_builtin_macro(name: &str) -> bool {
     matches!(
         name,
-        "mlp" | "gated_unit" | "residual_mlp" | "transformer_ffn" | "recurrent_cell"
+        "mlp"
+            | "gated_unit"
+            | "residual_mlp"
+            | "transformer_ffn"
+            | "recurrent_cell"
+            | "attention_head"
     )
 }
 
@@ -155,6 +160,75 @@ pub(super) fn expand_builtin_macro(
             local_steps.push(StepDecl { kind: "binary".into(), layer: base_layer_idx + 2, slots: vec![s_ws, s_wx, s_sum] });
             local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 3, slots: vec![s_sum, s_act] });
             local_steps.push(StepDecl { kind: "binary".into(), layer: base_layer_idx + 4, slots: vec![s_act, s_state, out_slot] });
+        }
+        "attention_head" => {
+            if in_slots.len() < 3 {
+                return Err("macro 'attention_head' requires 3 inputs (Q, K, V)".into());
+            }
+            let _d_model = need_usize(params, "d_model")?;
+            let layout = params
+                .get("layout")
+                .and_then(|v| v.as_str())
+                .unwrap_or("seq_axis1");
+            let (s_q, s_k, s_v) = (in_slots[0], in_slots[1], in_slots[2]);
+            match layout {
+                "heads_axis1" => {
+                    // [B, H, S, D]: K^T = transpose(2,3)(K); scores = Q @ K^T; W = softmax(scores, dim=3); out = W @ V
+                    let s_tk = state.alloc.fresh_slot();
+                    let s_scores = state.alloc.fresh_slot();
+                    let s_w = state.alloc.fresh_slot();
+                    let l0 = state.alloc.fresh_layer_id();
+                    let l1 = state.alloc.fresh_layer_id();
+                    let l2 = state.alloc.fresh_layer_id();
+                    let l3 = state.alloc.fresh_layer_id();
+                    local_layers.push(LayerDecl { constructor: "transpose".into(), args: vec![l0.into(), 2usize.into(), 3usize.into()] });
+                    local_layers.push(LayerDecl { constructor: "matmul".into(), args: vec![l1.into()] });
+                    local_layers.push(LayerDecl { constructor: "softmax".into(), args: vec![l2.into(), 3usize.into()] });
+                    local_layers.push(LayerDecl { constructor: "matmul".into(), args: vec![l3.into()] });
+                    local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx, slots: vec![s_k, s_tk] });
+                    local_steps.push(StepDecl { kind: "binary".into(), layer: base_layer_idx + 1, slots: vec![s_q, s_tk, s_scores] });
+                    local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 2, slots: vec![s_scores, s_w] });
+                    local_steps.push(StepDecl { kind: "binary".into(), layer: base_layer_idx + 3, slots: vec![s_w, s_v, out_slot] });
+                }
+                "seq_axis1" => {
+                    // [B, S, D, 1] -> [B, 1, S, D], attention over axis 3, transpose back to [B, Sq, Dv, 1]
+                    let s_tq1 = state.alloc.fresh_slot();
+                    let s_tq2 = state.alloc.fresh_slot();
+                    let s_tk = state.alloc.fresh_slot();
+                    let s_scores = state.alloc.fresh_slot();
+                    let s_w = state.alloc.fresh_slot();
+                    let s_tv1 = state.alloc.fresh_slot();
+                    let s_tv2 = state.alloc.fresh_slot();
+                    let s_o = state.alloc.fresh_slot();
+                    let s_to = state.alloc.fresh_slot();
+                    let lids: Vec<usize> = (0..10).map(|_| state.alloc.fresh_layer_id()).collect();
+                    local_layers.push(LayerDecl { constructor: "transpose".into(), args: vec![lids[0].into(), 2usize.into(), 3usize.into()] });
+                    local_layers.push(LayerDecl { constructor: "transpose".into(), args: vec![lids[1].into(), 1usize.into(), 2usize.into()] });
+                    local_layers.push(LayerDecl { constructor: "transpose".into(), args: vec![lids[2].into(), 1usize.into(), 3usize.into()] });
+                    local_layers.push(LayerDecl { constructor: "matmul".into(), args: vec![lids[3].into()] });
+                    local_layers.push(LayerDecl { constructor: "softmax".into(), args: vec![lids[4].into(), 3usize.into()] });
+                    local_layers.push(LayerDecl { constructor: "transpose".into(), args: vec![lids[5].into(), 2usize.into(), 3usize.into()] });
+                    local_layers.push(LayerDecl { constructor: "transpose".into(), args: vec![lids[6].into(), 1usize.into(), 2usize.into()] });
+                    local_layers.push(LayerDecl { constructor: "matmul".into(), args: vec![lids[7].into()] });
+                    local_layers.push(LayerDecl { constructor: "transpose".into(), args: vec![lids[8].into(), 1usize.into(), 2usize.into()] });
+                    local_layers.push(LayerDecl { constructor: "transpose".into(), args: vec![lids[9].into(), 2usize.into(), 3usize.into()] });
+                    local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx, slots: vec![s_q, s_tq1] });
+                    local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 1, slots: vec![s_tq1, s_tq2] });
+                    local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 2, slots: vec![s_k, s_tk] });
+                    local_steps.push(StepDecl { kind: "binary".into(), layer: base_layer_idx + 3, slots: vec![s_tq2, s_tk, s_scores] });
+                    local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 4, slots: vec![s_scores, s_w] });
+                    local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 5, slots: vec![s_v, s_tv1] });
+                    local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 6, slots: vec![s_tv1, s_tv2] });
+                    local_steps.push(StepDecl { kind: "binary".into(), layer: base_layer_idx + 7, slots: vec![s_w, s_tv2, s_o] });
+                    local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 8, slots: vec![s_o, s_to] });
+                    local_steps.push(StepDecl { kind: "unary".into(), layer: base_layer_idx + 9, slots: vec![s_to, out_slot] });
+                }
+                other => {
+                    return Err(format!(
+                        "attention_head layout must be 'seq_axis1' or 'heads_axis1', got '{other}'"
+                    ));
+                }
+            }
         }
         _ => {
             return Err(format!("unknown built-in macro '{macro_name}'"));

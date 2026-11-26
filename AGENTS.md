@@ -25,7 +25,7 @@ This repository follows the graph (Documentation-as-Contract) hierarchical syste
 - **Deterministic Backend**: All tensor execution runs deterministically on `Device::flex()`. Runtime autodiff uses Burn's `AutodiffBackend` on `flex` without requiring CUDA/GPU toolchains.
 - **Zero-Warning & Locked Dependency Gate**: Every build and test gate MUST pass with `--locked` and zero compiler warnings in `cargo test --locked` and `cargo build --release --locked`.
 - **Fail-Closed Validation**: Untrusted or malformed graph specs must fail closed before execution (unknown constructors, arity/arg mismatches, shape/dtype errors, canonical registry ID uniqueness, division-by-zero, integer overflow, NaN/Inf inputs).
-- **Backward-Compatible Crate Facade**: [`src/lib.rs`](src/lib.rs) must preserve root facade module paths (`engine`, `error`, `trace`, `rollout`, `profile`, `cost_model`, `validate`, `composer`, `rewrite`, `mutate`, `shard`, `recurse`, `verify`, `linear_equiv`, `gradcheck`, `quant`, `weight_lab`, `bundle`) so integration tests and external library callers never break.
+- **Backward-Compatible Crate Facade**: [`src/lib.rs`](src/lib.rs) must preserve root facade module paths (`engine`, `direct_math`, `error`, `trace`, `rollout`, `profile`, `cost_model`, `validate`, `composer`, `liveness`, `grad_spec`, `rewrite`, `mutate`, `shard`, `recurse`, `verify`, `diff_ref`, `geom3`, `linear_equiv`, `gradcheck`, `quant`, `soak`, `weight_lab`, `bundle`) so integration tests and external library callers never break.
 - **95-Constructor Alignment**: Constructor inventory in [`src/catalog.rs`](src/catalog.rs), shape inference in [`src/graph/validate.rs`](src/graph/validate.rs), and Burn execution kernels in [`src/layers/`](src/layers/AGENTS.md) must always stay in strict 1-to-1 parity across all 95 constructors (covering `unary`, `binary`, and `ternary` step arities).
 
 ## Work Guidance
@@ -37,11 +37,12 @@ This repository follows the graph (Documentation-as-Contract) hierarchical syste
 
 ## Verification
 
-- `cargo test --locked` (runs all 15 integration suites in [`tests/integration.rs`](tests/integration.rs), including the 27-check smoke suite)
+- `cargo test --locked` (runs all 21 integration suites in [`tests/integration.rs`](tests/integration.rs), including the 33-check smoke suite)
 - `cargo clippy --all-targets --locked`
 - `cargo build --release --locked`
 - `./target/release/math-draw smoke`
 - `./target/release/math-draw weight-lab selftest`
+- `./target/release/math-draw geom selftest`
 
 ## Child Graph Index
 

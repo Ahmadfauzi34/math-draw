@@ -12,6 +12,8 @@ pub mod spec;
 
 // Backward-compatible root module facades (matching ai_agent_builder style)
 pub use es as recurse;
-pub use evidence::{bundle, gradcheck, linear_equiv, quant, verify, weight_lab};
-pub use graph::{composer, mutate, rewrite, shard, validate};
-pub use runtime::{cost_model, engine, profile, rollout, trace};
+pub use evidence::{
+    bundle, diff_ref, geom3, gradcheck, linear_equiv, quant, soak, verify, weight_lab,
+};
+pub use graph::{composer, grad_spec, liveness, mutate, rewrite, shard, validate};
+pub use runtime::{cost_model, direct_math, engine, profile, rollout, trace};

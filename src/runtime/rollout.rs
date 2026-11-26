@@ -365,6 +365,16 @@ pub fn rollout_unroll(
     steps: usize,
     state_port_req: Option<&str>,
 ) -> Result<RolloutUnrollReport, String> {
+    rollout_unroll_with_options(spec, expansion, steps, state_port_req, false)
+}
+
+pub fn rollout_unroll_with_options(
+    spec: &SpecV1,
+    expansion: Option<&ExpansionReceipt>,
+    steps: usize,
+    state_port_req: Option<&str>,
+    compact_slots: bool,
+) -> Result<RolloutUnrollReport, String> {
     if steps == 0 {
         return Err("rollout unroll requires steps >= 1".into());
     }
@@ -409,7 +419,7 @@ pub fn rollout_unroll(
             .ok_or_else(|| format!("unroll: outputSlot {} missing after tick", spec.output_slot))?;
     }
 
-    let unrolled = SpecV1 {
+    let mut unrolled = SpecV1 {
         num_slots: next_slot.max(cur_state_slot + 1),
         layers: spec.layers.clone(),
         steps: unrolled_steps_vec,
@@ -421,6 +431,9 @@ pub fn rollout_unroll(
     let val = validate_spec(&unrolled, false);
     if !val.valid {
         return Err(format!("unrolled spec failed validation: {:?}", val.code));
+    }
+    if compact_slots {
+        unrolled = crate::graph::liveness::compact_slots_by_liveness(&unrolled)?.spec;
     }
 
     Ok(RolloutUnrollReport {

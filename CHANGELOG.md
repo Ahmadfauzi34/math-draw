@@ -5,6 +5,41 @@ All notable changes to `math-draw` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-11-26
+
+### Added
+- **Independent Pure-Rust `f64` Differential Oracle (`src/evidence/diff_ref/`, `math-draw diff-ref`)**:
+  - Added an independent, Burn-free `f64` interpreter (`run_reference_f64`, `diff_ref_spec`, `SUPPORTED_REF_OPS`) covering all **87 `f32` constructors** (`nn_ops.rs`: 44 neural/conv/norm/pool/activation/custom/binary ops; `math_ops.rs`: 43 numeric/transform/linalg/statistics/reduction/probability/comparison ops, incl. ternary `fma`).
+  - Added `math-draw diff-ref <spec.json> [--cases <cases.json>] [--ref <ref.json>] [--tol 1e-5]` supporting both the built-in `pure_rust_f64` oracle and external `--ref` JSON vectors (`[num...]`, `[[num...]...]`, `{"outputs": ...}`, `{"cases": [{"expected": [...]}]}`), returning `"PASS"` (exit `0`) or `"SIGNAL"` (exit `2`) with fail-closed validation on non-finite/non-positive tolerances, mismatched lengths, or unsupported integer ops without `--ref`.
+  - Added strict fail-closed `diff_ref` stage to `harness run-workflow` and updated `harness capabilities`.
+- **3D Geometry Domain Pack (`src/evidence/geom3/`, `src/cli/geom_cmds.rs`, `math-draw geom`)**:
+  - Added pure `f64` row-major 4×4 and 3×3 geometry math (`math.rs`): `rot_x4`/`rot_y4`/`rot_z4`, Rodrigues `rot_axis_angle4`, `euler4`, `quat_from_euler`, `quat_to_mat4`, `translate4`, `scale4`, recursive `repeat` (`depth <= 1024`), `normal_mat3` (inverse-transpose), `look_at4`, `perspective4`, and Sutherland–Hodgman near-plane triangle clipping (`clip_triangle_near`).
+  - Added `math-draw geom build <chain.json> [--compose] [--out <spec.json>]`, `scene-tree <tree.json> [--out <spec.json>]` (with cycle/duplicate/unknown-parent rejection), `solve-ik <ik.json> [--out <spec.json>]` (Polyak-stepped backtracking GD with joint limits and Burn `Device::flex()` end-effector verification), `project <model.json>` (single-vertex `linear(4,4)`), `batch <model.json>` (block-diagonal `linear(4N,4N)` chunked at `BATCH_MAX = 63`), and `selftest` (17/17 checks).
+- **Expanded Smoke Suite (#32–#33) & Integration Tests (#20–#21)**:
+  - Expanded in-binary smoke suite from 31 to 33 checks (`33/33`) and crate integration tests from 19 to 21 suites (`21/21`, including differential verification across all 87 `f32` constructors and full `geom` CLI/workflow coverage).
+
+## [0.8.0] - 2026-11-25
+
+### Added
+- **Graph Liveness, SSA Normalization, Slot Compaction & Deterministic Auto-Repair (`src/graph/liveness.rs`, `src/graph/validate.rs`, `src/runtime/rollout.rs`)**:
+  - Embedded pure static slot liveness analysis (`peak_bytes`, `peak_step`, `peak_slots`, `live_before`, per-slot `def_step`/`last_use_step`/`bytes` across `f32`/`i64` and `unary`/`binary`/`ternary` steps) into `validate --explain`.
+  - Added `ssa_normalize_spec`, linear-scan physical register compaction `compact_slots_by_liveness` (`--compact-slots` on `recurse expand`, `recurse grad-spec`, `rollout unroll`, and harness `compile`/`unroll`), and deterministic 3-pass `auto_repair_spec` (`--auto-repair` on `recurse expand` and harness `compile`) emitting auditable remediation receipts (`insert_dtype_boundary_cast`, `insert_terminal_intToFloat`, `drain_unused_port`, `recursive_shard_linear`).
+- **6th Built-In Macro `attention_head` (`src/graph/composer/macros.rs`)**:
+  - Added `attention_head` supporting both `seq_axis1` (`[B, S, D, 1]`, including cross-attention `Sq != Skv`) and `heads_axis1` (`[B, H, S, D]`) layouts.
+- **Symbolic In-Graph VJP & 2nd-Order HVP Compiler (`src/graph/grad_spec.rs`, `math-draw recurse grad-spec`)**:
+  - Compiles forward `v1`/`v2` specs into standalone runnable `SpecV1` backward graphs (`--order 1` VJP) or 2nd-order Hessian-Vector Product graphs (`--order 2 --hvp-vec ...`) with symbolic `--wrt <slot|name>` and optional `--compact-slots` across 23 differentiable constructors (`linear`, `add`, `sub`, `mul`, `fma`, `div`, `sqrt`, `exp`, `log`, `sin`, `cos`, `sigmoid`, `tanh`, `transpose`, `matmul`, `concat`, `shift*`, `gelu`, `mish`, `swiGlu`).
+- **Determinism Soak Prover, PRNG Stream Certification & Quantization Tree Search (`src/evidence/soak.rs`, `src/es/search.rs`)**:
+  - `math-draw soak <spec.json> [--runs 100]`: proves N-run bit-identical execution on `Device::flex()` via canonical SHA-256 output digests.
+  - `math-draw prng-check [mulberry32|xorshift64|pcg32|philox4x32] [seed] [count] [--out <manifest.json>]` & `math-draw prng-check verify <manifest.json>`: certifies and re-verifies deterministic PRNG streams.
+  - `math-draw recurse search ... [--quant-tol T] [--quant-scheme q8-per-block|int8|fp16]`: explores equivalence-verified quantization branches alongside algebraic rewrites (`search_graph_tree_with_options`, scoring `active_weight_bytes`).
+- **Direct Spec-Free Engine Math CLIs (`src/runtime/direct_math.rs`, `src/cli/math_cmds.rs`)**:
+  - `math-draw arith <op> <a> [b] | --batch <ops.json>`: spec-free `Device::flex()` f32 vector/matrix/stats/probability arithmetic with length-1 broadcast, precision warnings, and `"$prev"`/`"$<idx>"` batch register chaining.
+  - `math-draw int <add|sub|mul|div|rem|matmul|to-f32|from-f32> ... [--wrap] [--allow-inexact] | --batch <ops.json>`: exact checked `i64` arithmetic & casts with stringified `i64` JSON outputs.
+  - `math-draw kernel <sin|cos|tan|floor|ceil|round|atan2|powf|hypot|fma> ... | --batch <ops.json>`: Lane-E elementwise kernels with strict same-length (no-broadcast) validation.
+- **Expanded Harness Workflow Stages, Smoke Suite (#28–#31) & Integration Tests (#16–#19)**:
+  - Added strict fail-closed `grad_spec`, `soak`, `gradcheck`, `shard`, and `bundle_export` stages to `harness run-workflow` plus `auto_repair`/`compact_slots`/`quant_tol` options on `compile`/`unroll`/`search_rewrites`, and updated `harness capabilities`.
+  - Expanded in-binary smoke suite from 27 to 31 checks (`31/31`) and crate integration tests from 15 to 19 suites (`19/19`).
+
 ## [0.7.0] - 2026-11-19
 
 ### Added
@@ -13,8 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `(mu, lambda)` elitist selection (`EsStrategyKind::MuLambda`, `--strategy mu-lambda [--mu N]`) alongside antithetic `OpenEs` (`--strategy openes`).
   - Added per-generation population diagnostics (`worst_loss`, `mean_loss`, `std_loss`, `improvement`, `stagnation`, population `diversity`, `mean_norm`, `best_norm`, and health `flags`: `stagnation`, `low_diversity`, `non_finite_loss`) to `recurse fit` and harness workflow `fit` stages.
 - **Portable Program Bundle & Canonical Parameter Binding (`src/evidence/bundle.rs`, `math-draw bundle`)**:
-  - `math-draw bundle binding <spec.json> [--out <binding.json>]`: computes unique-first-use parameter ownership (`burn-math.graph-parameter-binding.v1`) deduplicating weight-tied layers across `spec.steps`, plus weight/input-invariant `program_identity` (`sha256:...`), `read_bound_flat_weights`, and `apply_bound_flat_weights`.
-  - `math-draw bundle export <spec.json> [--no-run] [--attest <stage>]... [--out <bundle.json>]`: packages `SpecV1`, parameter binding, optional live `Device::flex()` execution receipt, and SHA-256 provenance attestations into a self-contained `burn-math.program-bundle.v1` artifact (`bundle_digest`).
+  - `math-draw bundle binding <spec.json>`: computes unique-first-use parameter ownership (`burn-math.graph-parameter-binding.v1`) deduplicating weight-tied layers across `spec.steps`, plus weight/input-invariant `program_identity` (`sha256:...`), `read_bound_flat_weights`, and `apply_bound_flat_weights`.
+  - `math-draw bundle export <spec.json> [--no-exec] [--attest <stage>]... [--out <bundle.json>]`: packages `SpecV1`, parameter binding, optional live `Device::flex()` execution receipt, and SHA-256 provenance attestations into a self-contained `burn-math.program-bundle.v1` artifact (`bundle_sha256`).
   - `math-draw bundle verify <bundle.json>`: performs 6-check cryptographic integrity and live replay verification (`schema_version`, `bundle_digest`, `static_validation`, `parameter_binding`, `execution_replay`, `attestation_provenance`), failing closed on weight, receipt, schema, or attestation tampering.
 - **Structured Error Taxonomy & JSON Error Envelopes (`src/error.rs`, `src/cli/`, `src/harness/workflow.rs`)**:
   - Added [`math_draw::error`](src/error.rs) exposing 31 machine-readable `ErrorCode` variants (`snake_case`), `MathDrawError`, backward-compatible `ErrorEnvelope` (`ok: false`, `code`, `error`, optional `stage`, optional `hint`), and deterministic `classify_error`.

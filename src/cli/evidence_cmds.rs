@@ -8,6 +8,7 @@ use super::{
     read_cases_file, write_pretty_json,
 };
 use crate::bundle::{ProgramBundle, compute_parameter_binding, export_bundle, verify_bundle};
+use crate::diff_ref::diff_ref_spec;
 use crate::error::ErrorCode;
 use crate::gradcheck::gradcheck_spec;
 use crate::quant::{BudgetMode, QuantScheme, quant_budget, quant_verify};
@@ -681,3 +682,121 @@ pub(super) fn handle_bundle(rest: &[String]) -> ExitCode {
         ),
     }
 }
+
+fn parse_f64_array(arr: &[serde_json::Value], ctx: &str) -> Result<Vec<f64>, String> {
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        let f = v
+            .as_f64()
+            .ok_or_else(|| format!("{ctx}[{i}]: expected finite number, got {v}"))?;
+        if !f.is_finite() {
+            return Err(format!("{ctx}[{i}]: non-finite number"));
+        }
+        out.push(f);
+    }
+    Ok(out)
+}
+
+fn parse_external_ref_json(val: &serde_json::Value) -> Result<Vec<Vec<f64>>, String> {
+    if let Some(arr) = val.as_array() {
+        if arr.is_empty() {
+            return Err("external ref JSON array must not be empty".into());
+        }
+        if arr[0].is_array() {
+            let mut out = Vec::with_capacity(arr.len());
+            for (ci, item) in arr.iter().enumerate() {
+                let inner = item
+                    .as_array()
+                    .ok_or_else(|| format!("ref[{ci}]: expected array of numbers"))?;
+                out.push(parse_f64_array(inner, &format!("ref[{ci}]"))?);
+            }
+            return Ok(out);
+        }
+        return Ok(vec![parse_f64_array(arr, "ref")?]);
+    }
+    if let Some(obj) = val.as_object() {
+        if let Some(outputs) = obj.get("outputs") {
+            return parse_external_ref_json(outputs);
+        }
+        if let Some(cases) = obj.get("cases").and_then(|v| v.as_array()) {
+            let mut out = Vec::with_capacity(cases.len());
+            for (ci, c) in cases.iter().enumerate() {
+                let exp = c
+                    .get("expected")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| format!("ref.cases[{ci}]: missing 'expected' numeric array"))?;
+                out.push(parse_f64_array(exp, &format!("ref.cases[{ci}].expected"))?);
+            }
+            return Ok(out);
+        }
+    }
+    Err(
+        "external ref JSON must be [num...], [[num...]...], {\"outputs\": ...}, or {\"cases\": [{\"expected\": [...]}]}"
+            .into(),
+    )
+}
+
+pub(super) fn handle_diff_ref(rest: &[String]) -> ExitCode {
+    let usage =
+        "usage: math-draw diff-ref <spec.json> [--cases <cases.json>] [--ref <ref.json>] [--tol 1e-5]";
+    let parsed = match ParsedArgs::parse(rest, &["--cases", "--ref", "--tol"], &[]) {
+        Ok(p) => p,
+        Err(e) => return err_exit_typed(&e),
+    };
+    if let Err(e) = parsed.ensure_max_positionals(1, usage) {
+        return err_exit_typed(&e);
+    }
+    let Some(spec_file) = parsed.positionals.first() else {
+        return err_exit_usage("diff_ref", usage);
+    };
+    let loaded = match load_spec_file(Path::new(spec_file)) {
+        Ok(l) => l,
+        Err(e) => return err_exit_stage("load_spec", &e),
+    };
+    let tol = match parsed.parse_f64_pos("--tol", 1e-5) {
+        Ok(v) => v,
+        Err(e) => return err_exit_typed(&e),
+    };
+    let cases = if let Some(cf) = parsed.str_opt("--cases") {
+        match read_cases_file(cf) {
+            Ok(c) => Some(c),
+            Err(e) => return err_exit_typed(&e),
+        }
+    } else {
+        None
+    };
+    let ext_ref = if let Some(rf) = parsed.str_opt("--ref") {
+        let raw = match std::fs::read_to_string(rf) {
+            Ok(r) => r,
+            Err(e) => {
+                return err_exit_code(
+                    ErrorCode::IoReadFailed,
+                    "diff_ref",
+                    &format!("cannot read ref JSON '{rf}': {e}"),
+                );
+            }
+        };
+        let val: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                return err_exit_code(
+                    ErrorCode::JsonParseFailed,
+                    "diff_ref",
+                    &format!("invalid ref JSON '{rf}': {e}"),
+                );
+            }
+        };
+        match parse_external_ref_json(&val) {
+            Ok(v) => Some(v),
+            Err(e) => return err_exit_stage("diff_ref", &e),
+        }
+    } else {
+        None
+    };
+
+    match diff_ref_spec(&loaded.spec, cases.as_deref(), ext_ref.as_deref(), tol) {
+        Ok(rep) => print_json_exit(&rep, rep.ok),
+        Err(e) => err_exit_stage("diff_ref", &e),
+    }
+}
+
