@@ -1,9 +1,9 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::engine::get_layer_weight_len;
-use crate::spec::{SpecV1, sha256_f32_slice, sha256_json};
+use crate::spec::{LayerDecl, PortDecl, SpecV1, StepDecl, sha256_f32_slice, sha256_json};
 use crate::trace::{DEFAULT_MAX_TENSOR_BYTES, trace_hash_spec};
 use crate::validate::validate_spec;
 
@@ -11,7 +11,100 @@ pub const PARAMETER_BINDING_SCHEMA: &str = "burn-math.graph-parameter-binding.v1
 pub const PARAMETER_ORDERING: &str = "unique_first_use_graph_plan";
 pub const PROGRAM_BUNDLE_SCHEMA: &str = "burn-math.program-bundle.v1";
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictLayerDecl {
+    constructor: String,
+    #[serde(default)]
+    args: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictStepDecl {
+    kind: String,
+    layer: usize,
+    slots: Vec<usize>,
+}
+
+fn default_strict_role() -> String {
+    "observation".to_string()
+}
+
+fn default_strict_layout() -> String {
+    "feature_axis1_singleton".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictPortDecl {
+    slot: usize,
+    #[serde(default = "default_strict_role")]
+    role: String,
+    shape: [usize; 4],
+    #[serde(default = "default_strict_layout")]
+    layout: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StrictSpecV1 {
+    num_slots: usize,
+    #[serde(default)]
+    layers: Vec<StrictLayerDecl>,
+    #[serde(default)]
+    steps: Vec<StrictStepDecl>,
+    output_slot: usize,
+    #[serde(default)]
+    ports: Vec<StrictPortDecl>,
+    #[serde(default)]
+    weights: BTreeMap<String, Vec<f32>>,
+    #[serde(default)]
+    inputs: BTreeMap<String, Vec<serde_json::Value>>,
+}
+
+fn deserialize_strict_spec<'de, D>(deserializer: D) -> Result<SpecV1, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = StrictSpecV1::deserialize(deserializer)?;
+    Ok(SpecV1 {
+        num_slots: s.num_slots,
+        layers: s
+            .layers
+            .into_iter()
+            .map(|l| LayerDecl {
+                constructor: l.constructor,
+                args: l.args,
+            })
+            .collect(),
+        steps: s
+            .steps
+            .into_iter()
+            .map(|st| StepDecl {
+                kind: st.kind,
+                layer: st.layer,
+                slots: st.slots,
+            })
+            .collect(),
+        output_slot: s.output_slot,
+        ports: s
+            .ports
+            .into_iter()
+            .map(|p| PortDecl {
+                slot: p.slot,
+                role: p.role,
+                shape: p.shape,
+                layout: p.layout,
+            })
+            .collect(),
+        weights: s.weights,
+        inputs: s.inputs,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GraphParameterOwner {
     pub layer_index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -25,6 +118,7 @@ pub struct GraphParameterOwner {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GraphParameterBinding {
     pub schema: String,
     pub ordering: String,
@@ -37,6 +131,7 @@ pub struct GraphParameterBinding {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct BundleExecutionReceipt {
     pub output_shape: [usize; 4],
     pub output_values: Vec<f32>,
@@ -46,6 +141,7 @@ pub struct BundleExecutionReceipt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct BundleAttestation {
     pub label: String,
     pub kind: String,
@@ -54,9 +150,11 @@ pub struct BundleAttestation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ProgramBundle {
     pub schema: String,
     pub program_identity: String,
+    #[serde(deserialize_with = "deserialize_strict_spec")]
     pub spec: SpecV1,
     pub parameter_binding: GraphParameterBinding,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -668,4 +766,223 @@ pub fn verify_bundle(bundle: &ProgramBundle) -> BundleVerifyReport {
         replayed_execution,
         checks,
     }
+}
+
+fn strip_unknown_keys(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    prefix: &str,
+    allowed: &[&str],
+    unknowns: &mut Vec<String>,
+) {
+    let bad_keys: Vec<String> = obj
+        .keys()
+        .filter(|k| !allowed.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    for k in bad_keys {
+        obj.remove(&k);
+        if prefix.is_empty() {
+            unknowns.push(k);
+        } else {
+            unknowns.push(format!("{prefix}.{k}"));
+        }
+    }
+}
+
+fn collect_and_strip_unknown_bundle_fields(val: &mut serde_json::Value) -> Vec<String> {
+    let mut unknowns = Vec::new();
+    let Some(root) = val.as_object_mut() else {
+        return unknowns;
+    };
+    strip_unknown_keys(
+        root,
+        "",
+        &[
+            "schema",
+            "program_identity",
+            "spec",
+            "parameter_binding",
+            "reference_execution",
+            "attestations",
+            "bundle_sha256",
+        ],
+        &mut unknowns,
+    );
+
+    if let Some(spec_obj) = root.get_mut("spec").and_then(|v| v.as_object_mut()) {
+        strip_unknown_keys(
+            spec_obj,
+            "spec",
+            &[
+                "numSlots",
+                "layers",
+                "steps",
+                "outputSlot",
+                "ports",
+                "weights",
+                "inputs",
+            ],
+            &mut unknowns,
+        );
+        if let Some(layers) = spec_obj.get_mut("layers").and_then(|v| v.as_array_mut()) {
+            for (i, item) in layers.iter_mut().enumerate() {
+                if let Some(obj) = item.as_object_mut() {
+                    strip_unknown_keys(
+                        obj,
+                        &format!("spec.layers[{i}]"),
+                        &["constructor", "args"],
+                        &mut unknowns,
+                    );
+                }
+            }
+        }
+        if let Some(steps) = spec_obj.get_mut("steps").and_then(|v| v.as_array_mut()) {
+            for (i, item) in steps.iter_mut().enumerate() {
+                if let Some(obj) = item.as_object_mut() {
+                    strip_unknown_keys(
+                        obj,
+                        &format!("spec.steps[{i}]"),
+                        &["kind", "layer", "slots"],
+                        &mut unknowns,
+                    );
+                }
+            }
+        }
+        if let Some(ports) = spec_obj.get_mut("ports").and_then(|v| v.as_array_mut()) {
+            for (i, item) in ports.iter_mut().enumerate() {
+                if let Some(obj) = item.as_object_mut() {
+                    strip_unknown_keys(
+                        obj,
+                        &format!("spec.ports[{i}]"),
+                        &["slot", "role", "shape", "layout"],
+                        &mut unknowns,
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(pb_obj) = root
+        .get_mut("parameter_binding")
+        .and_then(|v| v.as_object_mut())
+    {
+        strip_unknown_keys(
+            pb_obj,
+            "parameter_binding",
+            &[
+                "schema",
+                "ordering",
+                "program_identity",
+                "total_params",
+                "trainable_params",
+                "stateless_layers_count",
+                "unique_referenced_layers",
+                "owners",
+            ],
+            &mut unknowns,
+        );
+        if let Some(owners) = pb_obj.get_mut("owners").and_then(|v| v.as_array_mut()) {
+            for (i, item) in owners.iter_mut().enumerate() {
+                if let Some(obj) = item.as_object_mut() {
+                    strip_unknown_keys(
+                        obj,
+                        &format!("parameter_binding.owners[{i}]"),
+                        &[
+                            "layer_index",
+                            "registry_id",
+                            "constructor",
+                            "offset",
+                            "len",
+                            "trainable",
+                            "explicit_weights",
+                            "weight_sha256",
+                        ],
+                        &mut unknowns,
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(exec_obj) = root
+        .get_mut("reference_execution")
+        .and_then(|v| v.as_object_mut())
+    {
+        strip_unknown_keys(
+            exec_obj,
+            "reference_execution",
+            &[
+                "output_shape",
+                "output_values",
+                "outputs_sha256",
+                "trace_sha256",
+                "captured_steps",
+            ],
+            &mut unknowns,
+        );
+    }
+
+    if let Some(atts) = root.get_mut("attestations").and_then(|v| v.as_array_mut()) {
+        for (i, item) in atts.iter_mut().enumerate() {
+            if let Some(obj) = item.as_object_mut() {
+                strip_unknown_keys(
+                    obj,
+                    &format!("attestations[{i}]"),
+                    &["label", "kind", "subject_identity", "digest"],
+                    &mut unknowns,
+                );
+            }
+        }
+    }
+
+    unknowns.sort();
+    unknowns
+}
+
+/// Strictly parse and verify raw JSON bundle bytes.
+///
+/// Rejects unknown/injected JSON fields anywhere in the bundle or nested `spec`
+/// (`spec.layers[*]`, `spec.steps[*]`, `spec.ports[*]`, etc.) with `bundle_integrity_failed`
+/// so extra unhashed metadata cannot be smuggled into a verified bundle.
+pub fn verify_bundle_json(raw: &str) -> Result<(ProgramBundle, BundleVerifyReport), String> {
+    let mut val: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("invalid JSON: {e}"))?;
+    let unknowns = collect_and_strip_unknown_bundle_fields(&mut val);
+    if unknowns.is_empty() {
+        let bundle: ProgramBundle = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+        let rep = verify_bundle(&bundle);
+        return Ok((bundle, rep));
+    }
+
+    let bundle: ProgramBundle = serde_json::from_value(val).map_err(|e| {
+        format!(
+            "{e}; also found unexpected unknown field(s) in bundle payload: {}",
+            unknowns.join(", ")
+        )
+    })?;
+    let mut rep = verify_bundle(&bundle);
+    let extra_msg = format!(
+        "unexpected unknown field(s) in bundle payload: {}",
+        unknowns.join(", ")
+    );
+    if let Some(chk) = rep
+        .checks
+        .iter_mut()
+        .find(|c| c.name == "bundle_integrity")
+    {
+        if chk.passed {
+            chk.passed = false;
+            chk.code = Some("bundle_integrity_failed".to_string());
+            chk.detail = extra_msg;
+        } else {
+            chk.detail = format!("{}; {extra_msg}", chk.detail);
+        }
+    }
+    rep.ok = false;
+    rep.code = rep
+        .checks
+        .iter()
+        .find(|c| !c.passed)
+        .and_then(|c| c.code.clone());
+    Ok((bundle, rep))
 }

@@ -38,7 +38,7 @@ This repository follows the graph (Documentation-as-Contract) hierarchical syste
 
 ## Verification
 
-- `cargo test --locked` (runs all 22 integration suites in [`tests/integration.rs`](tests/integration.rs), including the 33-check smoke suite)
+- `cargo test --locked` (runs all 23 integration suites in [`tests/integration.rs`](tests/integration.rs), including the 33-check smoke suite)
 - `cargo clippy --all-targets --locked`
 - `cargo build --release --locked`
 - `./target/release/math-draw smoke`

@@ -14,7 +14,8 @@ use crate::smoke::run_smoke_suite;
 use crate::spec::load_spec_file;
 use crate::validate::validate_spec;
 use crate::verify::{
-    FuzzConfig, default_cases_from_spec, generate_fuzz_cases, verify_specs, zoom_fuzz_specs,
+    FuzzConfig, default_cases_from_spec, generate_fuzz_cases, verify_specs,
+    zoom_fuzz_specs_with_tol,
 };
 
 pub(super) fn handle_run(rest: &[String]) -> ExitCode {
@@ -86,6 +87,13 @@ pub(super) fn handle_verify(rest: &[String]) -> ExitCode {
     if parsed.positionals.len() < 2 {
         return err_exit_usage("verify", usage);
     }
+    if parsed.has("--zoom") && parsed.has("--cases") {
+        return err_exit_code(
+            ErrorCode::CliUsage,
+            "cli_parse",
+            "verify --zoom cannot be combined with --cases",
+        );
+    }
     let base = match load_spec_file(Path::new(&parsed.positionals[0])) {
         Ok(l) => l.spec,
         Err(e) => return err_exit_stage("load_spec", &e),
@@ -131,7 +139,24 @@ pub(super) fn handle_verify(rest: &[String]) -> ExitCode {
             Ok(v) => v,
             Err(e) => return err_exit_typed(&e),
         };
-        match zoom_fuzz_specs(&base, &cand, &FuzzConfig { count, seed, lo, hi }, zoom_depth) {
+        let zoom_abs_tol = if parsed.has("--abs-tol") {
+            Some(abs_tol)
+        } else {
+            None
+        };
+        let zoom_rel_tol = if parsed.has("--rel-tol") {
+            Some(rel_tol)
+        } else {
+            None
+        };
+        match zoom_fuzz_specs_with_tol(
+            &base,
+            &cand,
+            &FuzzConfig { count, seed, lo, hi },
+            zoom_depth,
+            zoom_abs_tol,
+            zoom_rel_tol,
+        ) {
             Ok(rep) => return print_json_exit(&rep, rep.ok),
             Err(e) => return err_exit_stage("verify", &e),
         }

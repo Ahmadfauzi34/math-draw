@@ -7,7 +7,7 @@ use super::{
     ParsedArgs, err_exit_code, err_exit_stage, err_exit_typed, err_exit_usage, print_json_exit,
     read_cases_file, write_pretty_json,
 };
-use crate::bundle::{ProgramBundle, compute_parameter_binding, export_bundle, verify_bundle};
+use crate::bundle::{compute_parameter_binding, export_bundle, verify_bundle_json};
 use crate::diff_ref::diff_ref_spec;
 use crate::error::ErrorCode;
 use crate::gradcheck::gradcheck_spec;
@@ -656,8 +656,8 @@ pub(super) fn handle_bundle(rest: &[String]) -> ExitCode {
                     );
                 }
             };
-            let bundle: ProgramBundle = match serde_json::from_str(&raw) {
-                Ok(b) => b,
+            let (bundle, rep) = match verify_bundle_json(&raw) {
+                Ok(res) => res,
                 Err(e) => {
                     return err_exit_code(
                         ErrorCode::BundleInvalid,
@@ -666,7 +666,6 @@ pub(super) fn handle_bundle(rest: &[String]) -> ExitCode {
                     );
                 }
             };
-            let rep = verify_bundle(&bundle);
             if rep.ok
                 && let Some(op) = parsed.str_opt("--out-spec")
                 && let Err(e) = write_pretty_json(op, &bundle.spec)

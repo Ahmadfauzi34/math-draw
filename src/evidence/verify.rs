@@ -289,14 +289,26 @@ pub struct ZoomLevelRecord {
     pub max_abs_error: f64,
 }
 
+pub const MAX_ZOOM_DEPTH: usize = 64;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ZoomFuzzReport {
     pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<&'static str>,
     pub seed: u64,
     pub zoom_depth: usize,
     pub samples_per_level: usize,
     pub initial_max_abs_error: f64,
     pub zoomed_max_abs_error: f64,
+    pub zoomed_max_rel_error: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abs_tol: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rel_tol: Option<f64>,
+    pub error_trials: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_error: Option<String>,
     pub amplification_ratio: Option<f64>,
     pub worst_case_input: BTreeMap<String, Vec<Value>>,
     pub zoom_history: Vec<ZoomLevelRecord>,
@@ -305,14 +317,38 @@ pub struct ZoomFuzzReport {
 /// Recursive Adversarial Interval Narrowing (Zoom Fuzzing):
 /// Sweeps initial fuzz cases at depth 0, then iteratively narrows a box (`radius *= 0.5`)
 /// around the input case that maximizes `||Base(x) - Cand(x)||_inf`.
+///
+/// Exploratory mode (no tolerance gate). Use [`zoom_fuzz_specs_with_tol`] when enforcing
+/// fail-closed `abs_tol` / `rel_tol` acceptance thresholds.
 pub fn zoom_fuzz_specs(
     base: &SpecV1,
     cand: &SpecV1,
     cfg: &FuzzConfig,
     zoom_depth: usize,
 ) -> Result<ZoomFuzzReport, String> {
+    zoom_fuzz_specs_with_tol(base, cand, cfg, zoom_depth, None, None)
+}
+
+/// Adversarial Zoom Fuzzing with optional fail-closed `abs_tol` / `rel_tol` acceptance gating.
+///
+/// When `abs_tol` and/or `rel_tol` is `Some(_)`, any evaluated sample (initial or zoomed)
+/// that violates tolerance or encounters a runtime/non-finite error produces `ok: false`
+/// and `verdict: Some("REJECT")`.
+pub fn zoom_fuzz_specs_with_tol(
+    base: &SpecV1,
+    cand: &SpecV1,
+    cfg: &FuzzConfig,
+    zoom_depth: usize,
+    abs_tol: Option<f64>,
+    rel_tol: Option<f64>,
+) -> Result<ZoomFuzzReport, String> {
     if cfg.count == 0 {
         return Err("zoom_fuzz: fuzz count must be >= 1".into());
+    }
+    if zoom_depth > MAX_ZOOM_DEPTH {
+        return Err(format!(
+            "zoom_fuzz: zoom_depth ({zoom_depth}) exceeds maximum {MAX_ZOOM_DEPTH}"
+        ));
     }
     if !(cfg.lo.is_finite() && cfg.hi.is_finite()) {
         return Err(format!(
@@ -324,6 +360,20 @@ pub fn zoom_fuzz_specs(
         return Err(format!(
             "zoom_fuzz: invalid fuzz range lo ({}) > hi ({})",
             cfg.lo, cfg.hi
+        ));
+    }
+    if let Some(at) = abs_tol
+        && !(at.is_finite() && at >= 0.0)
+    {
+        return Err(format!(
+            "zoom_fuzz: abs_tol ({at}) must be finite and >= 0"
+        ));
+    }
+    if let Some(rt) = rel_tol
+        && !(rt.is_finite() && rt >= 0.0)
+    {
+        return Err(format!(
+            "zoom_fuzz: rel_tol ({rt}) must be finite and >= 0"
         ));
     }
     let g_base = crate::engine::PreparedGraph::compile(base)?;
@@ -341,33 +391,98 @@ pub fn zoom_fuzz_specs(
         return Err("zoom_fuzz: failed to generate initial cases".into());
     }
 
-    let eval_delta = |inputs: &BTreeMap<String, Vec<Value>>| -> Result<f64, String> {
-        let ob = g_base.run_once(base, Some(inputs))?;
-        let oc = g_cand.run_once(cand, Some(inputs))?;
-        if ob.values.len() != oc.values.len() {
-            return Ok(f64::INFINITY);
+    let eval_sample = |inputs: &BTreeMap<String, Vec<Value>>| -> Result<(f64, f64, bool), String> {
+        let ob = g_base
+            .run_once(base, Some(inputs))
+            .map_err(|e| format!("baseline execution error: {e}"))?;
+        let oc = g_cand
+            .run_once(cand, Some(inputs))
+            .map_err(|e| format!("candidate execution error: {e}"))?;
+        if ob.shape != oc.shape || ob.values.len() != oc.values.len() {
+            return Ok((
+                f64::INFINITY,
+                f64::INFINITY,
+                abs_tol.is_some() || rel_tol.is_some(),
+            ));
         }
-        let mut m = 0.0f64;
+        let mut max_abs = 0.0f64;
+        let mut max_rel = 0.0f64;
+        let mut violated = false;
         for (&a, &b) in ob.values.iter().zip(oc.values.iter()) {
-            let d = ((a as f64) - (b as f64)).abs();
-            if d > m {
-                m = d;
+            let ad = ((a as f64) - (b as f64)).abs();
+            let denom = (a as f64).abs().max((b as f64).abs()).max(1e-12);
+            let rd = ad / denom;
+            if !ad.is_finite() || !rd.is_finite() {
+                max_abs = f64::INFINITY;
+                max_rel = f64::INFINITY;
+                if abs_tol.is_some() || rel_tol.is_some() {
+                    violated = true;
+                }
+                continue;
+            }
+            if ad > max_abs {
+                max_abs = ad;
+            }
+            if rd > max_rel {
+                max_rel = rd;
+            }
+            let elem_ok = match (abs_tol, rel_tol) {
+                (Some(at), Some(rt)) => ad <= at || rd <= rt,
+                (Some(at), None) => ad <= at,
+                (None, Some(rt)) => rd <= rt,
+                (None, None) => true,
+            };
+            if !elem_ok {
+                violated = true;
             }
         }
-        Ok(m)
+        Ok((max_abs, max_rel, violated))
     };
 
+    let gated = abs_tol.is_some() || rel_tol.is_some();
+    let rel_only = abs_tol.is_none() && rel_tol.is_some();
     let mut best_case = initial[0].inputs.clone();
-    let mut best_delta = -1.0f64;
+    let mut best_score = -1.0f64;
+    let mut global_max_abs = 0.0f64;
+    let mut global_max_rel = 0.0f64;
+    let mut any_violated = false;
+    let mut error_trials = 0usize;
+    let mut first_error: Option<String> = None;
+    let mut first_error_input: Option<BTreeMap<String, Vec<Value>>> = None;
+
     for c in &initial {
-        let d = eval_delta(&c.inputs)?;
-        if d > best_delta {
-            best_delta = d;
-            best_case = c.inputs.clone();
+        match eval_sample(&c.inputs) {
+            Ok((ad, rd, violated)) => {
+                if ad > global_max_abs {
+                    global_max_abs = ad;
+                }
+                if rd > global_max_rel {
+                    global_max_rel = rd;
+                }
+                if violated {
+                    any_violated = true;
+                }
+                let score = if rel_only { rd } else { ad };
+                if score > best_score {
+                    best_score = score;
+                    best_case = c.inputs.clone();
+                }
+            }
+            Err(e) => {
+                if !gated {
+                    return Err(e);
+                }
+                error_trials += 1;
+                any_violated = true;
+                if first_error.is_none() {
+                    first_error = Some(e);
+                    first_error_input = Some(c.inputs.clone());
+                }
+            }
         }
     }
 
-    let initial_max = best_delta.max(0.0);
+    let initial_max = global_max_abs;
     let mut history = vec![ZoomLevelRecord {
         depth: 0,
         radius: (cfg.hi - cfg.lo) / 2.0,
@@ -399,37 +514,88 @@ pub fn zoom_fuzz_specs(
                     trial.insert(k, next_vals);
                 }
             }
-            if let Ok(d) = eval_delta(&trial)
-                && d > best_delta
-            {
-                best_delta = d;
-                best_case = trial;
+            match eval_sample(&trial) {
+                Ok((ad, rd, violated)) => {
+                    if ad > global_max_abs {
+                        global_max_abs = ad;
+                    }
+                    if rd > global_max_rel {
+                        global_max_rel = rd;
+                    }
+                    if violated {
+                        any_violated = true;
+                    }
+                    let score = if rel_only { rd } else { ad };
+                    if score > best_score {
+                        best_score = score;
+                        best_case = trial;
+                    }
+                }
+                Err(e) => {
+                    if !gated {
+                        return Err(e);
+                    }
+                    error_trials += 1;
+                    any_violated = true;
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                        first_error_input = Some(trial);
+                    }
+                }
             }
         }
         history.push(ZoomLevelRecord {
             depth,
             radius,
-            max_abs_error: best_delta.max(0.0),
+            max_abs_error: global_max_abs,
         });
         radius *= 0.5;
     }
 
-    let zoomed_max = best_delta.max(0.0);
+    let zoomed_max = global_max_abs;
     let amp = if initial_max > 0.0 && initial_max.is_finite() && zoomed_max.is_finite() {
         Some(((zoomed_max / initial_max) * 1e4).round() / 1e4)
     } else {
         None
     };
 
+    let passed = if gated {
+        !any_violated && error_trials == 0 && zoomed_max.is_finite() && global_max_rel.is_finite()
+    } else {
+        true
+    };
+    let verdict = if gated {
+        Some(if passed { "ACCEPT" } else { "REJECT" })
+    } else {
+        None
+    };
+
+    let worst_case_input = if error_trials > 0
+        && (best_score < 0.0
+            || (!passed
+                && zoomed_max <= abs_tol.unwrap_or(f64::INFINITY)
+                && global_max_rel <= rel_tol.unwrap_or(f64::INFINITY)))
+    {
+        first_error_input.unwrap_or(best_case)
+    } else {
+        best_case
+    };
+
     Ok(ZoomFuzzReport {
-        ok: true,
+        ok: passed,
+        verdict,
         seed: cfg.seed,
         zoom_depth,
         samples_per_level,
         initial_max_abs_error: initial_max,
         zoomed_max_abs_error: zoomed_max,
+        zoomed_max_rel_error: global_max_rel,
+        abs_tol,
+        rel_tol,
+        error_trials,
+        first_error,
         amplification_ratio: amp,
-        worst_case_input: best_case,
+        worst_case_input,
         zoom_history: history,
     })
 }
