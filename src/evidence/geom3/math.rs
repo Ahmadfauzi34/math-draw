@@ -502,7 +502,12 @@ fn op_to_mat4_inner(val: &Value, nest: usize) -> Result<Mat4, String> {
             let roll = opt_f64_field(obj, "roll", 0.0)?;
             let pitch = opt_f64_field(obj, "pitch", 0.0)?;
             let yaw = opt_f64_field(obj, "yaw", 0.0)?;
-            let order = obj.get("order").and_then(|v| v.as_str()).unwrap_or("ZYX");
+            let order = match obj.get("order") {
+                None | Some(Value::Null) => "ZYX",
+                Some(v) => v
+                    .as_str()
+                    .ok_or_else(|| "geom3: euler.order must be a string".to_string())?,
+            };
             euler4(roll, pitch, yaw, order)
         }
         "quaternion" => {

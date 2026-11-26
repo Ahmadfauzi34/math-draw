@@ -435,13 +435,22 @@ pub fn solve_ik(doc: &Value) -> Result<IkSolveReport, String> {
         let jo = jv
             .as_object()
             .ok_or_else(|| format!("geom solve-ik: joints[{idx}] must be a JSON object"))?;
-        let id = jo
-            .get("id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("joint_{idx}"));
-        let ax_str = jo.get("axis").and_then(|v| v.as_str()).unwrap_or("z");
+        let id = match jo.get("id") {
+            None | Some(Value::Null) => format!("joint_{idx}"),
+            Some(v) => v
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    format!("geom solve-ik: joints[{idx}].id must be a non-empty string")
+                })?
+                .to_string(),
+        };
+        let ax_str = match jo.get("axis") {
+            None | Some(Value::Null) => "z",
+            Some(v) => v
+                .as_str()
+                .ok_or_else(|| format!("geom solve-ik: joints[{idx}].axis must be a string"))?,
+        };
         let axis = match ax_str.to_ascii_lowercase().as_str() {
             "x" => 'x',
             "y" => 'y',
@@ -919,10 +928,12 @@ fn build_mvp_from_doc(obj: &serde_json::Map<String, Value>) -> Result<(Mat4, f64
         .get("fov_deg")
         .and_then(|v| v.as_f64())
         .ok_or_else(|| "geom project: camera.fov_deg missing".to_string())?;
-    let aspect = cam
-        .get("aspect")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1.0);
+    let aspect = match cam.get("aspect") {
+        None | Some(Value::Null) => 1.0,
+        Some(v) => v
+            .as_f64()
+            .ok_or_else(|| format!("geom project: camera.aspect must be a finite number, got {v}"))?,
+    };
     let near = cam
         .get("near")
         .and_then(|v| v.as_f64())

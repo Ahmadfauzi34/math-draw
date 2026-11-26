@@ -3149,6 +3149,39 @@ fn geom3_builders_scene_tree_ik_projection_batch_and_cli() {
         "expected huge viewport causing Inf screen coords to fail closed"
     );
 
+    // 5c. Malformed explicit optional fields fail closed instead of silently substituting defaults
+    let bad_aspect_doc = json!({
+        "vertices": [[0.0, 0.0, -5.0]],
+        "camera": {
+            "eye": [0.0, 0.0, 0.0],
+            "target": [0.0, 0.0, -1.0],
+            "up": [0.0, 1.0, 0.0],
+            "fov_deg": 60.0,
+            "aspect": "16:9",
+            "near": 0.1,
+            "far": 100.0
+        },
+        "viewport": { "w": 800.0, "h": 600.0 }
+    });
+    assert!(project_model(&bad_aspect_doc, false).is_err());
+    assert!(
+        build_chain_spec(
+            &json!({
+                "input": [1.0, 0.0, 0.0],
+                "chain": [{ "op": "euler", "roll": 10.0, "order": 123 }]
+            }),
+            false
+        )
+        .is_err()
+    );
+    assert!(
+        solve_ik(&json!({
+            "joints": [{ "id": "j0", "axis": 42, "length": 1.0 }],
+            "target": [1.0, 0.0, 0.0]
+        }))
+        .is_err()
+    );
+
     // 6. Workflow `diff_ref` stage + live CLI `math-draw geom` subcommands
     let tmp_dir = std::env::temp_dir().join(format!("math_draw_geom_cli_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
