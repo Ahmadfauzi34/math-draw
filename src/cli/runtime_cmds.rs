@@ -9,7 +9,8 @@ use crate::cost_model::run_cost_model;
 use crate::error::ErrorCode;
 use crate::profile::{compare_specs_perf, profile_spec};
 use crate::rollout::{
-    parse_inputs_sequence, rollout_bisect, rollout_fixpoint, rollout_scan, rollout_unroll,
+    parse_inputs_sequence, rollout_bisect, rollout_fixpoint, rollout_scan,
+    rollout_unroll_with_options,
 };
 use crate::spec::load_spec_file;
 use crate::trace::{DEFAULT_MAX_TENSOR_BYTES, compare_trace_hashes, trace_hash_spec};
@@ -156,12 +157,15 @@ pub(super) fn handle_rollout(rest: &[String]) -> ExitCode {
             }
         }
         "unroll" => {
-            let usage = "usage: math-draw rollout unroll <spec.json> [--steps N] [--state-port <slot|name>] [--out <out.json>]";
-            let parsed =
-                match ParsedArgs::parse(sub_rest, &["--steps", "--state-port", "--out"], &[]) {
-                    Ok(p) => p,
-                    Err(e) => return err_exit_typed(&e),
-                };
+            let usage = "usage: math-draw rollout unroll <spec.json> [--steps N] [--state-port <slot|name>] [--compact-slots] [--out <out.json>]";
+            let parsed = match ParsedArgs::parse(
+                sub_rest,
+                &["--steps", "--state-port", "--out"],
+                &["--compact-slots"],
+            ) {
+                Ok(p) => p,
+                Err(e) => return err_exit_typed(&e),
+            };
             if let Err(e) = parsed.ensure_max_positionals(1, usage) {
                 return err_exit_typed(&e);
             }
@@ -177,7 +181,14 @@ pub(super) fn handle_rollout(rest: &[String]) -> ExitCode {
                 Err(e) => return err_exit_typed(&e),
             };
             let state_port = parsed.str_opt("--state-port");
-            match rollout_unroll(&loaded.spec, loaded.expansion.as_ref(), steps, state_port) {
+            let compact = parsed.has("--compact-slots");
+            match rollout_unroll_with_options(
+                &loaded.spec,
+                loaded.expansion.as_ref(),
+                steps,
+                state_port,
+                compact,
+            ) {
                 Ok(rep) => {
                     if let Some(op) = parsed.str_opt("--out")
                         && let Err(e) = write_pretty_json(op, &rep.unrolled_spec)

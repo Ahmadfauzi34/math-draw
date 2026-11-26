@@ -40,6 +40,7 @@ pub struct ExplainReport {
     pub total_params: usize,
     pub steps: Vec<ExplainStep>,
     pub slot_shapes: BTreeMap<usize, [usize; 4]>,
+    pub liveness: crate::graph::liveness::LivenessReport,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1064,12 +1065,14 @@ pub fn validate_spec(spec: &SpecV1, include_explain: bool) -> ValidateReport {
     }
 
     let explain = if include_explain {
+        let liveness = crate::graph::liveness::analyze_liveness(spec, &slot_shapes, Some(&slot_dtypes));
         Some(ExplainReport {
             num_slots: spec.num_slots,
             output_slot: spec.output_slot,
             total_params,
             steps: explain_steps,
             slot_shapes,
+            liveness,
         })
     } else {
         None

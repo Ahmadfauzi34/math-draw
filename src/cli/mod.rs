@@ -1,7 +1,9 @@
 mod core_cmds;
 mod evidence_cmds;
+mod geom_cmds;
 mod graph_cmds;
 mod harness_cmds;
+mod math_cmds;
 mod runtime_cmds;
 
 use serde_json::json;
@@ -18,11 +20,18 @@ USAGE:
   math-draw run <spec.json>
   math-draw validate <spec.json> [--explain]
   math-draw verify <base.json> <candidate.json> [--cases <cases.json>] [--fuzz [N]] [--zoom] [--zoom-depth 4] [--seed S] [--lo A] [--hi B] [--abs-tol T] [--rel-tol T]
+  math-draw diff-ref <spec.json> [--cases <cases.json>] [--ref <ref.json>] [--tol 1e-5]
   math-draw linear-equiv <specA.json> <specB.json> [--tol 0.0]
+  math-draw soak <spec.json> [--runs 100]
+  math-draw prng-check [mulberry32|xorshift64|pcg32|philox4x32] [seed=1] [count=1000] [--out <manifest.json>] | verify <manifest.json>
+  math-draw arith <op> <a> [b] | --batch <ops.json>
+  math-draw int <add|sub|mul|div|rem|matmul|to-f32|from-f32> <a> [b] [--wrap] [--allow-inexact] | --batch <ops.json>
+  math-draw kernel <sin|cos|tan|floor|ceil|round|atan2|powf|hypot|fma> <a> [b] [c] | --batch <ops.json>
+  math-draw geom <build|scene-tree|solve-ik|project|batch|selftest> ...
   math-draw trace-hash <spec.json> [other.json] [--max-bytes N] [--isolate]
   math-draw rollout scan <spec.json> [--steps N] [--state-port <slot|name>] [--inputs-seq <seq.json>]
   math-draw rollout fixpoint <spec.json> [--tol 1e-6] [--max-steps 100] [--state-port <slot|name>]
-  math-draw rollout unroll <spec.json> [--steps N] [--state-port <slot|name>] [--out <out.json>]
+  math-draw rollout unroll <spec.json> [--steps N] [--state-port <slot|name>] [--compact-slots] [--out <out.json>]
   math-draw rollout bisect <base.json> <cand.json> [--steps N] [--state-port <slot|name>] [--inputs-seq <seq.json>] [--abs-tol 1e-5]
   math-draw profile <spec.json> [--iters 30] [--warmup 5]
   math-draw compare <base.json> <cand.json> [--iters 30] [--warmup 5]
@@ -40,8 +49,9 @@ USAGE:
   math-draw find-op [--list | <constructor>]
   math-draw rewrite list
   math-draw rewrite apply <rule|all> <spec.json> [--out <out.json>]
-  math-draw recurse expand <spec.v2.json> [--out <out.v1.json>]
-  math-draw recurse search <spec.json> [--out <best.json>] [--max-depth 3] [--cases <cases.json>] [--abs-tol 1e-5] [--rel-tol 1e-5]
+  math-draw recurse expand <spec.v2.json> [--auto-repair] [--max-weights N] [--compact-slots] [--out <out.v1.json>]
+  math-draw recurse grad-spec <spec.json> [--wrt <slot|name>] [--order 1|2] [--dout <v1,v2,...>] [--hvp-vec <v1,v2,...>] [--compact-slots] [--out <grad.json>]
+  math-draw recurse search <spec.json> [--out <best.json>] [--max-depth 3] [--cases <cases.json>] [--abs-tol 1e-5] [--rel-tol 1e-5] [--quant-tol T] [--quant-scheme q8-per-block|int8|fp16]
   math-draw recurse solve-gd <spec.json> [--targets <targets.json>] [--steps 20] [--lr 0.1] [--layer <idx|all>] [--precondition] [--out <out.json>]
   math-draw recurse fit <spec.json> --targets <targets.json> [--strategy openes|mu-lambda] [--rng xorshift64|mulberry32|pcg32|philox4x32] [--gens 40] [--pop 16] [--mu N] [--sigma 0.2] [--lr 0.2] [--seed 42] [--sensitivity-guided] [--freeze-threshold 1e-6] [--out <out.json>]
   math-draw smoke"#
@@ -443,6 +453,11 @@ pub fn run_cli() -> ExitCode {
         "linear-equiv" => core_cmds::handle_linear_equiv(rest),
         "find-op" => core_cmds::handle_find_op(rest),
         "smoke" => core_cmds::handle_smoke(rest),
+        "arith" => math_cmds::handle_arith(rest),
+        "int" => math_cmds::handle_int(rest),
+        "kernel" => math_cmds::handle_kernel(rest),
+        "soak" => math_cmds::handle_soak(rest),
+        "prng-check" => math_cmds::handle_prng_check(rest),
         "trace-hash" => runtime_cmds::handle_trace_hash(rest),
         "rollout" => runtime_cmds::handle_rollout(rest),
         "profile" => runtime_cmds::handle_profile(rest),
@@ -453,6 +468,8 @@ pub fn run_cli() -> ExitCode {
         "mutate" => graph_cmds::handle_mutate(rest),
         "shard" => graph_cmds::handle_shard(rest),
         "gradcheck" => evidence_cmds::handle_gradcheck(rest),
+        "diff-ref" => evidence_cmds::handle_diff_ref(rest),
+        "geom" => geom_cmds::handle_geom(rest),
         "quant" => evidence_cmds::handle_quant(rest),
         "weight-lab" => evidence_cmds::handle_weight_lab(rest),
         "bundle" => evidence_cmds::handle_bundle(rest),

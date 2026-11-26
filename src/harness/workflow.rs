@@ -2,11 +2,18 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 use super::workspace::{SemanticDigest, compute_semantic_digest, ensure_workspace_dir};
+use crate::bundle::{export_bundle, verify_bundle};
+use crate::diff_ref::diff_ref_spec;
 use crate::engine::run_spec;
+use crate::grad_spec::{GradSpecOptions, compile_grad_spec};
+use crate::gradcheck::gradcheck_spec;
+use crate::liveness::{auto_repair_spec, compact_slots_by_liveness};
 use crate::quant::{BudgetMode, QuantScheme, quant_budget};
-use crate::recurse::{search_graph_tree, solve_gd_autodiff};
-use crate::rollout::{rollout_fixpoint, rollout_scan, rollout_unroll};
-use crate::spec::{LoadedSpec, load_spec_file, load_spec_str};
+use crate::recurse::{SearchOptions, search_graph_tree_with_options, solve_gd_autodiff};
+use crate::rollout::{rollout_fixpoint, rollout_scan, rollout_unroll_with_options};
+use crate::shard::shard_spec;
+use crate::soak::soak_spec;
+use crate::spec::{LoadedSpec, load_spec_file, load_spec_str, parse_f32_values};
 use crate::validate::validate_spec;
 use crate::verify::TargetsFile;
 
@@ -21,7 +28,7 @@ fn ensure_allowed_keys(obj: &serde_json::Map<String, Value>, ctx: &str, allowed:
 
 fn wf_opt_str<'a>(st: &'a Value, ctx: &str, key: &str) -> Result<Option<&'a str>, String> {
     match st.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.as_str())),
         Some(other) => Err(format!(
             "workflow {ctx}: field '{key}' must be a string, got {other}"
@@ -35,7 +42,7 @@ fn wf_str<'a>(st: &'a Value, ctx: &str, key: &str, default: &'a str) -> Result<&
 
 fn wf_bool(st: &Value, ctx: &str, key: &str, default: bool) -> Result<bool, String> {
     match st.get(key) {
-        None | Some(Value::Null) => Ok(default),
+        None => Ok(default),
         Some(Value::Bool(b)) => Ok(*b),
         Some(other) => Err(format!(
             "workflow {ctx}: field '{key}' must be a boolean, got {other}"
@@ -45,10 +52,13 @@ fn wf_bool(st: &Value, ctx: &str, key: &str, default: bool) -> Result<bool, Stri
 
 fn wf_opt_u64(st: &Value, ctx: &str, key: &str) -> Result<Option<u64>, String> {
     match st.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Number(n)) => n.as_u64().ok_or_else(|| {
-            format!("workflow {ctx}: field '{key}' must be a non-negative integer, got {n}")
-        }).map(Some),
+        None => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| {
+                format!("workflow {ctx}: field '{key}' must be a non-negative integer, got {n}")
+            })
+            .map(Some),
         Some(other) => Err(format!(
             "workflow {ctx}: field '{key}' must be a non-negative integer, got {other}"
         )),
@@ -84,7 +94,7 @@ fn wf_usize_pos(st: &Value, ctx: &str, key: &str, default: usize) -> Result<usiz
 
 fn wf_f64(st: &Value, ctx: &str, key: &str, default: f64) -> Result<f64, String> {
     match st.get(key) {
-        None | Some(Value::Null) => Ok(default),
+        None => Ok(default),
         Some(Value::Number(n)) => {
             let v = n.as_f64().ok_or_else(|| {
                 format!("workflow {ctx}: field '{key}' must be a finite number, got {n}")
@@ -135,9 +145,18 @@ pub fn execute_harness_workflow(
         "root",
         &["schema", "name", "description", "workspace", "spec", "pipeline"],
     )?;
+    for meta_key in ["schema", "name", "description"] {
+        if let Some(s) = wf_opt_str(workflow, "root", meta_key)?
+            && s.trim().is_empty()
+        {
+            return Err(format!(
+                "workflow root: field '{meta_key}' must be a non-empty string"
+            ));
+        }
+    }
 
     let ws_from_wf = match workflow.get("workspace") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(Value::String(s)) => {
             if s.trim().is_empty() {
                 return Err("workflow field 'workspace' must be a non-empty string".into());
@@ -234,7 +253,12 @@ pub fn execute_harness_workflow(
     };
 
     let pipeline = match workflow.get("pipeline") {
-        Some(Value::Array(arr)) => arr.clone(),
+        Some(Value::Array(arr)) => {
+            if arr.is_empty() {
+                return Err("workflow field 'pipeline' must be a non-empty array of stages".into());
+            }
+            arr.clone()
+        }
         Some(other) => {
             return Err(format!(
                 "workflow field 'pipeline' must be an array of stage objects, got {other}"
@@ -268,11 +292,30 @@ pub fn execute_harness_workflow(
 
         let step_res: Result<Value, String> = (|| match stage_name {
             "compile" | "compile_v2" => {
-                ensure_allowed_keys(st_obj, stage_name, &["stage", "op"])?;
+                ensure_allowed_keys(
+                    st_obj,
+                    stage_name,
+                    &["stage", "op", "auto_repair", "max_weights", "compact_slots"],
+                )?;
+                let auto_repair = wf_bool(st, stage_name, "auto_repair", false)?;
+                let max_weights = wf_usize_pos(st, stage_name, "max_weights", 65535)?;
+                let compact = wf_bool(st, stage_name, "compact_slots", false)?;
+                let mut remediation = Vec::new();
+                if auto_repair {
+                    let ar = auto_repair_spec(&active_spec, max_weights)?;
+                    active_spec = ar.spec;
+                    remediation = ar.remediation_receipt;
+                }
+                let mut slots_saved = 0usize;
+                if compact {
+                    let comp = compact_slots_by_liveness(&active_spec)?;
+                    active_spec = comp.spec;
+                    slots_saved = comp.slots_saved;
+                }
                 events.push(json!({
                     "stage": stage_name,
                     "index": idx,
-                    "detail": format!("layers={};steps={}", active_spec.layers.len(), active_spec.steps.len()),
+                    "detail": format!("layers={};steps={};slots={}", active_spec.layers.len(), active_spec.steps.len(), active_spec.num_slots),
                 }));
                 Ok(json!({
                     "stage": stage_name,
@@ -280,6 +323,8 @@ pub fn execute_harness_workflow(
                     "layers_count": active_spec.layers.len(),
                     "steps_count": active_spec.steps.len(),
                     "num_slots": active_spec.num_slots,
+                    "slots_saved": slots_saved,
+                    "remediation_count": remediation.len(),
                 }))
             }
             "validate" => {
@@ -294,13 +339,25 @@ pub fn execute_harness_workflow(
                     "stage": "validate",
                     "ok": rep.valid,
                     "total_params": rep.explain.as_ref().map(|e| e.total_params),
+                    "peak_bytes": rep.explain.as_ref().map(|e| e.liveness.peak_bytes),
                 }))
             }
             "rollout_unroll" | "unroll" => {
-                ensure_allowed_keys(st_obj, stage_name, &["stage", "op", "steps", "state_port"])?;
+                ensure_allowed_keys(
+                    st_obj,
+                    stage_name,
+                    &["stage", "op", "steps", "state_port", "compact_slots"],
+                )?;
                 let steps = wf_usize_pos(st, stage_name, "steps", 3)?;
                 let state_port = wf_opt_str(st, stage_name, "state_port")?;
-                let ur = rollout_unroll(&active_spec, active_expansion.as_ref(), steps, state_port)?;
+                let compact = wf_bool(st, stage_name, "compact_slots", false)?;
+                let ur = rollout_unroll_with_options(
+                    &active_spec,
+                    active_expansion.as_ref(),
+                    steps,
+                    state_port,
+                    compact,
+                )?;
                 active_spec = ur.unrolled_spec;
                 Ok(json!({
                     "stage": stage_name,
@@ -315,12 +372,34 @@ pub fn execute_harness_workflow(
                 ensure_allowed_keys(
                     st_obj,
                     stage_name,
-                    &["stage", "op", "max_depth", "abs_tol", "rel_tol"],
+                    &[
+                        "stage",
+                        "op",
+                        "max_depth",
+                        "abs_tol",
+                        "rel_tol",
+                        "quant_tol",
+                        "quant_scheme",
+                    ],
                 )?;
                 let max_depth = wf_usize(st, stage_name, "max_depth", 3)?;
                 let abs_tol = wf_f64_non_neg(st, stage_name, "abs_tol", 1e-5)?;
                 let rel_tol = wf_f64_non_neg(st, stage_name, "rel_tol", 1e-5)?;
-                let sr = search_graph_tree(&active_spec, max_depth, None, abs_tol, rel_tol)?;
+                let quant_tol = if st_obj.contains_key("quant_tol") {
+                    Some(wf_f64_non_neg(st, stage_name, "quant_tol", 0.0)?)
+                } else {
+                    None
+                };
+                let quant_scheme =
+                    QuantScheme::parse(wf_str(st, stage_name, "quant_scheme", "q8-per-block")?)?;
+                let opts = SearchOptions {
+                    max_depth,
+                    abs_tol,
+                    rel_tol,
+                    quant_tol,
+                    quant_scheme,
+                };
+                let sr = search_graph_tree_with_options(&active_spec, None, &opts)?;
                 let best_max_abs_diff = sr
                     .nodes
                     .iter()
@@ -340,6 +419,7 @@ pub fn execute_harness_workflow(
                     "ok": true,
                     "explored_nodes": sr.visited_nodes,
                     "best_steps": sr.best_steps,
+                    "best_weight_bytes": sr.best_weight_bytes,
                     "best_rewrite_chain": sr.transform_chain,
                 }))
             }
@@ -353,6 +433,12 @@ pub fn execute_harness_workflow(
                 let scheme = QuantScheme::parse(wf_str(st, stage_name, "scheme", "q8-per-block")?)?;
                 let mode = BudgetMode::parse(wf_str(st, stage_name, "mode", "bound")?)?;
                 let qb = quant_budget(&active_spec, None, tol, scheme, mode)?;
+                if !qb.ok {
+                    return Err(format!(
+                        "workflow {stage_name}: quantization budget failed tolerance (verified_delta={} > tol={tol})",
+                        qb.verified_delta
+                    ));
+                }
                 active_spec = qb.planned_spec;
                 Ok(json!({
                     "stage": stage_name,
@@ -392,11 +478,16 @@ pub fn execute_harness_workflow(
                     .get("targets")
                     .ok_or_else(|| "workflow fit stage requires 'targets'".to_string())?;
                 let tf: TargetsFile = if let Some(tp) = t_val.as_str() {
-                    let raw =
-                        std::fs::read_to_string(base_dir.join(tp)).map_err(|e| e.to_string())?;
-                    serde_json::from_str(&raw).map_err(|e| e.to_string())?
+                    let raw = std::fs::read_to_string(base_dir.join(tp)).map_err(|e| {
+                        format!("cannot read workflow {stage_name} targets '{tp}': {e}")
+                    })?;
+                    serde_json::from_str(&raw).map_err(|e| {
+                        format!("invalid JSON in workflow {stage_name} targets '{tp}': {e}")
+                    })?
                 } else {
-                    serde_json::from_value(t_val.clone()).map_err(|e| e.to_string())?
+                    serde_json::from_value(t_val.clone()).map_err(|e| {
+                        format!("invalid JSON in workflow {stage_name} inline targets: {e}")
+                    })?
                 };
                 let gens = match wf_opt_usize(st, stage_name, "generations")? {
                     Some(g) => g,
@@ -430,6 +521,12 @@ pub fn execute_harness_workflow(
                     freeze_threshold,
                 };
                 let fr = crate::recurse::fit_es_with_config(&active_spec, &tf, &cfg)?;
+                if !fr.ok {
+                    return Err(format!(
+                        "workflow {stage_name}: ES fit did not succeed (start_loss={}, final_loss={}, flags={:?})",
+                        fr.start_loss, fr.final_loss, fr.flags
+                    ));
+                }
                 active_spec = fr.optimized_spec;
                 Ok(json!({
                     "stage": stage_name,
@@ -459,17 +556,28 @@ pub fn execute_harness_workflow(
                     "workflow solve_gd stage requires explicit 'targets'".to_string()
                 })?;
                 let tf: TargetsFile = if let Some(tp) = t_val.as_str() {
-                    let raw =
-                        std::fs::read_to_string(base_dir.join(tp)).map_err(|e| e.to_string())?;
-                    serde_json::from_str(&raw).map_err(|e| e.to_string())?
+                    let raw = std::fs::read_to_string(base_dir.join(tp)).map_err(|e| {
+                        format!("cannot read workflow {stage_name} targets '{tp}': {e}")
+                    })?;
+                    serde_json::from_str(&raw).map_err(|e| {
+                        format!("invalid JSON in workflow {stage_name} targets '{tp}': {e}")
+                    })?
                 } else {
-                    serde_json::from_value(t_val.clone()).map_err(|e| e.to_string())?
+                    serde_json::from_value(t_val.clone()).map_err(|e| {
+                        format!("invalid JSON in workflow {stage_name} inline targets: {e}")
+                    })?
                 };
                 let steps = wf_usize_pos(st, stage_name, "steps", 20)?;
                 let lr = wf_f64_pos(st, stage_name, "lr", 0.1)?;
                 let pre = wf_bool(st, stage_name, "precondition", false)?;
                 let layer = wf_opt_usize(st, stage_name, "layer")?;
                 let gd = solve_gd_autodiff(&active_spec, Some(&tf), layer, steps, lr, pre)?;
+                if !gd.ok {
+                    return Err(format!(
+                        "workflow {stage_name}: autodiff GD did not succeed (start_loss={}, final_loss={})",
+                        gd.start_loss, gd.final_loss
+                    ));
+                }
                 active_spec = gd.optimized_spec;
                 proofs.push(json!({
                     "stage": stage_name,
@@ -571,6 +679,262 @@ pub fn execute_harness_workflow(
                     "output_digest": dig,
                 }))
             }
+            "grad_spec" | "grad-spec" => {
+                ensure_allowed_keys(
+                    st_obj,
+                    stage_name,
+                    &[
+                        "stage",
+                        "op",
+                        "wrt",
+                        "order",
+                        "dout",
+                        "hvp_vec",
+                        "compact_slots",
+                        "replace_active",
+                    ],
+                )?;
+                let wrt = match st.get("wrt") {
+                    None | Some(Value::Null) => "0".to_string(),
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Number(n)) => n
+                        .as_u64()
+                        .ok_or_else(|| {
+                            format!("workflow {stage_name}: field 'wrt' must be string or non-negative integer")
+                        })?
+                        .to_string(),
+                    Some(other) => {
+                        return Err(format!(
+                            "workflow {stage_name}: field 'wrt' must be string or non-negative integer, got {other}"
+                        ));
+                    }
+                };
+                let order = wf_usize_pos(st, stage_name, "order", 1)?;
+                let dout = match st.get("dout") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Array(arr)) => {
+                        Some(parse_f32_values(arr, "workflow grad_spec.dout")?)
+                    }
+                    Some(other) => {
+                        return Err(format!(
+                            "workflow {stage_name}: field 'dout' must be an array of numbers, got {other}"
+                        ));
+                    }
+                };
+                let hvp_vec = match st.get("hvp_vec") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Array(arr)) => {
+                        Some(parse_f32_values(arr, "workflow grad_spec.hvp_vec")?)
+                    }
+                    Some(other) => {
+                        return Err(format!(
+                            "workflow {stage_name}: field 'hvp_vec' must be an array of numbers, got {other}"
+                        ));
+                    }
+                };
+                let compact = wf_bool(st, stage_name, "compact_slots", false)?;
+                let replace_active = wf_bool(st, stage_name, "replace_active", true)?;
+                let opts = GradSpecOptions {
+                    wrt,
+                    order,
+                    dout,
+                    hvp_vec,
+                    compact_slots: compact,
+                };
+                let gs = compile_grad_spec(&active_spec, active_expansion.as_ref(), &opts)?;
+                if replace_active {
+                    active_spec = gs.spec.clone();
+                }
+                proofs.push(json!({
+                    "stage": stage_name,
+                    "index": idx,
+                    "ok": gs.ok,
+                    "order": gs.order,
+                    "wrt_slot": gs.wrt_slot,
+                    "dout_slot": gs.dout_slot,
+                }));
+                Ok(json!({
+                    "stage": stage_name,
+                    "ok": gs.ok,
+                    "order": gs.order,
+                    "wrt_slot": gs.wrt_slot,
+                    "dout_slot": gs.dout_slot,
+                    "hvp_slot": gs.hvp_slot,
+                    "steps_count": gs.steps_count,
+                    "num_slots": gs.num_slots,
+                }))
+            }
+            "soak" => {
+                ensure_allowed_keys(st_obj, stage_name, &["stage", "op", "runs"])?;
+                let runs = wf_usize_pos(st, stage_name, "runs", 10)?;
+                let rep = soak_spec(&active_spec, runs)?;
+                if !rep.identical {
+                    return Err(format!(
+                        "soak detected non-determinism at run {:?}",
+                        rep.first_mismatch_index
+                    ));
+                }
+                proofs.push(json!({
+                    "stage": stage_name,
+                    "index": idx,
+                    "ok": rep.identical,
+                    "runs": rep.runs,
+                    "sha256": rep.sha256,
+                }));
+                Ok(json!({
+                    "stage": stage_name,
+                    "ok": rep.identical,
+                    "runs": rep.runs,
+                    "identical": rep.identical,
+                    "sha256": rep.sha256,
+                }))
+            }
+            "gradcheck" => {
+                ensure_allowed_keys(
+                    st_obj,
+                    stage_name,
+                    &["stage", "op", "eps", "tol", "weights", "autodiff"],
+                )?;
+                let eps = wf_f64_pos(st, stage_name, "eps", 1e-3)?;
+                let tol = wf_f64_pos(st, stage_name, "tol", 1e-3)?;
+                let include_weights = wf_bool(st, stage_name, "weights", true)?;
+                let check_autodiff = wf_bool(st, stage_name, "autodiff", false)?;
+                let rep = gradcheck_spec(
+                    &active_spec,
+                    None,
+                    eps,
+                    tol,
+                    include_weights,
+                    check_autodiff,
+                )?;
+                if !rep.ok {
+                    return Err("workflow gradcheck: stage failed tolerance check".into());
+                }
+                proofs.push(json!({
+                    "stage": stage_name,
+                    "index": idx,
+                    "ok": rep.ok,
+                    "autodiff": check_autodiff,
+                }));
+                Ok(json!({
+                    "stage": stage_name,
+                    "ok": rep.ok,
+                    "eps": eps,
+                    "tol": tol,
+                    "checked_autodiff": check_autodiff,
+                }))
+            }
+            "shard" => {
+                ensure_allowed_keys(st_obj, stage_name, &["stage", "op", "max_weights"])?;
+                let max_weights = wf_usize_pos(st, stage_name, "max_weights", 65535)?;
+                let rep = shard_spec(&active_spec, max_weights)?;
+                if !rep.ok {
+                    return Err(format!(
+                        "workflow {stage_name}: sharding verification failed (reassembly_exact={})",
+                        rep.reassembly_exact
+                    ));
+                }
+                active_spec = rep.spec;
+                proofs.push(json!({
+                    "stage": stage_name,
+                    "index": idx,
+                    "ok": rep.ok,
+                    "sharded": rep.sharded,
+                    "reassembly_exact": rep.reassembly_exact,
+                }));
+                Ok(json!({
+                    "stage": stage_name,
+                    "ok": rep.ok,
+                    "sharded": rep.sharded,
+                    "shards_count": rep.shards.len(),
+                    "reassembly_exact": rep.reassembly_exact,
+                }))
+            }
+            "bundle_export" => {
+                ensure_allowed_keys(
+                    st_obj,
+                    stage_name,
+                    &["stage", "op", "include_exec", "attest", "out"],
+                )?;
+                let include_exec = wf_bool(st, stage_name, "include_exec", true)?;
+                let attest_labels: Vec<String> = match st.get("attest") {
+                    None => Vec::new(),
+                    Some(Value::Array(arr)) => arr
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            v.as_str()
+                                .map(|s| s.to_string())
+                                .ok_or_else(|| {
+                                    format!("workflow {stage_name}: attest[{i}] must be a string")
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    Some(other) => {
+                        return Err(format!(
+                            "workflow {stage_name}: field 'attest' must be an array of strings, got {other}"
+                        ));
+                    }
+                };
+                let bundle = export_bundle(&active_spec, include_exec, &attest_labels)?;
+                let ver = verify_bundle(&bundle);
+                if !ver.ok {
+                    return Err("workflow bundle_export: self-verification failed".into());
+                }
+                if let Some(out_rel) = wf_opt_str(st, stage_name, "out")? {
+                    let out_path = if Path::new(out_rel).is_absolute() {
+                        PathBuf::from(out_rel)
+                    } else {
+                        base_dir.join(out_rel)
+                    };
+                    let txt = serde_json::to_string_pretty(&bundle)
+                        .map_err(|e| format!("failed serializing bundle: {e}"))?;
+                    std::fs::write(&out_path, format!("{txt}\n"))
+                        .map_err(|e| format!("failed writing bundle '{}': {e}", out_path.display()))?;
+                }
+                proofs.push(json!({
+                    "stage": stage_name,
+                    "index": idx,
+                    "ok": true,
+                    "program_identity": bundle.program_identity,
+                    "bundle_sha256": bundle.bundle_sha256,
+                }));
+                Ok(json!({
+                    "stage": stage_name,
+                    "ok": true,
+                    "program_identity": bundle.program_identity,
+                    "bundle_sha256": bundle.bundle_sha256,
+                    "verified": ver.ok,
+                }))
+            }
+            "diff_ref" | "diff-ref" => {
+                ensure_allowed_keys(st_obj, stage_name, &["stage", "op", "tol"])?;
+                let tol = wf_f64_pos(st, stage_name, "tol", 1e-5)?;
+                let rep = diff_ref_spec(&active_spec, None, None, tol)?;
+                if !rep.ok {
+                    return Err(format!(
+                        "workflow diff_ref: signal max_abs_error={} > tol={tol}",
+                        rep.max_abs_error
+                    ));
+                }
+                proofs.push(json!({
+                    "stage": stage_name,
+                    "index": idx,
+                    "ok": rep.ok,
+                    "verdict": rep.verdict,
+                    "max_abs_error": rep.max_abs_error,
+                    "max_rel_error": rep.max_rel_error,
+                }));
+                Ok(json!({
+                    "stage": stage_name,
+                    "ok": rep.ok,
+                    "verdict": rep.verdict,
+                    "tol": rep.tol,
+                    "cases_checked": rep.cases_checked,
+                    "max_abs_error": rep.max_abs_error,
+                    "max_rel_error": rep.max_rel_error,
+                }))
+            }
             other => Err(format!("unknown workflow pipeline stage '{other}'")),
         })();
 
@@ -585,8 +949,8 @@ pub fn execute_harness_workflow(
                     "error": err_msg,
                     "hint": classified.hint,
                 }));
-                sync_state(&events, &proofs)?;
-                return Ok(json!({
+                let persist_err = sync_state(&events, &proofs).err();
+                let mut out = json!({
                     "ok": false,
                     "code": classified.code,
                     "error": err_msg,
@@ -596,7 +960,11 @@ pub fn execute_harness_workflow(
                     "stages_completed": stage_reports.len(),
                     "stage_reports": stage_reports,
                     "final_output_digest": last_run_digest,
-                }));
+                });
+                if let Some(pe) = persist_err {
+                    out["workspace_persist_error"] = json!(pe);
+                }
+                return Ok(out);
             }
         }
     }

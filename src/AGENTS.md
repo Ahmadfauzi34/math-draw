@@ -34,10 +34,10 @@ Contains the complete `math_draw` Rust library crate ([`lib.rs`](lib.rs)) and th
 ## Child Graph Index
 
 - [`layers/AGENTS.md`](layers/AGENTS.md) — 95 Burn layer builders, 4D tensor/int execution kernels, and autograd `GradParam` wrappers
-- [`runtime/AGENTS.md`](runtime/AGENTS.md) — `PreparedGraph` execution, step trace hashing, recurrent rollouts, profiling, and cost modeling
-- [`graph/AGENTS.md`](graph/AGENTS.md) — Static validator, `v2` recursive composer, pure rewrites, transactional/branch mutations, and sharding
-- [`es/AGENTS.md`](es/AGENTS.md) — Rewrite tree search, autodiff GD solver, and Evolutionary Strategy optimizer (OpenES, MuLambda, 4 PRNGs, diagnostics)
-- [`evidence/AGENTS.md`](evidence/AGENTS.md) — Equivalence verifier, symbolic affine prover, gradcheck, quantization, `weight-lab`, and portable program bundles
+- [`runtime/AGENTS.md`](runtime/AGENTS.md) — `PreparedGraph` execution, spec-free direct math (`arith`/`int`/`kernel`), step trace hashing, recurrent rollouts, profiling, and cost modeling
+- [`graph/AGENTS.md`](graph/AGENTS.md) — Static validator, liveness/SSA/compaction/auto-repair, symbolic VJP/HVP `grad-spec` compiler, `v2` recursive composer, pure rewrites, transactional/branch mutations, and sharding
+- [`es/AGENTS.md`](es/AGENTS.md) — Rewrite+quant tree search, autodiff GD solver, and Evolutionary Strategy optimizer (OpenES, MuLambda, 4 PRNGs, diagnostics)
+- [`evidence/AGENTS.md`](evidence/AGENTS.md) — Equivalence verifier, pure-Rust `f64` differential oracle (`diff_ref`), 3D geometry domain pack (`geom3`), symbolic affine prover, gradcheck, quantization, soak determinism/PRNG certification, `weight-lab`, and portable program bundles
 - [`harness/AGENTS.md`](harness/AGENTS.md) — Layer-4 `.burn-harness` workspace, artifact store, branch coordinator, and workflow runner
-- [`smoke/AGENTS.md`](smoke/AGENTS.md) — Built-in 27-check deterministic self-verification suite
+- [`smoke/AGENTS.md`](smoke/AGENTS.md) — Built-in 33-check deterministic self-verification suite
 - [`cli/AGENTS.md`](cli/AGENTS.md) — Command parser, JSON/exit-code formatting, and domain command handlers

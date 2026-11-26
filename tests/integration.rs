@@ -2089,4 +2089,1496 @@ fn error_handling_phase3_workflow_schema_and_domain_guards() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
+#[test]
+fn liveness_compaction_auto_repair_and_attention_head_macros() {
+    use math_draw::liveness::{auto_repair_spec, compact_slots_by_liveness, ssa_normalize_spec};
+    use math_draw::rollout::rollout_unroll_with_options;
+
+    // 1. Explain liveness + SSA normalization + linear-scan compaction on a deep chain
+    let chain_raw = r#"{
+      "numSlots": 7,
+      "layers": [
+        { "constructor": "linear", "args": [0, 2, 2, true] },
+        { "constructor": "relu", "args": [1] },
+        { "constructor": "sigmoid", "args": [2] },
+        { "constructor": "tanh", "args": [3] },
+        { "constructor": "fma", "args": [4] }
+      ],
+      "steps": [
+        { "kind": "unary", "layer": 0, "slots": [0, 1] },
+        { "kind": "unary", "layer": 1, "slots": [1, 2] },
+        { "kind": "unary", "layer": 2, "slots": [2, 3] },
+        { "kind": "unary", "layer": 3, "slots": [3, 4] },
+        { "kind": "ternary", "layer": 4, "slots": [4, 2, 0, 5] }
+      ],
+      "outputSlot": 5,
+      "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+      "weights": { "0": [0.8, -0.3, 0.4, 0.7, 0.1, -0.2] },
+      "inputs": { "0": [1.5, -0.5] }
+    }"#;
+    let chain = load_spec_str(chain_raw, Path::new(".")).unwrap().spec;
+    let val = validate_spec(&chain, true);
+    assert!(val.valid);
+    let explain = val.explain.as_ref().unwrap();
+    assert!(!explain.liveness.peak_is_lower_bound);
+    assert!(explain.liveness.peak_bytes >= 24);
+    assert_eq!(explain.liveness.live_before.len(), chain.steps.len() + 1);
+
+    let comp = compact_slots_by_liveness(&chain).unwrap();
+    assert!(comp.slots_saved >= 2, "expected >=2 slots saved, got {}", comp.slots_saved);
+    let base_out = run_spec(&chain).unwrap().outputs.values;
+    let comp_out = run_spec(&comp.spec).unwrap().outputs.values;
+    assert_eq!(base_out, comp_out);
+
+    // 2. SSA normalize a spec that overwrites slots in-place
+    let ssa_rep = ssa_normalize_spec(&comp.spec);
+    assert!(validate_spec(&ssa_rep.ssa_spec, false).valid);
+    assert_eq!(run_spec(&ssa_rep.ssa_spec).unwrap().outputs.values, base_out);
+
+    // 3. Rollout unroll with --compact-slots reduces slot count while preserving bit-identity
+    let rec_raw = r#"{
+      "numSlots": 3,
+      "layers": [
+        { "constructor": "linear", "args": [0, 2, 2, true] },
+        { "constructor": "tanh", "args": [1] }
+      ],
+      "steps": [
+        { "kind": "unary", "layer": 0, "slots": [0, 1] },
+        { "kind": "unary", "layer": 1, "slots": [1, 2] }
+      ],
+      "outputSlot": 2,
+      "ports": [{ "slot": 0, "role": "state", "shape": [1, 2, 1, 1] }],
+      "weights": { "0": [0.5, 0.0, 0.0, 0.5, 0.1, -0.1] },
+      "inputs": { "0": [1.0, -1.0] }
+    }"#;
+    let rec = load_spec_str(rec_raw, Path::new(".")).unwrap().spec;
+    let unrolled_plain = rollout_unroll_with_options(&rec, None, 6, None, false).unwrap();
+    let unrolled_comp = rollout_unroll_with_options(&rec, None, 6, None, true).unwrap();
+    assert!(unrolled_comp.unrolled_num_slots < unrolled_plain.unrolled_num_slots);
+    assert_eq!(
+        run_spec(&unrolled_plain.unrolled_spec).unwrap().outputs.values,
+        run_spec(&unrolled_comp.unrolled_spec).unwrap().outputs.values
+    );
+
+    // 4. Auto-repair: mixed f32/i64 boundary cast + terminal intToFloat + unused port + linear sharding
+    let repair_raw = r#"{
+      "numSlots": 5,
+      "layers": [
+        { "constructor": "linear", "args": [0, 2, 4, true] },
+        { "constructor": "intAdd", "args": [1] }
+      ],
+      "steps": [
+        { "kind": "unary", "layer": 0, "slots": [0, 1] },
+        { "kind": "binary", "layer": 1, "slots": [1, 2, 3] }
+      ],
+      "outputSlot": 3,
+      "ports": [
+        { "slot": 0, "shape": [1, 2, 1, 1] },
+        { "slot": 2, "shape": [1, 4, 1, 1] },
+        { "slot": 4, "shape": [1, 2, 1, 1] }
+      ],
+      "weights": { "0": [1,0,0,0, 0,1,0,0, 0,0,0,0] },
+      "inputs": { "0": [3.0, 4.0], "2": [10, 20, 30, 40], "4": [1.0, 1.0] }
+    }"#;
+    let repair_in = load_spec_str(repair_raw, Path::new(".")).unwrap().spec;
+    let rep = auto_repair_spec(&repair_in, 6).unwrap();
+    assert!(rep.repaired);
+    let kinds: Vec<&str> = rep
+        .remediation_receipt
+        .iter()
+        .filter_map(|v| v["repair"].as_str())
+        .collect();
+    assert!(kinds.contains(&"insert_dtype_boundary_cast"), "receipts={kinds:?}");
+    assert!(kinds.contains(&"insert_terminal_intToFloat"), "receipts={kinds:?}");
+    assert!(kinds.contains(&"drain_unused_port"), "receipts={kinds:?}");
+    assert!(kinds.contains(&"recursive_shard_linear"), "receipts={kinds:?}");
+    assert!(validate_spec(&rep.spec, false).valid);
+    let out = run_spec(&rep.spec).unwrap().outputs.values;
+    assert_eq!(out, vec![13.0, 24.0, 30.0, 40.0]);
+
+    // 5. Built-in macro `attention_head` in both `seq_axis1` (cross-attention Sq=2, Skv=3) and `heads_axis1`
+    let seq_attn_raw = r#"{
+      "schema": "burn-math.recursive-spec.v2",
+      "ports": {
+        "q": { "slot": 0, "shape": [1, 2, 2, 1] },
+        "k": { "slot": 1, "shape": [1, 3, 2, 1] },
+        "v": { "slot": 2, "shape": [1, 3, 2, 1] }
+      },
+      "steps": [
+        { "op": "attention_head", "params": { "d_model": 2, "layout": "seq_axis1" }, "in": ["q", "k", "v"], "out": "y" }
+      ],
+      "output": "y",
+      "inputs": {
+        "q": [1.0, 0.0, 0.0, 1.0],
+        "k": [1.0, 0.0, 0.0, 1.0, 0.5, 0.5],
+        "v": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+      }
+    }"#;
+    let seq_attn = load_spec_str(seq_attn_raw, Path::new(".")).unwrap().spec;
+    let seq_out = run_spec(&seq_attn).unwrap();
+    assert_eq!(seq_out.outputs.shape, [1, 2, 2, 1]);
+    assert!(seq_out.outputs.values.iter().all(|v| v.is_finite()));
+
+    let bad_layout = r#"{
+      "schema": "burn-math.recursive-spec.v2",
+      "ports": {
+        "q": { "slot": 0, "shape": [1, 1, 2, 2] },
+        "k": { "slot": 1, "shape": [1, 1, 2, 2] },
+        "v": { "slot": 2, "shape": [1, 1, 2, 2] }
+      },
+      "steps": [
+        { "op": "attention_head", "params": { "d_model": 2, "layout": "invalid_layout" }, "in": ["q", "k", "v"], "out": "y" }
+      ],
+      "output": "y"
+    }"#;
+    assert!(load_spec_str(bad_layout, Path::new(".")).is_err());
+}
+
+#[test]
+fn symbolic_grad_spec_vjp_hvp_and_finite_diff_parity() {
+    use math_draw::grad_spec::{GradSpecOptions, compile_grad_spec};
+    use math_draw::gradcheck::gradcheck_spec;
+
+    // 1. Nonlinear multi-op forward graph: linear -> sigmoid + exp -> sin + fma -> div -> sqrt
+    let nl_raw = r#"{
+      "schema": "burn-math.recursive-spec.v2",
+      "ports": {
+        "x": { "slot": 0, "shape": [1, 2, 1, 1] },
+        "c": { "slot": 1, "shape": [1, 2, 1, 1] }
+      },
+      "steps": [
+        { "op": "linear", "params": { "in_dim": 2, "out_dim": 2, "bias": true }, "in": "x", "out": "h1", "weights": [0.4, -0.2, 0.3, 0.5, 0.1, 0.2] },
+        { "op": "sigmoid", "in": "h1", "out": "s1" },
+        { "op": "tanh", "in": "h1", "out": "t1" },
+        { "op": "fma", "in": ["s1", "t1", "c"], "out": "f1" },
+        { "op": "exp", "in": "s1", "out": "e1" },
+        { "op": "add", "in": ["f1", "e1"], "out": "y" }
+      ],
+      "output": "y",
+      "inputs": { "x": [0.7, -0.4], "c": [1.5, 2.0] }
+    }"#;
+    let loaded = load_spec_str(nl_raw, Path::new(".")).unwrap();
+    let vjp = compile_grad_spec(
+        &loaded.spec,
+        loaded.expansion.as_ref(),
+        &GradSpecOptions {
+            wrt: "x".into(),
+            order: 1,
+            dout: Some(vec![1.0, -0.5]),
+            hvp_vec: None,
+            compact_slots: true,
+        },
+    )
+    .unwrap();
+    let vjp_vals = run_spec(&vjp.spec).unwrap().outputs.values;
+    assert!(
+        vjp.forward_output_slot < vjp.num_slots,
+        "compacted forward_output_slot {} must be < num_slots {}",
+        vjp.forward_output_slot,
+        vjp.num_slots
+    );
+    assert_eq!(
+        Some(vjp.forward_output_slot),
+        vjp.spec.steps[loaded.spec.steps.len() - 1].output_slot(),
+        "compacted forward_output_slot must match the remapped final forward step output slot"
+    );
+
+    // Cross-check against central finite-difference Jacobian J^T * dout
+    let gc = gradcheck_spec(&loaded.spec, None, 1e-3, 1e-2, false, false).unwrap();
+    let jac = &gc.input_jacobians["0"].values;
+    let dout = [1.0f64, -0.5f64];
+    for j in 0..2 {
+        let expected: f64 = (0..2).map(|i| jac[i][j] * dout[i]).sum();
+        assert!(
+            ((vjp_vals[j] as f64) - expected).abs() < 2e-3,
+            "VJP[{j}]={} vs fd={expected}",
+            vjp_vals[j]
+        );
+    }
+
+    // 2. 2nd-order HVP on exp(x): f(x) = exp(x), f'(x) = exp(x), f''(x) = exp(x)
+    let exp_raw = r#"{
+      "numSlots": 2,
+      "layers": [{ "constructor": "exp", "args": [0] }],
+      "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+      "outputSlot": 1,
+      "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+      "inputs": { "0": [0.5, -0.3] }
+    }"#;
+    let exp_spec = load_spec_str(exp_raw, Path::new(".")).unwrap().spec;
+    let hvp = compile_grad_spec(
+        &exp_spec,
+        None,
+        &GradSpecOptions {
+            wrt: "0".into(),
+            order: 2,
+            dout: Some(vec![1.0, 1.0]),
+            hvp_vec: Some(vec![2.0, -3.0]),
+            compact_slots: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(hvp.kind, "symbolic_hvp_spec");
+    assert!(hvp.hvp_slot.is_some());
+    let hvp_vals = run_spec(&hvp.spec).unwrap().outputs.values;
+    let exp0 = 0.5_f32.exp() * 2.0;
+    let exp1 = (-0.3_f32).exp() * (-3.0);
+    assert!((hvp_vals[0] - exp0).abs() < 1e-4, "{} vs {exp0}", hvp_vals[0]);
+    assert!((hvp_vals[1] - exp1).abs() < 1e-4, "{} vs {exp1}", hvp_vals[1]);
+
+    // 3. Test gelu, mish, and swiGlu VJPs against central finite differences
+    for (name, raw) in [
+        (
+            "gelu",
+            r#"{
+              "numSlots": 2,
+              "layers": [{ "constructor": "gelu", "args": [0] }],
+              "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+              "outputSlot": 1,
+              "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+              "inputs": { "0": [0.8, -0.6] }
+            }"#,
+        ),
+        (
+            "mish",
+            r#"{
+              "numSlots": 2,
+              "layers": [{ "constructor": "mish", "args": [0] }],
+              "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+              "outputSlot": 1,
+              "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+              "inputs": { "0": [0.8, -0.6] }
+            }"#,
+        ),
+        (
+            "swiGlu",
+            r#"{
+              "numSlots": 2,
+              "layers": [{ "constructor": "swiGlu", "args": [0, 2, 2, true] }],
+              "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+              "outputSlot": 1,
+              "ports": [{ "slot": 0, "shape": [1, 1, 1, 2], "layout": "feature_last" }],
+              "weights": { "0": [0.5, -0.2, 0.3, 0.4, 0.1, -0.1, 0.2, 0.6, -0.3, 0.5, 0.05, 0.15] },
+              "inputs": { "0": [0.8, -0.6] }
+            }"#,
+        ),
+    ] {
+        let sp = load_spec_str(raw, Path::new(".")).unwrap().spec;
+        let gs = compile_grad_spec(&sp, None, &GradSpecOptions::default()).unwrap();
+        let gvals = run_spec(&gs.spec).unwrap().outputs.values;
+        let gc_op = gradcheck_spec(&sp, None, 1e-3, 1e-2, false, false).unwrap();
+        let jmat = &gc_op.input_jacobians["0"].values;
+        for col in 0..2 {
+            let expected: f64 = (0..2).map(|row| jmat[row][col]).sum();
+            assert!(
+                ((gvals[col] as f64) - expected).abs() < 3e-3,
+                "{name} VJP[{col}]={} vs fd={expected}",
+                gvals[col]
+            );
+        }
+    }
+
+    // 3b. GELU VJP (order=1) & HVP (order=2) at exact origin x = 0.0 (must not divide by zero)
+    {
+        let gelu_zero = load_spec_str(
+            r#"{
+              "numSlots": 2,
+              "layers": [{ "constructor": "gelu", "args": [0] }],
+              "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+              "outputSlot": 1,
+              "ports": [{ "slot": 0, "shape": [1, 4, 1, 1] }],
+              "inputs": { "0": [0.0, 1e-7, 0.8, -0.6] }
+            }"#,
+            Path::new("."),
+        )
+        .unwrap()
+        .spec;
+        let vjp_zero = compile_grad_spec(
+            &gelu_zero,
+            None,
+            &GradSpecOptions {
+                wrt: "0".into(),
+                order: 1,
+                dout: Some(vec![1.0, 1.0, 1.0, 1.0]),
+                hvp_vec: None,
+                compact_slots: true,
+            },
+        )
+        .unwrap();
+        let vjp_z_vals = run_spec(&vjp_zero.spec).unwrap().outputs.values;
+        assert!(
+            (vjp_z_vals[0] - 0.5).abs() < 1e-6,
+            "gelu'(0) expected 0.5, got {}",
+            vjp_z_vals[0]
+        );
+        assert!(
+            (vjp_z_vals[1] - 0.5).abs() < 1e-5,
+            "gelu'(1e-7) expected ~0.5, got {}",
+            vjp_z_vals[1]
+        );
+
+        let hvp_zero = compile_grad_spec(
+            &gelu_zero,
+            None,
+            &GradSpecOptions {
+                wrt: "0".into(),
+                order: 2,
+                dout: Some(vec![1.0, 1.0, 1.0, 1.0]),
+                hvp_vec: Some(vec![1.0, 1.0, 1.0, 1.0]),
+                compact_slots: false,
+            },
+        )
+        .unwrap();
+        let hvp_z_vals = run_spec(&hvp_zero.spec).unwrap().outputs.values;
+        let expected_d2_0 = (2.0 / std::f64::consts::PI).sqrt() as f32;
+        assert!(
+            (hvp_z_vals[0] - expected_d2_0).abs() < 1e-4,
+            "gelu''(0) expected {expected_d2_0}, got {}",
+            hvp_z_vals[0]
+        );
+    }
+
+    // 4. Fail-closed errors
+    assert!(
+        compile_grad_spec(
+            &exp_spec,
+            None,
+            &GradSpecOptions {
+                order: 3,
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        compile_grad_spec(
+            &exp_spec,
+            None,
+            &GradSpecOptions {
+                order: 1,
+                hvp_vec: Some(vec![1.0, 1.0]),
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        compile_grad_spec(
+            &exp_spec,
+            None,
+            &GradSpecOptions {
+                dout: Some(vec![1.0]),
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn soak_prng_manifest_quant_search_and_new_workflow_stages() {
+    use math_draw::harness::execute_harness_workflow;
+    use math_draw::quant::QuantScheme;
+    use math_draw::recurse::{RngKind, SearchOptions, search_graph_tree_with_options};
+    use math_draw::soak::{certify_prng_stream, soak_spec, verify_prng_manifest};
+
+    let spec_raw = r#"{
+      "numSlots": 4,
+      "layers": [
+        { "constructor": "linear", "args": [0, 2, 4, true] },
+        { "constructor": "sigmoid", "args": [1] }
+      ],
+      "steps": [
+        { "kind": "unary", "layer": 0, "slots": [0, 1] },
+        { "kind": "unary", "layer": 1, "slots": [1, 2] }
+      ],
+      "outputSlot": 2,
+      "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+      "weights": { "0": [0.5, -0.2, 0.3, 0.4, 0.1, 0.6, -0.4, 0.2, 0.05, -0.05, 0.1, -0.1] },
+      "inputs": { "0": [1.0, -0.5] }
+    }"#;
+    let spec = load_spec_str(spec_raw, Path::new(".")).unwrap().spec;
+
+    // 1. Soak determinism & domain guard
+    let sk = soak_spec(&spec, 12).unwrap();
+    assert!(sk.identical && sk.runs == 12 && sk.first_mismatch_index.is_none());
+    assert!(soak_spec(&spec, 1).is_err());
+
+    // 2. PRNG stream certification across all 4 engines + tamper check
+    for kind in [
+        RngKind::Xorshift64,
+        RngKind::Mulberry32,
+        RngKind::Pcg32,
+        RngKind::Philox4x32,
+    ] {
+        let m = certify_prng_stream(kind, 123, 50).unwrap();
+        assert_eq!(m.preview.len(), 5);
+        assert!(verify_prng_manifest(&m.algorithm, m.seed, m.count, &m.sha256).unwrap().verified);
+        assert!(!verify_prng_manifest(&m.algorithm, m.seed, m.count + 1, &m.sha256).unwrap().verified);
+    }
+    assert!(certify_prng_stream(RngKind::Mulberry32, 1, 0).is_err());
+
+    // 3. Search with --quant-tol reduces weight bytes when within tolerance & rejects negative quant_tol
+    let sr = search_graph_tree_with_options(
+        &spec,
+        None,
+        &SearchOptions {
+            max_depth: 2,
+            abs_tol: 1e-5,
+            rel_tol: 1e-5,
+            quant_tol: Some(0.1),
+            quant_scheme: QuantScheme::Int8,
+        },
+    )
+    .unwrap();
+    assert!(sr.best_weight_bytes < sr.baseline_weight_bytes);
+    assert!(sr.transform_chain.iter().any(|t| t == "quant:int8"));
+    assert!(
+        search_graph_tree_with_options(
+            &spec,
+            None,
+            &SearchOptions {
+                quant_tol: Some(-0.01),
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+
+    // 4. End-to-end harness workflow exercising new v0.8.0 stages
+    let tmp_dir = std::env::temp_dir().join(format!("math_draw_v08_wf_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let spec_path = tmp_dir.join("spec.json");
+    std::fs::write(&spec_path, spec_raw).unwrap();
+    let bundle_path = tmp_dir.join("out.bundle.json");
+
+    let wf = json!({
+        "spec": spec_path.display().to_string(),
+        "pipeline": [
+            { "stage": "compile", "compact_slots": true },
+            { "stage": "validate", "explain": true },
+            { "stage": "shard", "max_weights": 6 },
+            { "stage": "gradcheck", "eps": 1e-3, "tol": 1e-2, "weights": true, "autodiff": true },
+            { "stage": "soak", "runs": 5 },
+            { "stage": "bundle_export", "attest": ["v08_wf"], "out": bundle_path.display().to_string() },
+            { "stage": "grad_spec", "wrt": 0, "order": 1, "compact_slots": true },
+            { "stage": "run" }
+        ]
+    });
+    let ws = tmp_dir.join("ws");
+    let res = execute_harness_workflow(&wf, &tmp_dir, Some(&ws)).unwrap();
+    assert_eq!(res["ok"], json!(true), "workflow failed: {res}");
+    assert_eq!(res["stages_completed"], json!(8));
+    assert!(bundle_path.exists());
+
+    // Strict unknown field rejected on new stages
+    let bad_wf = json!({
+        "spec": spec_path.display().to_string(),
+        "pipeline": [{ "stage": "soak", "runs": 4, "bogus": true }]
+    });
+    let bad_res = execute_harness_workflow(&bad_wf, &tmp_dir, Some(&ws)).unwrap();
+    assert_eq!(bad_res["ok"], json!(false));
+    assert_eq!(bad_res["code"], json!("workflow_failed"));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn direct_math_cli_and_library_arith_int_kernel_end_to_end() {
+    use math_draw::direct_math::{
+        DirectBatchKind, eval_arith_op, eval_direct_batch, eval_int_op, eval_kernel_op,
+    };
+    use std::process::Command;
+
+    // 1. Arith ops (broadcast, stats, clamp, matmul, axis reductions, fail-closed div0)
+    let add = eval_arith_op("add", "1,2,3", Some("10")).unwrap();
+    assert_eq!(add["broadcast"], json!("b"));
+    assert_eq!(add["values"], json!([11.0, 12.0, 13.0]));
+    let cl = eval_arith_op("clamp", "-5,0.5,9", Some("0,1")).unwrap();
+    assert_eq!(cl["values"], json!([0.0, 0.5, 1.0]));
+    let ax = eval_arith_op("sum_axis", "1,2,3;4,5,6", Some("0")).unwrap();
+    assert_eq!(ax["values"], json!([5.0, 7.0, 9.0]));
+    assert!(eval_arith_op("div", "1,2", Some("1,0")).is_err());
+    assert!(eval_arith_op("clamp", "1,2", Some("5,1")).is_err());
+
+    // 2. Exact i64 ops, overflow guard, --wrap, to-f32 exactness guard, from-f32
+    let im = eval_int_op("matmul", "1,2;3,4", Some("5,6;7,8"), false, false).unwrap();
+    assert_eq!(im["values"], json!(["19", "22", "43", "50"]));
+    assert!(eval_int_op("add", "9223372036854775807", Some("1"), false, false).is_err());
+    let wrapped = eval_int_op("add", "9223372036854775807", Some("1"), true, false).unwrap();
+    assert_eq!(wrapped["values"], json!(["-9223372036854775808"]));
+    assert!(eval_int_op("div", "10", Some("0"), true, false).is_err());
+    assert!(eval_int_op("to-f32", "16777217", None, false, false).is_err());
+    assert!(eval_int_op("to-f32", "16777217", None, false, true).is_ok());
+    let fr = eval_int_op("from-f32", "3.9,-4.7,0", None, false, false).unwrap();
+    assert_eq!(fr["values"], json!(["3", "-4", "0"]));
+
+    // 3. Lane-E kernel ops: round half-to-even, atan2(y,x), fma, strict no-broadcast
+    let rd = eval_kernel_op("round", "2.5,3.5", None, None).unwrap();
+    assert_eq!(rd["values"], json!([2.0, 4.0]));
+    let at = eval_kernel_op("atan2", "1,0", Some("0,1"), None).unwrap();
+    let at0 = at["values"][0].as_f64().unwrap();
+    let at1 = at["values"][1].as_f64().unwrap();
+    assert!((at0 - std::f64::consts::FRAC_PI_2).abs() < 1e-5);
+    assert!(at1.abs() < 1e-6);
+    assert!(eval_kernel_op("hypot", "3,4", Some("1"), None).is_err());
+
+    // 4. Batch chaining for int and kernel
+    let int_batch = eval_direct_batch(
+        DirectBatchKind::Int,
+        &json!([
+            { "op": "add", "a": "10,20", "b": "5" },
+            { "op": "mul", "a": "$prev", "b": "2" }
+        ]),
+    )
+    .unwrap();
+    assert_eq!(int_batch["results"][1]["values"], json!(["30", "50"]));
+
+    // 5. Live CLI binary verification for new v0.8.0 commands
+    let bin = env!("CARGO_BIN_EXE_math-draw");
+    let run_cli = |args: &[&str]| -> (i32, serde_json::Value) {
+        let out = Command::new(bin).args(args).output().unwrap();
+        let code = out.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("non-JSON stdout for {args:?}: {e}\n{stdout}"));
+        (code, parsed)
+    };
+
+    let (c, v) = run_cli(&["arith", "add", "1,-2", "3,4"]);
+    assert_eq!(c, 0);
+    assert_eq!(v["values"], json!([4.0, 2.0]));
+
+    let (c, v) = run_cli(&["int", "add", "16777217", "1"]);
+    assert_eq!(c, 0);
+    assert_eq!(v["values"], json!(["16777218"]));
+
+    let (c, v) = run_cli(&["kernel", "fma", "2,3", "4,5", "1,-1"]);
+    assert_eq!(c, 0);
+    assert_eq!(v["values"], json!([9.0, 14.0]));
+
+    let tmp_dir = std::env::temp_dir().join(format!("math_draw_v08_cli_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let manifest_p = tmp_dir.join("prng.json");
+    let mp = manifest_p.to_str().unwrap();
+
+    let (c, v) = run_cli(&["prng-check", "philox4x32", "7", "32", "--out", mp]);
+    assert_eq!(c, 0);
+    assert_eq!(v["ok"], json!(true));
+    let (c, v) = run_cli(&["prng-check", "verify", mp]);
+    assert_eq!(c, 0);
+    assert_eq!(v["verified"], json!(true));
+
+    let (c, v) = run_cli(&["soak", "examples/linear-relu.json", "--runs", "5"]);
+    assert_eq!(c, 0);
+    assert_eq!(v["identical"], json!(true));
+
+    let (c, v) = run_cli(&[
+        "recurse",
+        "expand",
+        "examples/recursive-gated-residual.v2.json",
+        "--auto-repair",
+        "--compact-slots",
+    ]);
+    assert_eq!(c, 0);
+    assert_eq!(v["ok"], json!(true));
+    assert!(v["slot_compaction"]["slots_saved"].as_u64().unwrap() > 0);
+
+    let (c, v) = run_cli(&[
+        "rollout",
+        "unroll",
+        "examples/recursive-gated-residual.v2.json",
+        "--steps",
+        "4",
+        "--compact-slots",
+    ]);
+    assert_eq!(c, 0);
+    assert_eq!(v["ok"], json!(true));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn diff_ref_all_f32_families_and_external_ref_parity() {
+    use math_draw::diff_ref::{SUPPORTED_REF_OPS, diff_ref_spec, run_reference_f64};
+    use std::process::Command;
+
+    // 1. Verify exact 87-op alignment with non-integer constructors in CATALOG
+    assert_eq!(SUPPORTED_REF_OPS.len(), 87);
+    for meta in CATALOG {
+        if !math_draw::catalog::is_int_constructor(meta.name) {
+            assert!(
+                SUPPORTED_REF_OPS.contains(&meta.name),
+                "missing f32 constructor '{}' in SUPPORTED_REF_OPS",
+                meta.name
+            );
+        }
+    }
+
+    let check_unary = |ctor: &str,
+                       args: Vec<serde_json::Value>,
+                       shape: [usize; 4],
+                       input: Vec<serde_json::Value>,
+                       weights: Option<Vec<f32>>,
+                       tol: f64| {
+        let mut w_map = BTreeMap::new();
+        if let Some(w) = weights {
+            w_map.insert("0".to_string(), w);
+        }
+        let mut in_map = BTreeMap::new();
+        in_map.insert("0".to_string(), input);
+        let spec = SpecV1 {
+            num_slots: 2,
+            layers: vec![LayerDecl {
+                constructor: ctor.to_string(),
+                args,
+            }],
+            steps: vec![StepDecl {
+                kind: "unary".into(),
+                layer: 0,
+                slots: vec![0, 1],
+            }],
+            output_slot: 1,
+            ports: vec![PortDecl {
+                slot: 0,
+                role: "observation".into(),
+                shape,
+                layout: "any_rank4".into(),
+            }],
+            weights: w_map,
+            inputs: in_map,
+        };
+        let rep = diff_ref_spec(&spec, None, None, tol)
+            .unwrap_or_else(|e| panic!("diff_ref_spec({ctor}) error: {e}"));
+        assert!(
+            rep.ok,
+            "diff_ref_spec({ctor}) SIGNAL: abs={:.3e} rel={:.3e} tol={tol}",
+            rep.max_abs_error, rep.max_rel_error
+        );
+    };
+
+    let check_binary = |ctor: &str,
+                        args: Vec<serde_json::Value>,
+                        s0: [usize; 4],
+                        i0: Vec<serde_json::Value>,
+                        s1: [usize; 4],
+                        i1: Vec<serde_json::Value>,
+                        tol: f64| {
+        let mut in_map = BTreeMap::new();
+        in_map.insert("0".to_string(), i0);
+        in_map.insert("1".to_string(), i1);
+        let spec = SpecV1 {
+            num_slots: 3,
+            layers: vec![LayerDecl {
+                constructor: ctor.to_string(),
+                args,
+            }],
+            steps: vec![StepDecl {
+                kind: "binary".into(),
+                layer: 0,
+                slots: vec![0, 1, 2],
+            }],
+            output_slot: 2,
+            ports: vec![
+                PortDecl {
+                    slot: 0,
+                    role: "observation".into(),
+                    shape: s0,
+                    layout: "any_rank4".into(),
+                },
+                PortDecl {
+                    slot: 1,
+                    role: "observation".into(),
+                    shape: s1,
+                    layout: "any_rank4".into(),
+                },
+            ],
+            weights: BTreeMap::new(),
+            inputs: in_map,
+        };
+        let rep = diff_ref_spec(&spec, None, None, tol)
+            .unwrap_or_else(|e| panic!("diff_ref_spec({ctor}) error: {e}"));
+        assert!(
+            rep.ok,
+            "diff_ref_spec({ctor}) SIGNAL: abs={:.3e} rel={:.3e} tol={tol}",
+            rep.max_abs_error, rep.max_rel_error
+        );
+    };
+
+    let f4 = vec![json!(0.4), json!(-0.7), json!(1.2), json!(0.25)];
+    let pos4 = vec![json!(0.4), json!(0.7), json!(1.2), json!(2.5)];
+    let prob_p = vec![json!(0.2), json!(0.3), json!(0.5)];
+    let prob_q = vec![json!(0.25), json!(0.25), json!(0.5)];
+    let img2x2: Vec<serde_json::Value> = (1..=8).map(|i| json!(i as f64 * 0.25 - 0.5)).collect();
+
+    // Activations (15)
+    for op in ["relu", "gelu", "sigmoid", "tanh", "hardSwish", "mish"] {
+        check_unary(op, vec![json!(0)], [1, 4, 1, 1], f4.clone(), None, 1e-5);
+    }
+    check_unary("leakyRelu", vec![json!(0), json!(0.1)], [1, 4, 1, 1], f4.clone(), None, 1e-5);
+    check_unary("prelu", vec![json!(0), json!(4), json!(0.25)], [1, 4, 1, 1], f4.clone(), Some(vec![0.1, 0.2, 0.3, 0.4]), 1e-5);
+    check_unary("swiGlu", vec![json!(0), json!(2), json!(2), json!(true)], [1, 1, 1, 2], vec![json!(0.8), json!(-0.6)], Some(vec![0.5, -0.2, 0.3, 0.4, 0.1, -0.1, 0.2, 0.6, -0.3, 0.5, 0.05, 0.15]), 1e-5);
+    check_unary("hardSigmoid", vec![json!(0), json!(0.2), json!(0.5)], [1, 4, 1, 1], f4.clone(), None, 1e-5);
+    check_unary("softplus", vec![json!(0), json!(1.5)], [1, 4, 1, 1], f4.clone(), None, 1e-5);
+    check_unary("softmax", vec![json!(0), json!(1)], [1, 4, 1, 1], f4.clone(), None, 1e-5);
+    check_unary("logSoftmax", vec![json!(0), json!(1)], [1, 4, 1, 1], f4.clone(), None, 1e-5);
+    check_unary("glu", vec![json!(0), json!(1)], [1, 4, 1, 1], f4.clone(), None, 1e-5);
+    check_unary("sqrt", vec![json!(0)], [1, 4, 1, 1], pos4.clone(), None, 1e-5);
+
+    // Linear (1)
+    check_unary("linear", vec![json!(0), json!(2), json!(3), json!(true)], [1, 2, 1, 1], vec![json!(1.5), json!(-0.5)], Some(vec![0.5, -0.2, 0.3, 0.4, 0.1, 0.6, -0.1, 0.2, 0.05]), 1e-5);
+
+    // Norms (5)
+    check_unary("batchNorm", vec![json!(0), json!(2), json!(1e-5)], [2, 2, 2, 1], img2x2.clone(), Some(vec![1.1, 0.9, 0.1, -0.2]), 1e-4);
+    check_unary("groupNorm", vec![json!(0), json!(2), json!(2), json!(1e-5)], [1, 2, 2, 2], img2x2.clone(), Some(vec![1.2, 0.8, 0.05, -0.05]), 1e-4);
+    check_unary("instanceNorm", vec![json!(0), json!(2), json!(1e-5)], [1, 2, 2, 2], img2x2.clone(), Some(vec![1.1, 0.7, 0.2, -0.1]), 1e-4);
+    check_unary("layerNorm", vec![json!(0), json!(4), json!(1e-5)], [1, 1, 1, 4], f4.clone(), Some(vec![1.0, 1.2, 0.8, 0.9, 0.1, -0.1, 0.05, 0.0]), 1e-4);
+    check_unary("rmsNorm", vec![json!(0), json!(4), json!(1e-6)], [1, 1, 1, 4], f4.clone(), Some(vec![1.1, 0.9, 1.2, 0.8]), 1e-5);
+
+    // Convs & Embedding (4)
+    check_unary("conv1d", vec![json!(0), json!(2), json!(2), json!(2), json!(1), json!(0)], [1, 2, 4, 1], img2x2.clone(), Some(vec![0.2, -0.1, 0.3, 0.4, -0.2, 0.5, 0.1, -0.3, 0.05, -0.05]), 1e-5);
+    check_unary("conv2d", vec![json!(0), json!(2), json!(2), json!(2), json!(2), json!(1), json!(1), json!(0), json!(0)], [1, 2, 2, 2], img2x2.clone(), Some((0..18).map(|i| (i as f32) * 0.07 - 0.5).collect()), 1e-5);
+    check_unary("convTranspose2d", vec![json!(0), json!(2), json!(2), json!(2), json!(2), json!(1), json!(1), json!(0), json!(0)], [1, 2, 2, 2], img2x2.clone(), Some((0..18).map(|i| (i as f32) * 0.06 - 0.4).collect()), 1e-5);
+    check_unary("embedding", vec![json!(0), json!(4), json!(3)], [1, 2, 1, 1], vec![json!(1), json!(3)], Some((0..12).map(|i| i as f32 * 0.25).collect()), 1e-5);
+
+    // Pools (5)
+    check_unary("maxPool1d", vec![json!(0), json!(2), json!(1), json!(0)], [1, 2, 4, 1], img2x2.clone(), None, 1e-5);
+    check_unary("avgPool1d", vec![json!(0), json!(2), json!(1), json!(0)], [1, 2, 4, 1], img2x2.clone(), None, 1e-5);
+    check_unary("maxPool2d", vec![json!(0), json!(2), json!(2), json!(1), json!(1), json!(0), json!(0)], [1, 2, 2, 2], img2x2.clone(), None, 1e-5);
+    check_unary("avgPool2d", vec![json!(0), json!(2), json!(2), json!(1), json!(1), json!(0), json!(0)], [1, 2, 2, 2], img2x2.clone(), None, 1e-5);
+    check_unary("adaptiveAvgPool2d", vec![json!(0), json!(1), json!(1)], [1, 2, 2, 2], img2x2.clone(), None, 1e-5);
+
+    // Custom (7)
+    check_unary("featureNorm", vec![json!(0), json!(1e-6)], [1, 4, 1, 1], f4.clone(), None, 1e-5);
+    for sh in ["shiftUp", "shiftDown", "shiftLeft", "shiftRight"] {
+        check_unary(sh, vec![json!(0), json!(1)], [1, 2, 2, 2], img2x2.clone(), None, 1e-6);
+    }
+    check_unary("ghost", vec![json!(0), json!(2), json!(4), json!(1), json!(1), json!(2), json!(1), json!(1), json!(0), json!(0)], [1, 2, 2, 2], img2x2.clone(), Some((0..8).map(|i| (i as f32) * 0.1 - 0.3).collect()), 1e-5);
+    check_unary("seBlock", vec![json!(0), json!(2), json!(1)], [1, 2, 2, 2], img2x2.clone(), Some(vec![0.4, -0.2, 0.3, 0.5, 0.1, -0.1, 0.2, 0.6, -0.3, 0.5, 0.05, 0.1]), 1e-5);
+
+    // Binary f32 (6) & Transform (1)
+    for op in ["add", "sub", "mul", "div"] {
+        check_binary(op, vec![json!(0)], [1, 4, 1, 1], f4.clone(), [1, 4, 1, 1], pos4.clone(), 1e-5);
+    }
+    check_binary("matmul", vec![json!(0)], [1, 1, 2, 2], f4.clone(), [1, 1, 2, 2], pos4.clone(), 1e-5);
+    check_binary("concat", vec![json!(0), json!(1)], [1, 4, 1, 1], f4.clone(), [1, 4, 1, 1], pos4.clone(), 1e-6);
+    check_unary("transpose", vec![json!(0), json!(1), json!(2)], [1, 2, 2, 2], img2x2.clone(), None, 1e-6);
+
+    // Numeric primitives (15)
+    for op in ["abs", "exp", "sin", "cos", "tan", "floor", "ceil", "round", "allFinite"] {
+        check_unary(op, vec![json!(0)], [1, 4, 1, 1], f4.clone(), None, 1e-5);
+    }
+    check_unary("log", vec![json!(0)], [1, 4, 1, 1], pos4.clone(), None, 1e-5);
+    check_unary("clamp", vec![json!(0), json!(-0.2), json!(0.9)], [1, 4, 1, 1], f4.clone(), None, 1e-6);
+    check_binary("atan2", vec![json!(0)], [1, 4, 1, 1], f4.clone(), [1, 4, 1, 1], pos4.clone(), 1e-5);
+    check_binary("powf", vec![json!(0)], [1, 4, 1, 1], pos4.clone(), [1, 4, 1, 1], f4.clone(), 1e-5);
+    check_binary("hypot", vec![json!(0)], [1, 4, 1, 1], f4.clone(), [1, 4, 1, 1], pos4.clone(), 1e-5);
+
+    // Ternary fma
+    {
+        let mut in_map = BTreeMap::new();
+        in_map.insert("0".to_string(), f4.clone());
+        in_map.insert("1".to_string(), pos4.clone());
+        in_map.insert("2".to_string(), vec![json!(0.1), json!(0.2), json!(0.3), json!(0.4)]);
+        let fma_spec = SpecV1 {
+            num_slots: 4,
+            layers: vec![LayerDecl { constructor: "fma".into(), args: vec![json!(0)] }],
+            steps: vec![StepDecl { kind: "ternary".into(), layer: 0, slots: vec![0, 1, 2, 3] }],
+            output_slot: 3,
+            ports: vec![
+                PortDecl { slot: 0, role: "observation".into(), shape: [1, 4, 1, 1], layout: "any_rank4".into() },
+                PortDecl { slot: 1, role: "observation".into(), shape: [1, 4, 1, 1], layout: "any_rank4".into() },
+                PortDecl { slot: 2, role: "observation".into(), shape: [1, 4, 1, 1], layout: "any_rank4".into() },
+            ],
+            weights: BTreeMap::new(),
+            inputs: in_map,
+        };
+        let rep = diff_ref_spec(&fma_spec, None, None, 1e-5).unwrap();
+        assert!(rep.ok);
+    }
+
+    // Transforms (6)
+    check_unary("reshape", vec![json!(0), json!([1, 2, 2, 1])], [1, 4, 1, 1], f4.clone(), None, 1e-6);
+    check_unary("permute", vec![json!(0), json!([0, 2, 3, 1])], [1, 2, 2, 2], img2x2.clone(), None, 1e-6);
+    check_unary("slice", vec![json!(0), json!([0, 0, 0, 0]), json!([1, 2, 1, 2])], [1, 2, 2, 2], img2x2.clone(), None, 1e-6);
+    check_unary("selectAxis", vec![json!(0), json!(1), json!([3, 0, 2])], [1, 4, 1, 1], f4.clone(), None, 1e-6);
+    check_unary("fillLike", vec![json!(0), json!(3.5)], [1, 4, 1, 1], f4.clone(), None, 1e-6);
+    check_binary("expandLike", vec![json!(0)], [1, 1, 1, 1], vec![json!(2.25)], [1, 4, 1, 1], f4.clone(), 1e-6);
+
+    // Linalg (4)
+    check_binary("dot", vec![json!(0)], [1, 4, 1, 1], f4.clone(), [1, 4, 1, 1], pos4.clone(), 1e-5);
+    check_unary("l2Norm", vec![json!(0)], [1, 4, 1, 1], f4.clone(), None, 1e-5);
+    check_binary("l2Distance", vec![json!(0)], [1, 4, 1, 1], f4.clone(), [1, 4, 1, 1], pos4.clone(), 1e-5);
+    check_binary("cosineSimilarity", vec![json!(0), json!(1e-8)], [1, 4, 1, 1], f4.clone(), [1, 4, 1, 1], pos4.clone(), 1e-5);
+
+    // Statistics (8) & Reductions (4)
+    for op in [
+        "sum",
+        "mean",
+        "variancePopulation",
+        "stdPopulation",
+        "varianceSample",
+        "stdSample",
+        "min",
+        "max",
+    ] {
+        check_unary(op, vec![json!(0)], [1, 4, 1, 1], f4.clone(), None, 1e-5);
+    }
+    for op in ["sumAxis", "meanAxis", "minAxis", "maxAxis"] {
+        check_unary(op, vec![json!(0), json!(2)], [1, 2, 2, 2], img2x2.clone(), None, 1e-5);
+    }
+
+    // Probability (4) & Comparison/Index (2)
+    check_unary("normalize", vec![json!(0)], [1, 3, 1, 1], prob_p.clone(), None, 1e-5);
+    check_unary("entropy", vec![json!(0)], [1, 3, 1, 1], prob_p.clone(), None, 1e-5);
+    check_binary("crossEntropy", vec![json!(0)], [1, 3, 1, 1], prob_p.clone(), [1, 3, 1, 1], prob_q.clone(), 1e-5);
+    check_binary("klDivergence", vec![json!(0)], [1, 3, 1, 1], prob_p.clone(), [1, 3, 1, 1], prob_q.clone(), 1e-5);
+    check_binary("lessEqual01", vec![json!(0)], [1, 4, 1, 1], f4.clone(), [1, 4, 1, 1], pos4.clone(), 1e-6);
+    check_unary("indicesLike", vec![json!(0), json!(2)], [1, 2, 2, 2], img2x2.clone(), None, 1e-6);
+
+    // 2. Fail-closed checks: bad tol, int op without --ref, ref length mismatch
+    let lin_spec = math_draw::spec::load_spec_file(Path::new("examples/linear-relu.json"))
+        .unwrap()
+        .spec;
+    assert!(diff_ref_spec(&lin_spec, None, None, 0.0).is_err());
+    assert!(diff_ref_spec(&lin_spec, None, None, -1e-4).is_err());
+    assert!(diff_ref_spec(&lin_spec, None, None, f64::NAN).is_err());
+    assert!(diff_ref_spec(&lin_spec, None, Some(&[vec![1.0]]), 1e-4).is_err());
+    assert!(diff_ref_spec(&lin_spec, None, Some(&[vec![f64::NAN, 0.0]]), 1e-4).is_err());
+
+    let int_spec = load_spec_str(
+        r#"{
+          "numSlots": 3,
+          "layers": [{ "constructor": "intAdd", "args": [0] }],
+          "steps": [{ "kind": "binary", "layer": 0, "slots": [0, 1, 2] }],
+          "outputSlot": 2,
+          "ports": [
+            { "slot": 0, "shape": [1, 2, 1, 1] },
+            { "slot": 1, "shape": [1, 2, 1, 1] }
+          ],
+          "inputs": { "0": [1, 2], "1": [3, 4] }
+        }"#,
+        Path::new("."),
+    )
+    .unwrap()
+    .spec;
+    assert!(run_reference_f64(&int_spec, None).is_err());
+
+    // 3. Live CLI `math-draw diff-ref` (oracle PASS + external --ref PASS & SIGNAL)
+    let bin = env!("CARGO_BIN_EXE_math-draw");
+    let run_cli = |args: &[&str]| -> (i32, serde_json::Value) {
+        let out = Command::new(bin).args(args).output().unwrap();
+        let code = out.status.code().unwrap_or(-1);
+        let val: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        (code, val)
+    };
+
+    let (c, v) = run_cli(&["diff-ref", "examples/linear-relu.json", "--tol", "1e-5"]);
+    assert_eq!(c, 0, "diff-ref CLI failed: {v}");
+    assert_eq!(v["ok"], json!(true));
+    assert_eq!(v["verdict"], json!("PASS"));
+    assert_eq!(v["reference_source"], json!("pure_rust_f64"));
+
+    let tmp_dir = std::env::temp_dir().join(format!("math_draw_diffref_cli_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let ref_good = tmp_dir.join("ref_good.json");
+    let ref_bad = tmp_dir.join("ref_bad.json");
+    let ref_t = run_reference_f64(&lin_spec, None).unwrap();
+    std::fs::write(&ref_good, serde_json::to_string(&ref_t.values).unwrap()).unwrap();
+    let mut bad_vals = ref_t.values.clone();
+    bad_vals[0] += 5.0;
+    std::fs::write(&ref_bad, serde_json::to_string(&bad_vals).unwrap()).unwrap();
+
+    let (c, v) = run_cli(&["diff-ref", "examples/linear-relu.json", "--ref", ref_good.to_str().unwrap()]);
+    assert_eq!(c, 0);
+    assert_eq!(v["verdict"], json!("PASS"));
+    assert_eq!(v["reference_source"], json!("external_ref"));
+
+    let (c, v) = run_cli(&["diff-ref", "examples/linear-relu.json", "--ref", ref_bad.to_str().unwrap()]);
+    assert_eq!(c, 2);
+    assert_eq!(v["ok"], json!(false));
+    assert_eq!(v["verdict"], json!("SIGNAL"));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn geom3_builders_scene_tree_ik_projection_batch_and_cli() {
+    use math_draw::geom3::{
+        BATCH_MAX, build_chain_spec, compile_scene_tree, project_model, run_geom_selftest,
+        solve_ik,
+    };
+    use math_draw::harness::execute_harness_workflow;
+    use std::process::Command;
+
+    // 1. Selftest 17/17
+    let st = run_geom_selftest().unwrap();
+    assert_eq!(st["ok"], json!(true), "geom selftest failed: {st}");
+    assert_eq!(st["passed"], json!(17));
+    assert_eq!(st["total"], json!(17));
+
+    // 2. build_chain_spec composed vs uncomposed equivalence on Burn engine + repeat op
+    let chain_doc = json!({
+        "input": [1.0, 2.0, 3.0],
+        "chain": [
+            { "op": "scale", "by": [2.0, 1.0, 0.5] },
+            { "op": "euler", "roll": 15.0, "pitch": 25.0, "yaw": 35.0, "order": "ZYX" },
+            { "op": "repeat", "depth": 2, "chain": [{ "op": "rotate_z", "degrees": 45.0 }] },
+            { "op": "translate", "by": [4.0, -2.0, 1.5] }
+        ]
+    });
+    let uncomposed = build_chain_spec(&chain_doc, false).unwrap();
+    let composed = build_chain_spec(&chain_doc, true).unwrap();
+    assert_eq!(uncomposed.steps, 4);
+    assert_eq!(composed.steps, 1);
+    let out_u = run_spec(&uncomposed.spec).unwrap().outputs.values;
+    let out_c = run_spec(&composed.spec).unwrap().outputs.values;
+    for k in 0..3 {
+        assert!((out_u[k] - out_c[k]).abs() < 1e-4, "k={k}: {} vs {}", out_u[k], out_c[k]);
+        assert!(
+            ((out_c[k] as f64) - composed.reference_point_f64[k]).abs() < 1e-4,
+            "k={k}: engine={} vs ref={}",
+            out_c[k],
+            composed.reference_point_f64[k]
+        );
+    }
+
+    // 3. compile_scene_tree cycle/duplicate/unknown-parent fail-closed
+    assert!(
+        compile_scene_tree(&json!({
+            "nodes": [
+                { "id": "a", "parent": "b" },
+                { "id": "b", "parent": "a" }
+            ]
+        }))
+        .is_err()
+    );
+    assert!(
+        compile_scene_tree(&json!({
+            "nodes": [
+                { "id": "a" },
+                { "id": "a" }
+            ]
+        }))
+        .is_err()
+    );
+    assert!(
+        compile_scene_tree(&json!({
+            "nodes": [{ "id": "a", "parent": "missing" }]
+        }))
+        .is_err()
+    );
+
+    // 4. solve_ik with joint limits + engine parity
+    let ik_doc = json!({
+        "joints": [
+            { "id": "j0", "axis": "z", "length": 1.0, "initial_deg": 5.0, "min_deg": -90.0, "max_deg": 90.0 },
+            { "id": "j1", "axis": "z", "length": 1.0, "initial_deg": 5.0, "min_deg": -90.0, "max_deg": 90.0 },
+            { "id": "j2", "axis": "y", "length": 0.5, "initial_deg": 0.0, "min_deg": -90.0, "max_deg": 90.0 }
+        ],
+        "target": [1.5, 1.0, 0.3],
+        "tol": 1e-3,
+        "max_iters": 200
+    });
+    let ik = solve_ik(&ik_doc).unwrap();
+    assert!(ik.ok && ik.converged, "IK did not converge: err={}", ik.final_error);
+    assert!(ik.engine_max_abs_diff < 1e-4);
+    for &ang in &ik.solved_angles_deg {
+        assert!((-90.0..=90.0).contains(&ang));
+    }
+
+    // 5. Multi-chunk batched projection (> BATCH_MAX = 63) matches single projection + triangles clipping
+    let n_verts = BATCH_MAX + 7; // 70 vertices -> 2 chunks (63 + 7)
+    let mut verts = Vec::with_capacity(n_verts);
+    for i in 0..n_verts {
+        let a = (i as f64) * 0.1;
+        verts.push([a.cos(), a.sin(), -5.0 - (i % 5) as f64]);
+    }
+    verts[0] = [0.0, 0.0, 5.0]; // behind camera
+    let model_doc = json!({
+        "vertices": verts,
+        "triangles": [
+            [1, 2, 3],   // fully inside
+            [0, 1, 2]    // spans camera (v0 has w <= 0)
+        ],
+        "camera": {
+            "eye": [0.0, 0.0, 0.0],
+            "target": [0.0, 0.0, -1.0],
+            "up": [0.0, 1.0, 0.0],
+            "fov_deg": 60.0,
+            "aspect": 1.5,
+            "near": 0.1,
+            "far": 100.0
+        },
+        "viewport": { "w": 640.0, "h": 480.0 }
+    });
+    let p_single = project_model(&model_doc, false).unwrap();
+    let p_batch = project_model(&model_doc, true).unwrap();
+    assert_eq!(p_batch.chunks, 2);
+    assert_eq!(p_single.behind_camera, 1);
+    assert_eq!(p_batch.behind_camera, 1);
+    assert_eq!(p_batch.triangles_spans_camera, Some(1));
+    assert_eq!(p_batch.triangles.as_ref().unwrap()[0].clipped_count, 1);
+    assert!(p_batch.triangles.as_ref().unwrap()[1].spans_camera);
+    for (a, b) in p_single.results.iter().zip(p_batch.results.iter()) {
+        assert_eq!(a.behind, b.behind);
+        for k in 0..4 {
+            assert!((a.clip[k] - b.clip[k]).abs() < 1e-5);
+        }
+    }
+
+    // 5b. Overflow-inducing huge viewport dimensions fail closed instead of returning Inf screen coords
+    let overflow_vp_doc = json!({
+        "vertices": [[10.0, 10.0, -2.0]],
+        "camera": {
+            "eye": [0.0, 0.0, 0.0],
+            "target": [0.0, 0.0, -1.0],
+            "up": [0.0, 1.0, 0.0],
+            "fov_deg": 60.0,
+            "aspect": 1.0,
+            "near": 0.1,
+            "far": 100.0
+        },
+        "viewport": { "w": 1e308, "h": 1e308 }
+    });
+    assert!(
+        project_model(&overflow_vp_doc, false).is_err(),
+        "expected huge viewport causing Inf screen coords to fail closed"
+    );
+
+    // 5c. Malformed explicit optional fields fail closed instead of silently substituting defaults
+    let bad_aspect_doc = json!({
+        "vertices": [[0.0, 0.0, -5.0]],
+        "camera": {
+            "eye": [0.0, 0.0, 0.0],
+            "target": [0.0, 0.0, -1.0],
+            "up": [0.0, 1.0, 0.0],
+            "fov_deg": 60.0,
+            "aspect": "16:9",
+            "near": 0.1,
+            "far": 100.0
+        },
+        "viewport": { "w": 800.0, "h": 600.0 }
+    });
+    assert!(project_model(&bad_aspect_doc, false).is_err());
+    assert!(
+        build_chain_spec(
+            &json!({
+                "input": [1.0, 0.0, 0.0],
+                "chain": [{ "op": "euler", "roll": 10.0, "order": 123 }]
+            }),
+            false
+        )
+        .is_err()
+    );
+    assert!(
+        solve_ik(&json!({
+            "joints": [{ "id": "j0", "axis": 42, "length": 1.0 }],
+            "target": [1.0, 0.0, 0.0]
+        }))
+        .is_err()
+    );
+
+    // 6. Workflow `diff_ref` stage + live CLI `math-draw geom` subcommands
+    let tmp_dir = std::env::temp_dir().join(format!("math_draw_geom_cli_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    let wf = json!({
+        "spec": "examples/linear-relu.json",
+        "pipeline": [
+            { "stage": "validate" },
+            { "stage": "diff_ref", "tol": 1e-5 },
+            { "stage": "run" }
+        ]
+    });
+    let ws = tmp_dir.join("ws");
+    let wf_rep = execute_harness_workflow(&wf, Path::new("."), Some(&ws)).unwrap();
+    assert_eq!(wf_rep["ok"], json!(true), "diff_ref workflow failed: {wf_rep}");
+    assert_eq!(wf_rep["stage_reports"][1]["verdict"], json!("PASS"));
+
+    let bin = env!("CARGO_BIN_EXE_math-draw");
+    let run_cli = |args: &[&str]| -> (i32, serde_json::Value) {
+        let out = Command::new(bin).args(args).output().unwrap();
+        let code = out.status.code().unwrap_or(-1);
+        let val: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        (code, val)
+    };
+
+    let (c, v) = run_cli(&["geom", "selftest"]);
+    assert_eq!(c, 0);
+    assert_eq!(v["ok"], json!(true));
+    assert_eq!(v["passed"], json!(17));
+
+    let chain_p = tmp_dir.join("chain.json");
+    let built_p = tmp_dir.join("built.spec.json");
+    let model_p = tmp_dir.join("model.json");
+    let ik_p = tmp_dir.join("ik.json");
+    std::fs::write(&chain_p, serde_json::to_string(&chain_doc).unwrap()).unwrap();
+    std::fs::write(&model_p, serde_json::to_string(&model_doc).unwrap()).unwrap();
+    std::fs::write(&ik_p, serde_json::to_string(&ik_doc).unwrap()).unwrap();
+
+    let (c, v) = run_cli(&[
+        "geom",
+        "build",
+        chain_p.to_str().unwrap(),
+        "--compose",
+        "--out",
+        built_p.to_str().unwrap(),
+    ]);
+    assert_eq!(c, 0);
+    assert_eq!(v["ok"], json!(true));
+    assert_eq!(v["composed"], json!(true));
+
+    let (c, v) = run_cli(&["diff-ref", built_p.to_str().unwrap(), "--tol", "1e-5"]);
+    assert_eq!(c, 0);
+    assert_eq!(v["verdict"], json!("PASS"));
+
+    let (c, v) = run_cli(&["geom", "solve-ik", ik_p.to_str().unwrap()]);
+    assert_eq!(c, 0);
+    assert_eq!(v["converged"], json!(true));
+
+    let (c, v) = run_cli(&["geom", "batch", model_p.to_str().unwrap()]);
+    assert_eq!(c, 0);
+    assert_eq!(v["chunks"], json!(2));
+
+    let (c, v) = run_cli(&["geom", "unknown-sub"]);
+    assert_eq!(c, 2);
+    assert_eq!(v["code"], json!("cli_unknown_command"));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn muse_audit_edge_case_regressions() {
+    use math_draw::diff_ref::{diff_ref_spec, run_reference_f64};
+    use math_draw::direct_math::{DirectBatchKind, eval_direct_batch};
+    use math_draw::geom3::{
+        build_chain_spec, compile_scene_tree, dehomogenize, normal_mat3, perspective4,
+    };
+    use math_draw::grad_spec::{GradSpecOptions, compile_grad_spec};
+    use math_draw::harness::execute_harness_workflow;
+    use math_draw::liveness::auto_repair_spec;
+    use std::process::Command;
+
+    // 1. H1 + M-r2: short weights in linear / swiGlu return Err (never panic) in both grad_spec and diff_ref
+    let short_lin = load_spec_str(
+        r#"{
+          "numSlots": 2,
+          "layers": [{ "constructor": "linear", "args": [0, 2, 2, false] }],
+          "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+          "outputSlot": 1,
+          "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+          "weights": { "0": [0.5, 0.5] },
+          "inputs": { "0": [1.0, 2.0] }
+        }"#,
+        Path::new("."),
+    )
+    .unwrap()
+    .spec;
+    assert!(compile_grad_spec(&short_lin, None, &GradSpecOptions::default()).is_err());
+    assert!(run_reference_f64(&short_lin, None).is_err());
+
+    let short_swiglu = load_spec_str(
+        r#"{
+          "numSlots": 2,
+          "layers": [{ "constructor": "swiGlu", "args": [0, 2, 2, true] }],
+          "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+          "outputSlot": 1,
+          "ports": [{ "slot": 0, "shape": [1, 1, 1, 2], "layout": "feature_last" }],
+          "weights": { "0": [0.5] },
+          "inputs": { "0": [0.8, -0.6] }
+        }"#,
+        Path::new("."),
+    )
+    .unwrap()
+    .spec;
+    assert!(compile_grad_spec(&short_swiglu, None, &GradSpecOptions::default()).is_err());
+    assert!(run_reference_f64(&short_swiglu, None).is_err());
+
+    // 2. H2: order=2 HVP on overwritten intermediate slot differentiates the exact same SSA-final variable
+    let overwrite_spec = load_spec_str(
+        r#"{
+          "numSlots": 3,
+          "layers": [
+            { "constructor": "linear", "args": [0, 1, 1, false] },
+            { "constructor": "sigmoid", "args": [1] },
+            { "constructor": "exp", "args": [2] }
+          ],
+          "steps": [
+            { "kind": "unary", "layer": 0, "slots": [0, 1] },
+            { "kind": "unary", "layer": 1, "slots": [1, 1] },
+            { "kind": "unary", "layer": 2, "slots": [1, 2] }
+          ],
+          "outputSlot": 2,
+          "ports": [{ "slot": 0, "shape": [1, 1, 1, 1] }],
+          "weights": { "0": [1.0] },
+          "inputs": { "0": [0.5] }
+        }"#,
+        Path::new("."),
+    )
+    .unwrap()
+    .spec;
+    let s_val = 1.0f32 / (1.0f32 + (-0.5f32).exp());
+    let expected_exp_s = s_val.exp(); // d/ds exp(s) == d^2/ds^2 exp(s) == exp(s) ~= 1.8635
+    let vjp_mid = compile_grad_spec(
+        &overwrite_spec,
+        None,
+        &GradSpecOptions {
+            wrt: "1".into(),
+            order: 1,
+            dout: Some(vec![1.0]),
+            hvp_vec: None,
+            compact_slots: false,
+        },
+    )
+    .unwrap();
+    let hvp_mid = compile_grad_spec(
+        &overwrite_spec,
+        None,
+        &GradSpecOptions {
+            wrt: "1".into(),
+            order: 2,
+            dout: Some(vec![1.0]),
+            hvp_vec: Some(vec![1.0]),
+            compact_slots: false,
+        },
+    )
+    .unwrap();
+    let vjp_out = run_spec(&vjp_mid.spec).unwrap().outputs.values[0];
+    let hvp_out = run_spec(&hvp_mid.spec).unwrap().outputs.values[0];
+    assert!((vjp_out - expected_exp_s).abs() < 1e-4, "vjp={vjp_out} vs {expected_exp_s}");
+    assert!((hvp_out - expected_exp_s).abs() < 1e-4, "hvp={hvp_out} vs {expected_exp_s}");
+
+    // 3. M-l3: undefined wrt slot fails closed with unresolved_wrt_slot
+    let undef_slot_spec = load_spec_str(
+        r#"{
+          "numSlots": 4,
+          "layers": [{ "constructor": "exp", "args": [0] }],
+          "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+          "outputSlot": 1,
+          "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+          "inputs": { "0": [0.5, -0.5] }
+        }"#,
+        Path::new("."),
+    )
+    .unwrap()
+    .spec;
+    let err_undef = compile_grad_spec(
+        &undef_slot_spec,
+        None,
+        &GradSpecOptions {
+            wrt: "3".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(err_undef.contains("unresolved_wrt_slot"), "got: {err_undef}");
+
+    // 4. M-l5: auto_repair_spec fails closed if spec remains invalid after repair
+    let bad_spec = load_spec_str(
+        r#"{
+          "numSlots": 2,
+          "layers": [{ "constructor": "nonexistentOp", "args": [0] }],
+          "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+          "outputSlot": 1,
+          "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+          "inputs": { "0": [1.0, 2.0] }
+        }"#,
+        Path::new("."),
+    )
+    .unwrap()
+    .spec;
+    assert!(auto_repair_spec(&bad_spec, 65535).is_err());
+
+    // 5. H6 + M-r1: cosineSimilarity default eps=1e-12 matches engine; mixed-magnitude per-element pass rule
+    let cos_default = load_spec_str(
+        r#"{
+          "numSlots": 3,
+          "layers": [{ "constructor": "cosineSimilarity", "args": [0] }],
+          "steps": [{ "kind": "binary", "layer": 0, "slots": [0, 1, 2] }],
+          "outputSlot": 2,
+          "ports": [
+            { "slot": 0, "shape": [1, 4, 1, 1] },
+            { "slot": 1, "shape": [1, 4, 1, 1] }
+          ],
+          "inputs": {
+            "0": [1e-5, 1e-5, 1e-5, 1e-5],
+            "1": [1e-5, 1e-5, 1e-5, 1e-5]
+          }
+        }"#,
+        Path::new("."),
+    )
+    .unwrap()
+    .spec;
+    let cos_rep = diff_ref_spec(&cos_default, None, None, 1e-5).unwrap();
+    assert!(cos_rep.ok && cos_rep.verdict == "PASS", "false SIGNAL on default cosineSimilarity: {cos_rep:?}");
+
+    // Mixed magnitude [1e-8, 1e6]: abs diff at idx 1 is 0.5 (rel=5e-7 <= 1e-5), rel diff at idx 0 is 0.1 (abs=1e-9 <= 1e-5)
+    let id_spec = load_spec_str(
+        r#"{
+          "numSlots": 2,
+          "layers": [{ "constructor": "relu", "args": [0] }],
+          "steps": [{ "kind": "unary", "layer": 0, "slots": [0, 1] }],
+          "outputSlot": 1,
+          "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+          "inputs": { "0": [1e-8, 1e6] }
+        }"#,
+        Path::new("."),
+    )
+    .unwrap()
+    .spec;
+    let mixed_rep = diff_ref_spec(&id_spec, None, Some(&[vec![1.1e-8, 1_000_000.5]]), 1e-5).unwrap();
+    assert!(mixed_rep.ok && mixed_rep.cases[0].first_diff_index.is_none());
+
+    // 6. H4 + M-g1 + M-g2 + M-g4 + M-g5: geom3 overflow & deep-tree guards
+    assert!(
+        build_chain_spec(
+            &json!({
+                "input": [1.0, 1.0, 1.0],
+                "chain": [
+                    { "op": "scale", "by": [1e308, 1e308, 1e308] },
+                    { "op": "scale", "by": [10.0, 10.0, 10.0] }
+                ]
+            }),
+            true
+        )
+        .is_err()
+    );
+    assert!(
+        build_chain_spec(
+            &json!({
+                "input": [1.0, 1.0, 1.0],
+                "chain": [{ "op": "repeat", "depth": 1024, "chain": [{ "op": "scale", "by": [2.0, 2.0, 2.0] }] }]
+            }),
+            true
+        )
+        .is_err()
+    );
+    let near_sing = [
+        1e-320, 0.0, 0.0, 0.0,
+        0.0, 1e154, 0.0, 0.0,
+        0.0, 0.0, 1e154, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ];
+    assert!(normal_mat3(&near_sing).is_err());
+    assert!(perspective4(1e-320, 1.0, 0.1, 100.0).is_err());
+    assert!(perspective4(60.0, 1.0, 8e307, 1.7e308).is_err());
+    assert!(dehomogenize([1e308, 0.0, 0.0, 1e-10]).is_err());
+
+    let deep_nodes: Vec<serde_json::Value> = (0..520)
+        .map(|i| {
+            json!({
+                "id": format!("n{i}"),
+                "parent": if i == 0 { serde_json::Value::Null } else { json!(format!("n{}", i - 1)) },
+                "point": [0.0, 0.0, 0.0]
+            })
+        })
+        .collect();
+    assert!(compile_scene_tree(&json!({ "nodes": deep_nodes })).is_err());
+
+    // 7. H5 + M-d1 + M-d3: direct_math batch strict field allowlist, 2D->1D chaining, CLI --batch + --wrap rejection
+    assert!(
+        eval_direct_batch(
+            DirectBatchKind::Arith,
+            &json!([{ "op": "add", "a": "1,2", "axis": 5 }])
+        )
+        .is_err()
+    );
+    assert!(
+        eval_direct_batch(
+            DirectBatchKind::Arith,
+            &json!([{ "op": "clamp", "a": "-5,0.5,9", "b": "0,1", "min": 0, "max": 1 }])
+        )
+        .is_err()
+    );
+    let mat_chain = eval_direct_batch(
+        DirectBatchKind::Arith,
+        &json!([
+            { "op": "matmul", "a": "1,2;3,4", "b": "5,6;7,8" },
+            { "op": "add", "a": "$prev", "b": [1, 1, 1, 1] }
+        ]),
+    )
+    .unwrap();
+    assert_eq!(mat_chain["results"][1]["values"], json!([20.0, 23.0, 44.0, 51.0]));
+
+    // 8. H3 + M-w1 + M-w2 + M-w4 + M-w6: harness workflow strictness & error codes
+    let tmp_dir = std::env::temp_dir().join(format!("math_draw_muse_audit_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let ws = tmp_dir.join("ws");
+
+    // Empty pipeline rejected (M-w2)
+    assert!(
+        execute_harness_workflow(
+            &json!({ "spec": "examples/linear-relu.json", "pipeline": [] }),
+            Path::new("."),
+            Some(&ws),
+        )
+        .is_err()
+    );
+    // Explicit null param rejected (M-w4) & compile.max_weights=0 rejected (M-w6)
+    let null_rep = execute_harness_workflow(
+        &json!({
+            "spec": "examples/linear-relu.json",
+            "pipeline": [{ "stage": "soak", "runs": null }]
+        }),
+        Path::new("."),
+        Some(&ws),
+    )
+    .unwrap();
+    assert_eq!(null_rep["ok"], json!(false));
+    assert_ne!(null_rep["code"], json!("internal_error"));
+
+    let mw0_rep = execute_harness_workflow(
+        &json!({
+            "spec": "examples/linear-relu.json",
+            "pipeline": [{ "stage": "compile", "auto_repair": true, "max_weights": 0 }]
+        }),
+        Path::new("."),
+        Some(&ws),
+    )
+    .unwrap();
+    assert_eq!(mw0_rep["ok"], json!(false));
+    assert_ne!(mw0_rep["code"], json!("internal_error"));
+
+    // Stage error codes are never internal_error (M-w1)
+    for stage_obj in [
+        json!({ "stage": "quant_budget", "scheme": "bogus" }),
+        json!({ "stage": "grad_spec", "order": 3 }),
+        json!({ "stage": "gradcheck", "tol": 0.0 }),
+        json!({ "stage": "fit", "targets": "does-not-exist-targets.json" }),
+    ] {
+        let rep = execute_harness_workflow(
+            &json!({ "spec": "examples/linear-relu.json", "pipeline": [stage_obj] }),
+            Path::new("."),
+            Some(&ws),
+        )
+        .unwrap();
+        assert_eq!(rep["ok"], json!(false));
+        assert_ne!(rep["code"], json!("internal_error"), "stage returned internal_error: {rep}");
+        assert!(rep["hint"].as_str().is_some_and(|h| !h.is_empty()), "missing hint: {rep}");
+    }
+
+    // M-d3 CLI test: `int --batch <file> --wrap` rejected with exit 2
+    let batch_p = tmp_dir.join("int_batch.json");
+    std::fs::write(&batch_p, r#"[{"op":"add","a":"1","b":"2"}]"#).unwrap();
+    let bin = env!("CARGO_BIN_EXE_math-draw");
+    let out = Command::new(bin)
+        .args(["int", "--batch", batch_p.to_str().unwrap(), "--wrap"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["code"], json!("cli_usage"));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+
+
+
 

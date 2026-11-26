@@ -1,8 +1,9 @@
 use serde_json::json;
 use std::path::Path;
 
-use super::{SmokeCheck, run_check};
+use super::{SmokeCheck, approx_eq_slice, run_check};
 use crate::cost_model::run_cost_model;
+use crate::engine::run_spec;
 use crate::gradcheck::gradcheck_spec;
 use crate::harness::{compute_semantic_digest, execute_harness_workflow, get_capability_catalog};
 use crate::linear_equiv::equiv_linear;
@@ -10,6 +11,7 @@ use crate::mutate::{MutationRequest, mutate_spec};
 use crate::quant::{BudgetMode, QuantScheme, quant_budget, quant_verify};
 use crate::shard::shard_spec;
 use crate::spec::load_spec_str;
+use crate::validate::validate_spec;
 use crate::verify::{FuzzConfig, zoom_fuzz_specs};
 use crate::weight_lab::run_weight_lab_selftest;
 
@@ -456,6 +458,390 @@ pub(crate) fn collect_advanced_checks() -> Vec<SmokeCheck> {
             ok_rep.total_params, ok_rep.checked_attestations
         ))
     }));
+
+    // 28. Liveness analysis, slot compaction, auto-repair & attention_head macro
+    checks.push(run_check(
+        "liveness_compaction_auto_repair_and_attention_head",
+        || {
+            // 4-step chain with 5 slots compacts cleanly to fewer slots with bit-identical output
+            let chain_raw = r#"{
+              "numSlots": 6,
+              "layers": [
+                { "constructor": "linear", "args": [0, 2, 2, true] },
+                { "constructor": "relu", "args": [1] },
+                { "constructor": "sigmoid", "args": [2] },
+                { "constructor": "tanh", "args": [3] }
+              ],
+              "steps": [
+                { "kind": "unary", "layer": 0, "slots": [0, 1] },
+                { "kind": "unary", "layer": 1, "slots": [1, 2] },
+                { "kind": "unary", "layer": 2, "slots": [2, 3] },
+                { "kind": "unary", "layer": 3, "slots": [3, 4] }
+              ],
+              "outputSlot": 4,
+              "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+              "weights": { "0": [0.8, -0.3, 0.4, 0.7, 0.1, -0.2] },
+              "inputs": { "0": [1.5, -0.5] }
+            }"#;
+            let chain = load_spec_str(chain_raw, Path::new("."))?.spec;
+            let val = validate_spec(&chain, true);
+            let peak = val
+                .explain
+                .as_ref()
+                .map(|e| e.liveness.peak_bytes)
+                .unwrap_or(0);
+            if peak == 0 {
+                return Err("expected non-zero liveness peak_bytes".into());
+            }
+            let comp = crate::liveness::compact_slots_by_liveness(&chain)?;
+            if comp.slots_saved == 0 || comp.slots_after >= comp.slots_before {
+                return Err(format!(
+                    "expected slot compaction savings, got {} -> {}",
+                    comp.slots_before, comp.slots_after
+                ));
+            }
+            let base_out = run_spec(&chain)?.outputs.values;
+            let comp_out = run_spec(&comp.spec)?.outputs.values;
+            approx_eq_slice(&base_out, &comp_out, 0.0)?;
+
+            // Auto-repair: terminal i64 output + unused port -> repaired & valid
+            let broken_raw = r#"{
+              "numSlots": 4,
+              "layers": [{ "constructor": "intAdd", "args": [0] }],
+              "steps": [{ "kind": "binary", "layer": 0, "slots": [0, 1, 2] }],
+              "outputSlot": 2,
+              "ports": [
+                { "slot": 0, "shape": [1, 2, 1, 1] },
+                { "slot": 1, "shape": [1, 2, 1, 1] },
+                { "slot": 3, "shape": [1, 2, 1, 1] }
+              ],
+              "inputs": { "0": [3, 4], "1": [5, 6], "3": [1.0, 2.0] }
+            }"#;
+            let broken = load_spec_str(broken_raw, Path::new("."))?.spec;
+            let ar = crate::liveness::auto_repair_spec(&broken, 65535)?;
+            if !ar.repaired || ar.remediation_receipt.len() < 2 {
+                return Err("auto_repair_spec did not emit expected receipts".into());
+            }
+            let ar_out = run_spec(&ar.spec)?.outputs.values;
+            approx_eq_slice(&ar_out, &[8.0, 10.0], 1e-6)?;
+
+            // attention_head macro (heads_axis1)
+            let attn_raw = r#"{
+              "schema": "burn-math.recursive-spec.v2",
+              "ports": {
+                "q": { "slot": 0, "shape": [1, 1, 2, 2] },
+                "k": { "slot": 1, "shape": [1, 1, 2, 2] },
+                "v": { "slot": 2, "shape": [1, 1, 2, 2] }
+              },
+              "steps": [
+                { "op": "attention_head", "params": { "d_model": 2, "layout": "heads_axis1" }, "in": ["q", "k", "v"], "out": "y" }
+              ],
+              "output": "y",
+              "inputs": {
+                "q": [1.0, 0.0, 0.0, 1.0],
+                "k": [1.0, 0.0, 0.0, 1.0],
+                "v": [2.0, 4.0, 6.0, 8.0]
+              }
+            }"#;
+            let attn = load_spec_str(attn_raw, Path::new("."))?.spec;
+            let attn_out = run_spec(&attn)?;
+            if attn_out.outputs.shape != [1, 1, 2, 2] {
+                return Err(format!("unexpected attention_head shape {:?}", attn_out.outputs.shape));
+            }
+            Ok(format!(
+                "peak={}B compacted={}->{} repairs={} attn_ok=true",
+                peak, comp.slots_before, comp.slots_after, ar.remediation_receipt.len()
+            ))
+        },
+    ));
+
+    // 29. Symbolic in-graph VJP (order=1) & 2nd-order HVP (order=2) verified against finite diff
+    checks.push(run_check(
+        "symbolic_grad_spec_vjp_and_second_order_hvp",
+        || {
+            // f(x) = x * x * x -> f'(x) = 3 x^2, f''(x) = 6 x
+            let cubic_raw = r#"{
+              "numSlots": 3,
+              "layers": [
+                { "constructor": "mul", "args": [0] },
+                { "constructor": "mul", "args": [1] }
+              ],
+              "steps": [
+                { "kind": "binary", "layer": 0, "slots": [0, 0, 1] },
+                { "kind": "binary", "layer": 1, "slots": [1, 0, 2] }
+              ],
+              "outputSlot": 2,
+              "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+              "inputs": { "0": [2.0, -3.0] }
+            }"#;
+            let cubic = load_spec_str(cubic_raw, Path::new("."))?.spec;
+            let vjp = crate::grad_spec::compile_grad_spec(
+                &cubic,
+                None,
+                &crate::grad_spec::GradSpecOptions {
+                    wrt: "0".into(),
+                    order: 1,
+                    dout: Some(vec![1.0, 1.0]),
+                    hvp_vec: None,
+                    compact_slots: true,
+                },
+            )?;
+            let vjp_out = run_spec(&vjp.spec)?.outputs.values;
+            approx_eq_slice(&vjp_out, &[12.0, 27.0], 1e-4)?;
+
+            let hvp = crate::grad_spec::compile_grad_spec(
+                &cubic,
+                None,
+                &crate::grad_spec::GradSpecOptions {
+                    wrt: "0".into(),
+                    order: 2,
+                    dout: Some(vec![1.0, 1.0]),
+                    hvp_vec: Some(vec![1.0, 2.0]),
+                    compact_slots: false,
+                },
+            )?;
+            // HVP = diag(6*x) * v = [6*2*1, 6*(-3)*2] = [12, -36]
+            let hvp_out = run_spec(&hvp.spec)?.outputs.values;
+            approx_eq_slice(&hvp_out, &[12.0, -36.0], 1e-3)?;
+            Ok(format!(
+                "vjp={:?} hvp={:?} vjp_slots={}",
+                vjp_out, hvp_out, vjp.num_slots
+            ))
+        },
+    ));
+
+    // 30. Soak determinism proof, PRNG manifest certification & rewrite+quant search
+    checks.push(run_check(
+        "soak_determinism_prng_manifest_and_quant_search",
+        || {
+            let raw = r#"{
+              "numSlots": 3,
+              "layers": [
+                { "constructor": "linear", "args": [0, 2, 2, true] },
+                { "constructor": "relu", "args": [1] }
+              ],
+              "steps": [
+                { "kind": "unary", "layer": 0, "slots": [0, 1] },
+                { "kind": "unary", "layer": 1, "slots": [1, 2] }
+              ],
+              "outputSlot": 2,
+              "ports": [{ "slot": 0, "shape": [1, 2, 1, 1] }],
+              "weights": { "0": [1.0, 0.5, -0.5, 1.0, 0.25, -0.25] },
+              "inputs": { "0": [1.0, 2.0] }
+            }"#;
+            let spec = load_spec_str(raw, Path::new("."))?.spec;
+            let soak = crate::soak::soak_spec(&spec, 8)?;
+            if !soak.identical || soak.runs != 8 {
+                return Err("soak failed bit-identity".into());
+            }
+            let manifest = crate::soak::certify_prng_stream(
+                crate::recurse::RngKind::Philox4x32,
+                42,
+                64,
+            )?;
+            let ok_ver = crate::soak::verify_prng_manifest(
+                &manifest.algorithm,
+                manifest.seed,
+                manifest.count,
+                &manifest.sha256,
+            )?;
+            let bad_ver = crate::soak::verify_prng_manifest(
+                &manifest.algorithm,
+                manifest.seed + 1,
+                manifest.count,
+                &manifest.sha256,
+            )?;
+            if !ok_ver.verified || bad_ver.verified {
+                return Err("prng manifest verification invariant failed".into());
+            }
+            let sr = crate::recurse::search_graph_tree_with_options(
+                &spec,
+                None,
+                &crate::recurse::SearchOptions {
+                    max_depth: 2,
+                    abs_tol: 1e-5,
+                    rel_tol: 1e-5,
+                    quant_tol: Some(0.1),
+                    quant_scheme: crate::quant::QuantScheme::Int8,
+                },
+            )?;
+            if sr.best_weight_bytes >= sr.baseline_weight_bytes {
+                return Err(format!(
+                    "expected quant search to reduce weight bytes, got {} -> {}",
+                    sr.baseline_weight_bytes, sr.best_weight_bytes
+                ));
+            }
+            Ok(format!(
+                "soak=8/8 prng=ok quant_bytes={}->{}",
+                sr.baseline_weight_bytes, sr.best_weight_bytes
+            ))
+        },
+    ));
+
+    // 31. Direct spec-free engine math (arith, int, kernel) + --batch register chaining
+    checks.push(run_check(
+        "direct_math_arith_int_kernel_and_batch_chaining",
+        || {
+            let mm = crate::direct_math::eval_arith_op("matmul", "1,2;3,4", Some("5,6;7,8"))?;
+            let mm_vals: Vec<f32> = mm["values"]
+                .as_array()
+                .ok_or("missing matmul values")?
+                .iter()
+                .filter_map(|v| v.as_f64().map(|x| x as f32))
+                .collect();
+            approx_eq_slice(&mm_vals, &[19.0, 22.0, 43.0, 50.0], 1e-5)?;
+
+            let i_add = crate::direct_math::eval_int_op("add", "16777217,100", Some("1,-30"), false, false)?;
+            if i_add["values"][0] != "16777218" || i_add["values"][1] != "70" {
+                return Err(format!("unexpected int add output: {i_add}"));
+            }
+            if crate::direct_math::eval_int_op("add", "9223372036854775807", Some("1"), false, false).is_ok() {
+                return Err("expected checked int overflow to fail".into());
+            }
+
+            let fma = crate::direct_math::eval_kernel_op("fma", "2,3", Some("4,5"), Some("1,-1"))?;
+            let fma_vals: Vec<f32> = fma["values"]
+                .as_array()
+                .ok_or("missing fma values")?
+                .iter()
+                .filter_map(|v| v.as_f64().map(|x| x as f32))
+                .collect();
+            approx_eq_slice(&fma_vals, &[9.0, 14.0], 1e-6)?;
+
+            let batch_doc = serde_json::json!([
+                { "op": "add", "a": [1.0, 2.0, 3.0], "b": [10.0] },
+                { "op": "mul", "a": "$prev", "b": "$0" },
+                { "op": "sum", "a": "$prev" }
+            ]);
+            let batch_res = crate::direct_math::eval_direct_batch(
+                crate::direct_math::DirectBatchKind::Arith,
+                &batch_doc,
+            )?;
+            let sum_v = batch_res["results"][2]["values"][0]
+                .as_f64()
+                .ok_or("missing batch sum")? as f32;
+            // (11^2 + 12^2 + 13^2) = 121 + 144 + 169 = 434
+            approx_eq_slice(&[sum_v], &[434.0], 1e-4)?;
+            Ok(format!("matmul=ok int_exact=16777218 fma=ok batch_sum={sum_v}"))
+        },
+    ));
+
+    // 32. Independent pure-Rust f64 differential oracle (diff-ref) & external ref tamper detection
+    checks.push(run_check(
+        "diff_ref_f64_oracle_and_external_ref",
+        || {
+            if crate::diff_ref::SUPPORTED_REF_OPS.len() != 87 {
+                return Err(format!(
+                    "expected 87 supported ref ops, got {}",
+                    crate::diff_ref::SUPPORTED_REF_OPS.len()
+                ));
+            }
+            let raw = r#"{
+              "numSlots": 6,
+              "layers": [
+                { "constructor": "linear", "args": [0, 3, 2, true] },
+                { "constructor": "gelu", "args": [1] },
+                { "constructor": "reshape", "args": [2, [1, 1, 1, 2]] },
+                { "constructor": "rmsNorm", "args": [3, 2, 1e-6] },
+                { "constructor": "reshape", "args": [4, [1, 2, 1, 1]] },
+                { "constructor": "fma", "args": [5] }
+              ],
+              "steps": [
+                { "kind": "unary", "layer": 0, "slots": [0, 2] },
+                { "kind": "unary", "layer": 1, "slots": [2, 3] },
+                { "kind": "unary", "layer": 2, "slots": [3, 4] },
+                { "kind": "unary", "layer": 3, "slots": [4, 4] },
+                { "kind": "unary", "layer": 4, "slots": [4, 3] },
+                { "kind": "ternary", "layer": 5, "slots": [3, 1, 2, 5] }
+              ],
+              "outputSlot": 5,
+              "ports": [
+                { "slot": 0, "shape": [1, 3, 1, 1] },
+                { "slot": 1, "shape": [1, 2, 1, 1] }
+              ],
+              "weights": {
+                "0": [0.5, -0.3, 0.4, 0.6, -0.2, 0.7, 0.1, -0.1],
+                "3": [1.1, 0.9]
+              },
+              "inputs": {
+                "0": [1.2, -0.7, 0.4],
+                "1": [0.8, 1.5]
+              }
+            }"#;
+            let spec = load_spec_str(raw, Path::new("."))?.spec;
+            let rep = crate::diff_ref::diff_ref_spec(&spec, None, None, 1e-5)?;
+            if !rep.ok || rep.verdict != "PASS" {
+                return Err(format!(
+                    "diff-ref failed: verdict={} abs={}",
+                    rep.verdict, rep.max_abs_error
+                ));
+            }
+            let ref_t = crate::diff_ref::run_reference_f64(&spec, None)?;
+            let mut tampered = ref_t.values.clone();
+            tampered[0] += 0.25;
+            let sig = crate::diff_ref::diff_ref_spec(&spec, None, Some(&[tampered]), 1e-4)?;
+            if sig.ok || sig.verdict != "SIGNAL" {
+                return Err("expected tampered external ref to emit SIGNAL".into());
+            }
+            Ok(format!(
+                "ops={} max_abs={:.2e} tamper=SIGNAL",
+                crate::diff_ref::SUPPORTED_REF_OPS.len(),
+                rep.max_abs_error
+            ))
+        },
+    ));
+
+    // 33. 3D geometry domain pack (selftest 17/17, scene-tree with repeat, IK solver, batched projection)
+    checks.push(run_check(
+        "geom3_scene_tree_ik_and_batched_projection",
+        || {
+            let st = crate::geom3::run_geom_selftest()?;
+            if st["ok"] != serde_json::json!(true) {
+                return Err(format!("geom selftest failed: {st}"));
+            }
+            let tree_doc = serde_json::json!({
+                "nodes": [
+                    {
+                        "id": "base",
+                        "chain": [{ "op": "repeat", "depth": 3, "chain": [{ "op": "rotate_z", "degrees": 30.0 }] }],
+                        "point": [1.0, 0.0, 0.0]
+                    },
+                    {
+                        "id": "tip",
+                        "parent": "base",
+                        "chain": [{ "op": "translate", "by": [2.0, 0.0, 0.0] }],
+                        "point": [0.0, 0.0, 0.0]
+                    }
+                ]
+            });
+            let tree = crate::geom3::compile_scene_tree(&tree_doc)?;
+            let tree_out = run_spec(&tree.spec)?.outputs.values;
+            // base: Rz(90)*[1,0,0]=[0,1,0]; tip: Rz(90)*[2,0,0]=[0,2,0]
+            approx_eq_slice(&tree_out[0..3], &[0.0, 1.0, 0.0], 1e-5)?;
+            approx_eq_slice(&tree_out[4..7], &[0.0, 2.0, 0.0], 1e-5)?;
+
+            let ik_doc = serde_json::json!({
+                "joints": [
+                    { "id": "shoulder", "axis": "z", "length": 1.0, "initial_deg": 10.0 },
+                    { "id": "elbow", "axis": "z", "length": 1.0, "initial_deg": 10.0 }
+                ],
+                "target": [1.0, 1.0, 0.0],
+                "tol": 1e-3,
+                "max_iters": 150
+            });
+            let ik = crate::geom3::solve_ik(&ik_doc)?;
+            if !ik.ok || ik.engine_max_abs_diff > 1e-4 {
+                return Err(format!(
+                    "solve_ik failed: ok={} err={} eng_diff={}",
+                    ik.ok, ik.final_error, ik.engine_max_abs_diff
+                ));
+            }
+            Ok(format!(
+                "selftest={}/{} ik_err={:.2e} eng_diff={:.2e}",
+                st["passed"], st["total"], ik.final_error, ik.engine_max_abs_diff
+            ))
+        },
+    ));
 
     checks
 }

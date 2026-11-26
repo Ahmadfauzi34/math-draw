@@ -7,7 +7,7 @@ Compiles hierarchical `burn-math.recursive-spec.v2` graph specifications—suppo
 ## Ownership
 
 - Core `v2` schema detection (`is_recursive_spec_v2`), subgraph/repeat/residual lowering, weight binding & `ExpansionReceipt` generation: [`mod.rs`](mod.rs)
-- Built-in reusable subgraph macro definitions (`mlp`, etc.): [`macros.rs`](macros.rs)
+- Built-in reusable subgraph macro definitions (`mlp`, `gated_unit`, `residual_mlp`, `transformer_ffn`, `recurrent_cell`, `attention_head` with `seq_axis1`/`heads_axis1` layouts): [`macros.rs`](macros.rs)
 - Node/slot/layer-index substitution and JSON template instantiation helpers: [`subst.rs`](subst.rs)
 
 ## Local Contracts

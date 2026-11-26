@@ -7,7 +7,7 @@ Implements graph- and parameter-level optimization engines: equivalence-verified
 ## Ownership
 
 - Active trainable parameter discovery (`discover_trainable_slices`, `apply_flat_weights`) & facade exports: [`mod.rs`](mod.rs)
-- Bounded BFS/best-first equivalence-verified rewrite tree search (`search_graph_tree`): [`search.rs`](search.rs)
+- Bounded BFS/best-first equivalence-verified rewrite + optional quantization tree search (`search_graph_tree`, `search_graph_tree_with_options`, `SearchOptions`): [`search.rs`](search.rs)
 - Burn `Autodiff` gradient descent with backtracking line search & optional diagonal Hessian preconditioning (`solve_gd_autodiff`): [`solve_gd.rs`](solve_gd.rs)
 - Deterministic seeded ES optimizer (`fit_es_with_config`, legacy `fit_es`), `EsStrategyKind` (`OpenEs`, `MuLambda`), `FitEsConfig`, and sensitivity-guided layer freezing: [`optimizer.rs`](optimizer.rs)
 - Deterministic PRNG suite (`Xorshift64`, `Mulberry32`, `Pcg32`, `Philox4x32` with `seek`, `RngKind`, `AnyRng`): [`rng.rs`](rng.rs)
@@ -15,7 +15,7 @@ Implements graph- and parameter-level optimization engines: equivalence-verified
 
 ## Local Contracts
 
-- **Verified Rewrite Acceptance**: `search_graph_tree` requires finite `abs_tol >= 0` and `rel_tol >= 0`, and may only promote rewrite nodes whose outputs pass `verify_specs` within `abs_tol`/`rel_tol` across active evaluation cases.
+- **Verified Rewrite & Quantization Acceptance**: `search_graph_tree` and `search_graph_tree_with_options` require finite `abs_tol >= 0`, `rel_tol >= 0`, and optional `quant_tol >= 0`, and may only promote rewrite or quantization nodes whose outputs pass `verify_specs` within tolerance across active evaluation cases.
 - **Determinism & Reference Vectors**: Given fixed `seed`, `strategy`, `rng`, `targets`, `generations`, `pop`, `mu`, `sigma`, and `lr`, `fit_es_with_config` and `fit_es` must be bit-for-bit reproducible on the `flex` backend. `Mulberry32`, `Pcg32`, and `Philox4x32` must match published reference test vectors (`pcg-c-basic` & Random123).
 - **Fail-Closed ES Hyperparameters**: `fit_es_with_config` and `fit_es` must reject `generations == 0`, `pop < 2`, odd `pop` for `OpenEs` (without silent clamping), invalid `mu` (`0` or `> pop`) for `MuLambda`, `--mu` on `OpenEs`, and non-finite or non-positive `sigma`/`lr`. Non-finite candidate losses must never corrupt parent/mean states.
 - **Non-Degradation / Line Search Safety (`solve_gd_autodiff`)**: Rejects `steps == 0` and non-finite or non-positive `lr` up front; backtracking line search must never accept weight updates producing `NaN`/`Inf` losses; optional `--precondition` diagonal Hessian estimation must clamp safely when curvature is near zero or negative (`hessian_trust`).

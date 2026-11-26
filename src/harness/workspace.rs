@@ -261,35 +261,40 @@ pub fn compute_semantic_digest(
 pub fn get_capability_catalog(domain: Option<&str>) -> Value {
     let domains = json!({
         "compose": {
-            "summary": "Build, expand, and lower recursive v2 specs, macros, sharded layers, and weight expression trees.",
+            "summary": "Build, expand, auto-repair, compact, and lower recursive v2 specs, macros (incl. attention_head), sharded layers, 3D geometry pipelines/scene trees/IK, and weight expression trees.",
             "tools": [
-                { "cmd": "math-draw recurse expand", "role": "Compile burn-math.recursive-spec.v2 (subgraphs, repeat, residual, parallel_concat, $ref, macros) to flat v1" },
+                { "cmd": "math-draw recurse expand [--auto-repair] [--compact-slots]", "role": "Compile burn-math.recursive-spec.v2 (subgraphs, repeat, residual, parallel_concat, $ref, 6 built-in macros incl. attention_head) to flat v1 with optional auto-repair and linear-scan liveness slot compaction" },
                 { "cmd": "math-draw shard", "role": "Split oversized linear layers along output rows with concat(dim=1) and exact reassembly verification" },
+                { "cmd": "math-draw geom <build|scene-tree|solve-ik|project|batch|selftest>", "role": "3D geometry domain pack: 4x4 transform chains (incl. repeat), hierarchical scene trees, 3D IK solver, single & batched (BATCH_MAX=63) Burn projection with near-plane clipping" },
                 { "cmd": "math-draw weight-lab", "role": "Manual-weighting workbench (run, gate, certify, compose, eval, selftest)" }
             ]
         },
         "verify": {
-            "summary": "Validate plans, prove numerical and exact algebraic equivalence, zoom-fuzz worst cases, localize step divergences, and verify portable program bundles.",
+            "summary": "Validate plans with liveness analysis, differential-test Burn against pure-Rust f64 oracle, prove numerical/algebraic equivalence, soak-test determinism, certify PRNG streams, zoom-fuzz worst cases, localize step divergences, and verify portable program bundles.",
             "tools": [
-                { "cmd": "math-draw validate --explain", "role": "95-constructor static validation, 4D shape inference, and dtype dataflow trace" },
+                { "cmd": "math-draw validate --explain", "role": "95-constructor static validation, 4D shape inference, dtype dataflow trace, and peak-byte slot liveness analysis" },
+                { "cmd": "math-draw diff-ref [--cases <cases.json>] [--ref <ref.json>] [--tol 1e-5]", "role": "Differential test Burn Device::flex() f32 outputs against an independent pure-Rust f64 interpreter (all 87 f32 constructors) or external reference vectors" },
                 { "cmd": "math-draw verify [--fuzz] [--zoom]", "role": "Equivalence checker with domain-aware fuzzing and recursive adversarial interval narrowing (--zoom)" },
                 { "cmd": "math-draw linear-equiv", "role": "Exact symbolic affine equivalence prover over linear, add, sub, and concat(dim=1) graphs" },
+                { "cmd": "math-draw soak [--runs 100]", "role": "Long-run bit-identical determinism proof hashing raw canonical f32 output bytes" },
+                { "cmd": "math-draw prng-check [algo] [seed] [count] | verify <manifest.json>", "role": "Certify and re-verify deterministic PRNG streams (xorshift64, mulberry32, pcg32, philox4x32)" },
                 { "cmd": "math-draw trace-hash [--isolate]", "role": "Per-step SHA-256 tensor fingerprinting, divergence step localization, and prefix subspec isolation" },
                 { "cmd": "math-draw bundle <binding|export|verify>", "role": "Canonical unique-first-use parameter binding, self-contained program bundle export, cryptographic tamper detection, and live replay verification" },
                 { "cmd": "math-draw smoke", "role": "End-to-end deterministic smoke test suite" }
             ]
         },
         "differentiate": {
-            "summary": "Compute central finite-difference Jacobians, verify analytic derivatives, and cross-check against Burn autodiff.",
+            "summary": "Compile symbolic in-graph 1st-order VJP and 2nd-order HVP specs, compute central finite-difference Jacobians, verify analytic derivatives, and cross-check against Burn autodiff.",
             "tools": [
+                { "cmd": "math-draw recurse grad-spec [--wrt <slot|name>] [--order 1|2] [--compact-slots]", "role": "Compile a runnable 1st-order VJP or 2nd-order Hessian-Vector Product SpecV1 graph across 23 differentiable constructors" },
                 { "cmd": "math-draw gradcheck [--weights] [--autodiff]", "role": "Central finite-difference input & weight Jacobians with Burn Device::flex().autodiff() verification" }
             ]
         },
         "optimize": {
-            "summary": "Search rewrite trees, apply fixpoint rewrites, mutate graphs across competing branches, plan mixed-precision quantization, and optimize weights via GD or ES.",
+            "summary": "Search rewrite+quantization trees, apply fixpoint rewrites, mutate graphs across competing branches, plan mixed-precision quantization, and optimize weights via GD or ES.",
             "tools": [
                 { "cmd": "math-draw rewrite <list|apply>", "role": "Pure graph rewrites and recursive fixpoint simplification" },
-                { "cmd": "math-draw recurse search", "role": "Equivalence-verified tree rewrite search" },
+                { "cmd": "math-draw recurse search [--quant-tol T]", "role": "Equivalence-verified tree rewrite and quantization branch search" },
                 { "cmd": "math-draw mutate", "role": "Transactional & multi-branch equivalence-gated graph mutations" },
                 { "cmd": "math-draw quant <verify|budget>", "role": "int8/q8-per-block/fp16 weight quantization verifier and analytical Lipschitz/measured budget planner" },
                 { "cmd": "math-draw recurse solve-gd [--precondition]", "role": "Burn autodiff gradient descent with backtracking and diagonal Hessian preconditioning" },
@@ -298,10 +303,11 @@ pub fn get_capability_catalog(domain: Option<&str>) -> Value {
             ]
         },
         "rollout": {
-            "summary": "Execute graphs one-shot, recurrently across time (scan), iteratively to convergence (fixpoint), unroll temporal horizons, or bisect trajectory divergence.",
+            "summary": "Execute graphs one-shot, run spec-free direct math (arith/int/kernel), step recurrently across time (scan), solve fixed points, unroll temporal horizons, or bisect trajectory divergence.",
             "tools": [
                 { "cmd": "math-draw run", "role": "One-shot deterministic execution on Burn flex backend" },
-                { "cmd": "math-draw rollout <scan|fixpoint|unroll|bisect>", "role": "Stateful recurrent rollout, fixed-point solver, weight-tied unroller, and tick/step bisection" }
+                { "cmd": "math-draw arith / int / kernel [--batch <ops.json>]", "role": "Spec-free deterministic f32 arithmetic/linalg/stats, exact checked i64 arithmetic, and Lane-E elementwise kernels with $prev/$<idx> batch register chaining" },
+                { "cmd": "math-draw rollout <scan|fixpoint|unroll|bisect> [--compact-slots]", "role": "Stateful recurrent rollout, fixed-point solver, weight-tied unroller (with optional liveness compaction), and tick/step bisection" }
             ]
         },
         "state": {

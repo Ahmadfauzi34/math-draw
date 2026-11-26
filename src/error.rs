@@ -264,10 +264,22 @@ pub fn classify_error(msg: &str, stage: Option<&str>) -> MathDrawError {
     } else if low.contains("unexpected positional") {
         ErrorCode::CliUnexpectedPositional
     } else if low.contains("unknown command")
-        || (low.contains("unknown ") && low.contains("subcommand"))
+        || (low.contains("unknown ")
+            && (low.contains("subcommand")
+                || low.contains("arith op")
+                || low.contains("int op")
+                || low.contains("kernel op")
+                || low.contains("geom op")))
     {
         ErrorCode::CliUnknownCommand
-    } else if low.starts_with("usage:") {
+    } else if low.starts_with("usage:")
+        || low.contains("unknown quant scheme")
+        || low.contains("unknown budget mode")
+        || low.contains("grad-spec: order must be")
+        || low.contains("grad-spec: --hvp-vec")
+        || low.contains("unknown or unsupported batch field")
+        || (low.starts_with("batch[") && low.contains("specify either "))
+    {
         ErrorCode::CliUsage
     } else if low.contains("cannot read") || low.contains("failed to read") {
         ErrorCode::IoReadFailed
@@ -288,6 +300,12 @@ pub fn classify_error(msg: &str, stage: Option<&str>) -> MathDrawError {
     } else if low.contains("invalid v1 spec")
         || low.contains("recursive-spec.v2")
         || low.contains("unknown_layer_constructor")
+        || low.contains("unsupported_symbolic_grad_op")
+        || low.contains("unresolved_wrt_slot")
+        || low.contains("cycle detected")
+        || low.contains("duplicate node id")
+        || low.contains("unknown parent node")
+        || low.contains("unsupported constructor")
     {
         ErrorCode::SpecInvalid
     } else if low.contains("missing 'expected'")
@@ -333,10 +351,18 @@ pub fn classify_error(msg: &str, stage: Option<&str>) -> MathDrawError {
     } else if low.contains("domain")
         || low.contains("must be > 0")
         || low.contains("must be >= 0")
+        || low.contains("must be >= 1")
+        || low.contains("must be >= 2")
         || low.contains("must sum to 1")
         || low.contains("zero support")
         || low.contains("negative")
         || low.contains("out of range")
+        || low.contains("exceeds exact f32")
+        || low.contains("singular")
+        || low.contains("zero quaternion")
+        || low.contains("zero-length")
+        || low.contains("requires 0 < near < far")
+        || low.contains("exceeds maximum")
     {
         ErrorCode::MathDomainError
     } else if low.contains("workflow") || low.contains("unknown workflow pipeline stage") {
@@ -345,7 +371,22 @@ pub fn classify_error(msg: &str, stage: Option<&str>) -> MathDrawError {
         ErrorCode::ValidationFailed
     } else if matches!(
         stage,
-        Some("run" | "execute" | "trace_hash" | "rollout" | "profile" | "compare")
+        Some(
+            "run"
+                | "execute"
+                | "trace_hash"
+                | "rollout"
+                | "profile"
+                | "compare"
+                | "soak"
+                | "diff_ref"
+                | "arith"
+                | "int"
+                | "kernel"
+                | "geom.project"
+                | "geom.batch"
+                | "geom.solve_ik"
+        )
     ) {
         ErrorCode::ExecutionFailed
     } else {
