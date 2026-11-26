@@ -2271,6 +2271,17 @@ fn symbolic_grad_spec_vjp_hvp_and_finite_diff_parity() {
     )
     .unwrap();
     let vjp_vals = run_spec(&vjp.spec).unwrap().outputs.values;
+    assert!(
+        vjp.forward_output_slot < vjp.num_slots,
+        "compacted forward_output_slot {} must be < num_slots {}",
+        vjp.forward_output_slot,
+        vjp.num_slots
+    );
+    assert_eq!(
+        Some(vjp.forward_output_slot),
+        vjp.spec.steps[loaded.spec.steps.len() - 1].output_slot(),
+        "compacted forward_output_slot must match the remapped final forward step output slot"
+    );
 
     // Cross-check against central finite-difference Jacobian J^T * dout
     let gc = gradcheck_spec(&loaded.spec, None, 1e-3, 1e-2, false, false).unwrap();
@@ -3118,6 +3129,25 @@ fn geom3_builders_scene_tree_ik_projection_batch_and_cli() {
             assert!((a.clip[k] - b.clip[k]).abs() < 1e-5);
         }
     }
+
+    // 5b. Overflow-inducing huge viewport dimensions fail closed instead of returning Inf screen coords
+    let overflow_vp_doc = json!({
+        "vertices": [[10.0, 10.0, -2.0]],
+        "camera": {
+            "eye": [0.0, 0.0, 0.0],
+            "target": [0.0, 0.0, -1.0],
+            "up": [0.0, 1.0, 0.0],
+            "fov_deg": 60.0,
+            "aspect": 1.0,
+            "near": 0.1,
+            "far": 100.0
+        },
+        "viewport": { "w": 1e308, "h": 1e308 }
+    });
+    assert!(
+        project_model(&overflow_vp_doc, false).is_err(),
+        "expected huge viewport causing Inf screen coords to fail closed"
+    );
 
     // 6. Workflow `diff_ref` stage + live CLI `math-draw geom` subcommands
     let tmp_dir = std::env::temp_dir().join(format!("math_draw_geom_cli_{}", std::process::id()));

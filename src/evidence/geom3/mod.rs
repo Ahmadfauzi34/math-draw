@@ -700,27 +700,35 @@ pub struct GeomProjectReport {
     pub triangles_spans_camera: Option<usize>,
 }
 
-fn project_clip(clip: Vec4, vp_w: f64, vp_h: f64) -> ProjectedVertex {
+fn project_clip(clip: Vec4, vp_w: f64, vp_h: f64) -> Result<ProjectedVertex, String> {
+    if !clip.iter().all(|v| v.is_finite()) {
+        return Err("geom project: non-finite clip coordinates produced by engine".into());
+    }
     let [x, y, z, w] = clip;
-    if !clip.iter().all(|v| v.is_finite()) || w <= 0.0 {
-        return ProjectedVertex {
+    if w <= 0.0 {
+        return Ok(ProjectedVertex {
             behind: true,
             clip,
             ndc: None,
             screen: None,
-        };
+        });
     }
     let nx = x / w;
     let ny = y / w;
     let nz = z / w;
     let sx = (nx * 0.5 + 0.5) * vp_w;
     let sy = (1.0 - (ny * 0.5 + 0.5)) * vp_h;
-    ProjectedVertex {
+    if ![nx, ny, nz, sx, sy].iter().all(|v| v.is_finite()) {
+        return Err(
+            "geom project: non-finite projected NDC or screen coordinates (overflow)".into(),
+        );
+    }
+    Ok(ProjectedVertex {
         behind: false,
         clip,
         ndc: Some([nx, ny, nz]),
         screen: Some([sx, sy]),
-    }
+    })
 }
 
 fn build_single_mvp_spec(mvp: &Mat4) -> SpecV1 {
@@ -988,7 +996,7 @@ pub fn project_model(doc: &Value, batched: bool) -> Result<GeomProjectReport, St
     let results: Vec<ProjectedVertex> = clips
         .iter()
         .map(|&c| project_clip(c, vp_w, vp_h))
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     let projected = results.iter().filter(|r| !r.behind).count();
     let behind_camera = results.len() - projected;
 
@@ -1048,14 +1056,14 @@ pub fn project_model(doc: &Value, batched: bool) -> Result<GeomProjectReport, St
             let clipped_proj: Vec<[ProjectedVertex; 3]> = res
                 .triangles
                 .iter()
-                .map(|tri| {
-                    [
-                        project_clip(tri[0], vp_w, vp_h),
-                        project_clip(tri[1], vp_w, vp_h),
-                        project_clip(tri[2], vp_w, vp_h),
-                    ]
+                .map(|tri| -> Result<[ProjectedVertex; 3], String> {
+                    Ok([
+                        project_clip(tri[0], vp_w, vp_h)?,
+                        project_clip(tri[1], vp_w, vp_h)?,
+                        project_clip(tri[2], vp_w, vp_h)?,
+                    ])
                 })
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
             out_tris.push(ProjectedTriangle {
                 input: idxs,
                 spans_camera: res.spans_camera,

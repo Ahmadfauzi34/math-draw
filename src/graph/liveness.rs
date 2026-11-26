@@ -268,7 +268,8 @@ pub fn compact_slots_by_liveness(spec: &SpecV1) -> Result<SlotCompactionReport, 
     }
 
     let old_num_slots = spec.num_slots;
-    let ssa = ssa_normalize_spec(spec).ssa_spec;
+    let ssa_rep = ssa_normalize_spec(spec);
+    let ssa = ssa_rep.ssa_spec;
     let liveness = analyze_liveness(&ssa, &BTreeMap::new(), None);
     let port_slots: HashSet<usize> = ssa.ports.iter().map(|p| p.slot).collect();
 
@@ -358,13 +359,20 @@ pub fn compact_slots_by_liveness(spec: &SpecV1) -> Result<SlotCompactionReport, 
         ));
     }
 
+    let mut slot_remap = BTreeMap::new();
+    for (&orig, &virt) in &ssa_rep.final_slot_map {
+        if let Some(&phys) = virt_to_phys.get(&virt) {
+            slot_remap.insert(orig, phys);
+        }
+    }
+
     let slots_after = compacted.num_slots;
     Ok(SlotCompactionReport {
         spec: compacted,
         slots_before: old_num_slots,
         slots_after,
         slots_saved: old_num_slots.saturating_sub(slots_after),
-        slot_remap: virt_to_phys,
+        slot_remap,
     })
 }
 

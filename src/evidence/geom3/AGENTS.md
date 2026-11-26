@@ -12,7 +12,7 @@ Provides deterministic 3D affine transform builders, hierarchical scene-tree com
 ## Local Contracts
 
 - **Canonical Conventions**: Angles are in degrees; coordinates are right-handed with active column-vector transforms (`v' = M v`); internal matrices are row-major `f64`; Burn `linear(4, 4, false)` weights are emitted column-major `f32`.
-- **Documented Perspective-Divide Boundary**: Linear MVP transforms execute on Burn `Device::flex()` returning homogeneous clip coordinates `[x, y, z, w]`. Perspective divide (`x/w, y/w, z/w`) and viewport mapping stay host-side, flagging any vertex with `w <= 0` as `behind: true` (never producing `NaN`/`Inf`).
+- **Documented Perspective-Divide Boundary**: Linear MVP transforms execute on Burn `Device::flex()` returning homogeneous clip coordinates `[x, y, z, w]`. Perspective divide (`x/w, y/w, z/w`) and viewport mapping stay host-side, flagging any finite vertex with `w <= 0` as `behind: true` and failing closed (`Err`) if clip, NDC, or screen coordinates overflow to non-finite values (`NaN`/`Inf`).
 - **Fail-Closed Validation**: Reject non-finite inputs, zero rotation axes, zero quaternions, singular normal matrices, invalid `near`/`far`/`fov_deg`/`aspect`, `repeat` depth `> 1024`, scene-tree cycles/duplicate IDs/unknown parents, out-of-range triangle indices, and invalid joint limits (`min_deg > max_deg`).
 - **Batching Limit**: Block-diagonal projection packs at most `BATCH_MAX = 63` vertices per `linear(4N, 4N, false)` chunk (`(4 * 63)^2 = 63,504 <= 65,535` weights).
 

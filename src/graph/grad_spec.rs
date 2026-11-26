@@ -1622,6 +1622,11 @@ pub fn compile_grad_spec(
 
     if opts.compact_slots {
         let compacted = compact_slots_by_liveness(&report.spec)?;
+        let remap = |slot: usize| compacted.slot_remap.get(&slot).copied().unwrap_or(slot);
+        report.wrt_slot = remap(report.wrt_slot);
+        report.dout_slot = remap(report.dout_slot);
+        report.hvp_slot = report.hvp_slot.map(remap);
+        report.forward_output_slot = remap(report.forward_output_slot);
         report.spec = compacted.spec;
         report.num_slots = report.spec.num_slots;
         report.output_slot = report.spec.output_slot;
